@@ -337,6 +337,25 @@ async def send_private_command_feedback(
     return sent
 
 
+async def send_private_registration_feedback(
+    ctx: commands.Context,
+    content: str,
+) -> None:
+    """Send registration errors only to the member who submitted the command."""
+    try:
+        await ctx.author.send(
+            content,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        logger.exception(
+            "Could not DM registration feedback to %s.",
+            getattr(ctx.author, "id", None),
+        )
+    finally:
+        await delete_command_message(ctx)
+
+
 async def purge_channel_messages(channel) -> bool:
     """Clear a channel in batches, reporting failure without aborting reset."""
     purge = getattr(channel, "purge", None)
@@ -518,6 +537,28 @@ def resolve_channel_scrim(ctx: commands.Context, *, staff_only: bool = False) ->
         )
     ]
     return matches[0] if len(matches) == 1 else None
+
+
+def resolve_registration_scrim(ctx: commands.Context) -> Scrim | None:
+    if ctx.guild is None:
+        return None
+    matches = [
+        scrim
+        for scrim in repository.list(ctx.guild.id)
+        if getattr(scrim, "registration_channel_id", None) == ctx.channel.id
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def registration_role_allows(ctx: commands.Context, scrim: Scrim) -> bool:
+    role_id = getattr(scrim, "registration_role_id", None)
+    if role_id is None or ctx.guild is None:
+        return False
+    if role_id == ctx.guild.id:
+        return True
+    return role_id in {
+        getattr(role, "id", None) for role in getattr(ctx.author, "roles", ())
+    }
 
 
 async def require_channel_scrim(
@@ -1396,6 +1437,29 @@ async def notify_staff_for_review(scrim: Scrim, slot: SlotSnapshot) -> bool:
         return True
     except discord.HTTPException:
         logger.exception("Could not send the staff notification (%s).", scrim.id)
+        return False
+
+
+async def notify_staff_for_registration(
+    scrim: Scrim, slot: SlotSnapshot | None
+) -> bool:
+    if slot is None:
+        return False
+    channel = await staff_channel(scrim)
+    if channel is None or not is_active(scrim):
+        return False
+    try:
+        await channel.send(
+            f"📝 **Team registration request**\n"
+            f"**{discord.utils.escape_markdown(slot.team_name)}** · "
+            f"Slot {slot.number:02d}\n"
+            f"Captain: <@{slot.manager_id}>",
+            view=SlotReviewView(scrim, slot),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return True
+    except discord.HTTPException:
+        logger.exception("Could not send the registration review (%s).", scrim.id)
         return False
 
 
@@ -2351,6 +2415,7 @@ def build_help_embed() -> discord.Embed:
             "`!set <@Role>` — define the global Staff role for admin commands.\n"
             "`!say <message>` — publish an announcement as the bot for Staff.\n"
             "`!export` — generate a complete registration list usable anywhere.\n"
+            "`!add Team / TAG / @Captain` — staff-only team registration.\n"
             "`!reset` — archive the last slot state in History, then clear registrations."
         ),
         inline=False,
@@ -2370,7 +2435,8 @@ def build_help_embed() -> discord.Embed:
     embed.add_field(
         name="👤 Players",
         value=(
-            "`!add Team / TAG / @Captain` — register a team in the first free slot.\n"
+            "`!register Team Name / Tag [/ @Manager]` — public registration; "
+            "the manager mention is optional.\n"
             "`!remind` — remind reserved managers to confirm or cancel.\n"
             "`✅ Confirm` / `❌ Cancel` — manager actions on the public board.\n"
             "`!cap add`, `!cap transfer`, `!cap remove` — manage team captains."
@@ -3569,6 +3635,74 @@ async def apply_add_entries(
     return snapshots, unavailable, access_failures, board_refreshed
 
 
+def parse_registration_arguments(arguments: str) -> tuple[str, str, str | None]:
+    """Parse ``!register Team Name / Tag [/ @Manager]``."""
+    raw = arguments.strip()
+    parts = [part.strip() for part in raw.split("/")]
+    if len(parts) not in {2, 3} or not all(parts):
+        raise ValueError(
+            "Wrong format. Use `!register Team Name / Tag` or "
+            "`!register Team Name / Tag / @Manager`. "
+            "The manager mention is optional; without it, you become captain."
+        )
+    team_name, tag = parts[:2]
+    manager_text = parts[2] if len(parts) == 3 else None
+    if len(team_name) > 100 or len(tag) > 32:
+        raise ValueError("The team name or tag is too long.")
+    if any(character in team_name or character in tag for character in ("\r", "\n")):
+        raise ValueError("The team name and tag must stay on one line.")
+    if manager_text is not None and not re.fullmatch(r"<@!?\d+>", manager_text):
+        raise ValueError(
+            "The manager must be a member mention, such as `@Manager`."
+        )
+    return team_name, tag, manager_text
+
+
+async def apply_registration_entry(
+    scrim: Scrim,
+    entry: AddDraftEntry,
+) -> tuple[SlotSnapshot | None, str | None, bool, bool]:
+    snapshot: SlotSnapshot | None = None
+    async with scrim.state_lock:
+        if not is_active(scrim):
+            return None, "The scrim is no longer active.", False, False
+        slot = scrim.slots.get(entry.slot_number)
+        if slot is None or not slot_is_assignable(slot):
+            return None, "The selected slot is no longer available.", False, False
+        with repository.transaction():
+            slot.assignment_id += 1
+            slot.status = (
+                STATUS_RESERVED
+                if getattr(scrim, "registration_auto_accept", False)
+                else STATUS_PENDING
+            )
+            slot.team_name = entry.team_name
+            slot.tag = entry.tag
+            slot.manager_id = entry.member.id
+            slot.captain_1_id = entry.member.id
+            slot.captain_2_id = None
+            snapshot = slot.snapshot()
+
+    access_ok = await grant_manager_access(scrim, entry.member)
+    board_refreshed = await refresh_public_slots(scrim)
+    if getattr(scrim, "registration_auto_accept", False):
+        await send_scrim_log(
+            scrim,
+            "TEAM REGISTERED",
+            f"Slot {entry.slot_number:02d} · team **{entry.team_name}** · "
+            f"captain <@{entry.member.id}>",
+        )
+        return snapshot, None, access_ok, board_refreshed
+    notified = await notify_staff_for_registration(scrim, snapshot)
+    await send_scrim_log(
+        scrim,
+        "TEAM REGISTRATION REQUEST",
+        f"Slot {entry.slot_number:02d} · team **{entry.team_name}** · "
+        f"captain <@{entry.member.id}>",
+    )
+    return snapshot, None, access_ok, board_refreshed and notified
+
+
 class AddRegistrationView(DurableView):
     def __init__(
         self,
@@ -3724,6 +3858,115 @@ class AddRegistrationView(DurableView):
         button: discord.ui.Button,
     ) -> None:
         await self._finish_cancel(interaction)
+
+
+@bot.command(name="register")
+@commands.guild_only()
+async def register_team(ctx: commands.Context, *, arguments: str) -> None:
+    """Register a team through the configured public registration channel."""
+    scrim = resolve_registration_scrim(ctx)
+    if scrim is None:
+        await send_private_command_feedback(
+            ctx,
+            "This command must be used in a configured team registration channel.",
+            silent=False,
+        )
+        return
+    if not scrim.is_open:
+        await send_private_command_feedback(
+            ctx,
+            "This scrim is currently closed for registrations.",
+            silent=False,
+        )
+        return
+    if not registration_role_allows(ctx, scrim):
+        await send_private_command_feedback(
+            ctx,
+            "You do not have the role allowed to use `!register`.",
+            silent=False,
+        )
+        return
+    try:
+        team_name, tag, manager_text = parse_registration_arguments(arguments)
+    except ValueError as error:
+        await send_private_registration_feedback(ctx, str(error))
+        return
+
+    manager = ctx.author
+    if manager_text is not None:
+        try:
+            manager = await resolve_add_member(ctx, manager_text)
+        except (
+            commands.MemberNotFound,
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException,
+        ):
+            await send_private_registration_feedback(
+                ctx,
+                "That manager mention could not be found in this server. "
+                "Mention a current server member.",
+            )
+            return
+
+    async with scrim.state_lock:
+        slot_number = next(
+            (
+                slot.number
+                for slot in scrim.slots.values()
+                if slot_is_assignable(slot)
+            ),
+            None,
+        )
+    if slot_number is None:
+        await send_private_command_feedback(
+            ctx,
+            "There are no available slots for this scrim.",
+            silent=False,
+        )
+        return
+
+    entry = AddDraftEntry(
+        original_line=arguments.strip(),
+        team_name=team_name,
+        slot_number=slot_number,
+        member=manager,
+        tag=tag,
+    )
+    snapshot, error, access_ok, board_refreshed = await apply_registration_entry(
+        scrim, entry
+    )
+    if error or snapshot is None:
+        await send_private_command_feedback(
+            ctx,
+            error or "The registration could not be completed.",
+            silent=False,
+        )
+        return
+
+    message = (
+        f"✅ **{discord.utils.escape_markdown(team_name)}** registered in "
+        f"Slot {snapshot.number:02d}. Your slot is reserved; use the public "
+        "board to confirm it when prompted."
+        if scrim.registration_auto_accept
+        else (
+            f"📝 **{discord.utils.escape_markdown(team_name)}** registration "
+            f"received for Slot {snapshot.number:02d}. Staff validation is required."
+        )
+    )
+    warnings = []
+    if not access_ok:
+        warnings.append("captain access could not be configured")
+    if not board_refreshed:
+        warnings.append("the slot board could not be refreshed")
+    if warnings:
+        message += " Warning: " + " and ".join(warnings) + "."
+    await ctx.send(
+        message,
+        allowed_mentions=discord.AllowedMentions.none(),
+        delete_after=20,
+    )
+    await delete_command_message(ctx)
 
 
 @bot.command(name="add")
