@@ -3,7 +3,13 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from main import _format_idpw_announcement, _parse_idpw_input, _publish_idpwg
+from main import (
+    _format_idpw_announcement,
+    _format_idpw_reminder,
+    _parse_idpw_input,
+    _publish_idpwg,
+    clear_active_idpw,
+)
 
 
 class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -82,6 +88,52 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
             "Start : 00:58**\n"
             "<@&456>",
         )
+
+    def test_reminder_format_matches_discord_edit_text(self):
+        self.assertEqual(
+            _format_idpw_reminder(
+                title="The match starts in 3 minutes",
+                message="Please prepare.",
+                confirmed_role_id=456,
+            ),
+            "# **The match starts in 3 minutes**\n"
+            "**Please prepare.**\n"
+            "<@&456>",
+        )
+        self.assertEqual(
+            _format_idpw_reminder(
+                title="FINAL CALL",
+                message="The match begins in 1 minute.",
+                confirmed_role_id=456,
+            ),
+            "# **FINAL CALL**\n"
+            "**The match begins in 1 minute.**\n"
+            "<@&456>",
+        )
+
+    async def test_clearing_a_run_deletes_announcement_and_reminders(self):
+        announcement = SimpleNamespace(id=101, delete=AsyncMock())
+        reminder = SimpleNamespace(id=102, delete=AsyncMock())
+        task = Mock()
+        task.done.return_value = False
+        state = {
+            "message": announcement,
+            "messages": [announcement, reminder],
+            "tasks": [task],
+        }
+        active = {"scrim-1": state}
+
+        with (
+            patch("main.active_idpw", active),
+            patch("main.repository.get_idpw_config", return_value=None),
+            patch("main.repository.get", return_value=None),
+        ):
+            await clear_active_idpw("scrim-1")
+
+        task.cancel.assert_called_once_with()
+        announcement.delete.assert_awaited_once_with()
+        reminder.delete.assert_awaited_once_with()
+        self.assertNotIn("scrim-1", active)
 
     async def test_fixed_mode_uses_the_individual_match_assignment(self):
         scrim = self.make_scrim(
