@@ -2257,6 +2257,7 @@ def build_help_embed() -> discord.Embed:
         value=(
             "`!setup` — initialize scrims and configure roles, channels, maps, and ID/PW.\n"
             "`!set <@Role>` — define the global Staff role for admin commands.\n"
+            "`!say <message>` — publish an announcement as the bot for Staff.\n"
             "`!export` — generate a complete registration list usable anywhere.\n"
             "`!reset` — archive the last slot state in History, then clear registrations."
         ),
