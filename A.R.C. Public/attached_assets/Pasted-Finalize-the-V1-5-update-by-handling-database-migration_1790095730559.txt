@@ -1,0 +1,33 @@
+Finalize the V1.5 update by handling database migrations, updating the Staff UI, securing the `!reset` logic, and completely rewriting the `!help` command.
+
+1. **Database Migration / Initialization:**
+   - Ensure the `on_ready` event checks for the existence of the new columns (`timezone`, `maps`, `max_matches`, `pw_type`, `fixed_pw`, `current_match_counter`) in the `scrims` SQLite table. 
+   - If they do not exist, execute `ALTER TABLE` queries to add them safely without dropping existing data.
+
+2. **Update Staff Control Panel (Embed):**
+   - When the `!setup` control panel is generated or updated, modify the Embed description or fields to clearly display the current configuration to the staff:
+     - Password Mode (Fixed/Dynamic)
+     - Timezone configured
+     - Map Rotation (e.g., "4 Matches Configured")
+     - Current Match Counter
+
+3. **Secure the `!reset` Command:**
+   - Modify the `!reset` command so that it ONLY clears the registered slots/teams and sets `current_match_counter` back to `1`. 
+   - It MUST NOT delete the `maps`, `pw_type`, `fixed_pw`, or `timezone` configurations. The event configuration must persist for the next day's tournament.
+
+4. **Overhaul the `!help` Command:**
+   - Override the default help command: `bot.remove_command('help')`.
+   - Create a new custom `!help` command that sends a beautifully categorized Embed.
+   - **Embed Details:**
+     - Title: "A.R.C. Bot - Command Center"
+     - Color: Bot Theme.
+     - **Category 1: Staff & Setup 🛠️**
+       - `!setup` : Initialize a new scrim, configure roles, channels, and maps.
+       - `!set` : Define the Manager role required for admin commands.
+       - `!export` : Generate a complete registration list (usable anywhere).
+     - **Category 2: Match Management 🎮**
+       - `!slots` : Display a real-time status of registrations (e.g., 📊 Slot Status - Tactical Reapers Scrims).
+       - `!idpw` : Send room details & auto-increment the match counter.
+       - `!idpwg[1-32]` : Send room details for a specific match (e.g., `!idpwg2` for Game 2). 
+     - **Category 3: Players 👤**
+       - `!add` / The UI Buttons : Register or confirm a team slot.
