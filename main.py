@@ -435,19 +435,30 @@ async def clear_active_idpw(scrim_id: str | None = None) -> None:
             messages.insert(0, message)
         config = repository.get_idpw_config(current_id)
         scrim = repository.get(current_id)
-        if message is None and config is not None and scrim is not None:
+        persisted_message_id = (
+            config.announcement_message_id
+            if config is not None
+            else None
+        )
+        active_message_id = getattr(message, "id", None)
+        if (
+            persisted_message_id is not None
+            and persisted_message_id != active_message_id
+            and scrim is not None
+        ):
             try:
                 channel = await configured_text_channel(
                     scrim, config.target_channel_id
                 )
                 fetch_message = getattr(channel, "fetch_message", None)
-                if fetch_message is not None and config.announcement_message_id:
-                    message = await fetch_message(config.announcement_message_id)
+                if fetch_message is not None:
+                    persisted_message = await fetch_message(persisted_message_id)
                     if all(
-                        getattr(existing, "id", None) != getattr(message, "id", None)
+                        getattr(existing, "id", None)
+                        != getattr(persisted_message, "id", None)
                         for existing in messages
                     ):
-                        messages.insert(0, message)
+                        messages.insert(0, persisted_message)
             except discord.NotFound:
                 pass
             except (discord.Forbidden, discord.HTTPException):
