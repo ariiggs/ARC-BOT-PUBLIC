@@ -294,6 +294,11 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             "cap_channel_id": scrim.cap_channel_id,
             "logs_channel_id": scrim.logs_channel_id,
             "history_channel_id": scrim.history_channel_id,
+            "registration_channel_id": getattr(scrim, "registration_channel_id", None),
+            "registration_role_id": getattr(scrim, "registration_role_id", None),
+            "registration_auto_accept": getattr(
+                scrim, "registration_auto_accept", False
+            ),
             "slot_start": scrim.slot_start,
             "slot_end": scrim.slot_end,
             "max_matches": scrim.max_matches,
@@ -314,6 +319,11 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             "cap_channel_id": scrim.cap_channel_id,
             "logs_channel_id": scrim.logs_channel_id,
             "history_channel_id": scrim.history_channel_id,
+            "registration_channel_id": getattr(scrim, "registration_channel_id", None),
+            "registration_role_id": getattr(scrim, "registration_role_id", None),
+            "registration_auto_accept": getattr(
+                scrim, "registration_auto_accept", False
+            ),
             "slot_start": scrim.slot_start,
             "slot_end": scrim.slot_end,
             "max_matches": scrim.max_matches,
