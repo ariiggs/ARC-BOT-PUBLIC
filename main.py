@@ -2015,6 +2015,39 @@ async def _parse_idpw_input(
     return scrim, config, room_id, minutes, password
 
 
+def _format_idpw_announcement(
+    *,
+    match_number: int,
+    room_id: str,
+    password: str,
+    start_time: str,
+    confirmed_role_id: int | None,
+    map_name: str | None = None,
+    start_label: str = "Start",
+    separate_role_mention: bool = False,
+) -> str:
+    """Build the Discord-formatted ID/password announcement."""
+    detail_lines = []
+    if map_name:
+        detail_lines.append(f"Map : {discord.utils.escape_markdown(map_name)}")
+    detail_lines.extend(
+        (
+            f"ID : `{discord.utils.escape_markdown(room_id)}`",
+            f"PW : {discord.utils.escape_markdown(password)}",
+            f"{start_label} : {start_time}",
+        )
+    )
+    lines = [f"# __**Match {match_number}**__"]
+    if separate_role_mention:
+        lines.append("")
+    lines.append(f"**{chr(10).join(detail_lines)}**")
+    if confirmed_role_id is not None:
+        if separate_role_mention:
+            lines.append("")
+        lines.append(f"<@&{confirmed_role_id}>")
+    return "\n".join(lines)
+
+
 async def _publish_idpw(
     ctx: commands.Context,
     lobby_id: str,
@@ -2077,12 +2110,13 @@ async def _publish_idpw(
     match_number = requested_match or scrim.current_match_counter
     if password is None:
         password = getattr(scrim, "fixed_pw", "") or config.fixed_password
-    message_content = (
-        f"# Match {match_number}\n\n"
-        f"ID : `{discord.utils.escape_markdown(lobby_id)}`\n"
-        f"PW : {discord.utils.escape_markdown(password)}\n"
-        f"Start Time : {heure_formatee}\n\n"
-        f"<@&{scrim.confirmed_role_id}>"
+    message_content = _format_idpw_announcement(
+        match_number=match_number,
+        room_id=lobby_id,
+        password=password,
+        start_time=heure_formatee,
+        confirmed_role_id=scrim.confirmed_role_id,
+        map_name=_match_map_for_scrim(scrim, match_number),
     )
     role_mentions = discord.AllowedMentions(
         everyone=False, users=False, roles=True, replied_user=False
@@ -2180,20 +2214,17 @@ async def _publish_idpwg(
         start_timestamp,
         tz=timezone_for_name(configured_timezone),
     )
-    lines = [f"**Match {game_number}**"]
     map_name = _match_map_for_scrim(scrim, game_number)
-    if map_name is not None:
-        lines.append(f"Map : {discord.utils.escape_markdown(map_name)}")
-    lines.extend(
-        (
-            f"**ID :** `{discord.utils.escape_markdown(room_id)}`",
-            f"**PW :** {discord.utils.escape_markdown(password)}",
-            f"**Start :** {local_start.strftime('%H:%M')}",
-        )
+    message_content = _format_idpw_announcement(
+        match_number=game_number,
+        room_id=room_id,
+        password=password,
+        start_time=local_start.strftime("%H:%M"),
+        confirmed_role_id=scrim.confirmed_role_id,
+        map_name=map_name,
+        start_label="Start Time",
+        separate_role_mention=True,
     )
-    if scrim.confirmed_role_id is not None:
-        lines.append(f"<@&{scrim.confirmed_role_id}>")
-    message_content = "\n".join(lines)
     allowed_mentions = discord.AllowedMentions(
         everyone=False,
         users=False,
