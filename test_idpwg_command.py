@@ -3,7 +3,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from main import _parse_idpw_input, _publish_idpwg
+from main import _format_idpw_announcement, _parse_idpw_input, _publish_idpwg
 
 
 class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -55,14 +55,33 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
         content = target_channel.send.call_args.kwargs["content"]
         self.assertEqual(
             content,
-            "**Match 1**\n"
-            "Map : Erangel\n"
-            "**ID :** `ROOM-1`\n"
-            "**PW :** fixed-secret\n"
-            "**Start :** 00:05\n"
+            "# __**Match 1**__\n\n"
+            "**Map : Erangel\n"
+            "ID : `ROOM-1`\n"
+            "PW : fixed-secret\n"
+            "Start Time : 00:05**\n"
+            "\n"
             "<@&456>",
         )
         self.assertEqual(scrim.current_match_counter, 2)
+
+    def test_announcement_format_matches_discord_edit_text(self):
+        self.assertEqual(
+            _format_idpw_announcement(
+                match_number=1,
+                room_id="1233456",
+                password="BETA",
+                start_time="00:58",
+                confirmed_role_id=456,
+                map_name="Erangel",
+            ),
+            "# __**Match 1**__\n"
+            "**Map : Erangel\n"
+            "ID : `1233456`\n"
+            "PW : BETA\n"
+            "Start : 00:58**\n"
+            "<@&456>",
+        )
 
     async def test_fixed_mode_uses_the_individual_match_assignment(self):
         scrim = self.make_scrim(
@@ -123,10 +142,10 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             target_channel.send.call_args.kwargs["content"],
-            "**Match 2**\n"
-            "**ID :** `ROOM-2`\n"
-            "**PW :** dynamic password\n"
-            "**Start :** 00:10",
+            "# __**Match 2**__\n\n"
+            "**ID : `ROOM-2`\n"
+            "PW : dynamic password\n"
+            "Start Time : 00:10**",
         )
         self.assertEqual(scrim.current_match_counter, 3)
 
