@@ -920,15 +920,28 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     ("logs", "Select the Logs channel"),
                     ("history", "Select the History channel"),
                 )
+            elif setting == "public_staff":
+                selectors = (
+                    ("public", "Select the Public channel"),
+                    ("staff", "Select the Staff channel"),
+                )
             else:
                 selectors = ((setting, f"Select the {setting} channel"),)
+            self.selected: dict[str, int | None] = {
+                field: getattr(
+                    grid,
+                    f"{field}_channel_id",
+                    None,
+                )
+                for field, _ in selectors
+            }
             for field, placeholder in selectors:
                 picker = discord.ui.ChannelSelect(
                     channel_types=[discord.ChannelType.text],
                     placeholder=placeholder,
                     min_values=1,
                     max_values=1,
-                    row=0 if field == "logs" else (1 if field == "history" else 0),
+                    row=0 if field in {"logs", "public"} else 1,
                 )
 
                 async def picker_callback(
@@ -938,32 +951,38 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 ) -> None:
                     if not await self.interaction_check(interaction):
                         return
-                    if setting == "logs_history":
-                        if field == "logs":
-                            self.grid.logs_channel_id = picker.values[0].id
-                        else:
-                            self.grid.history_channel_id = picker.values[0].id
-                        if (
-                            self.grid.logs_channel_id
-                            and self.grid.history_channel_id
-                        ):
-                            if (
-                                self.grid.logs_channel_id
-                                == self.grid.history_channel_id
-                            ):
+                    self.selected[field] = picker.values[0].id
+                    if setting in {"logs_history", "public_staff"}:
+                        first_field, second_field = (
+                            ("logs", "history")
+                            if setting == "logs_history"
+                            else ("public", "staff")
+                        )
+                        first_id = self.selected[first_field]
+                        second_id = self.selected[second_field]
+                        if first_id and second_id:
+                            if first_id == second_id:
                                 await interaction.response.send_message(
-                                    "Logs and history channels must be different.",
+                                    (
+                                        "Public and staff channels must be different."
+                                        if setting == "public_staff"
+                                        else "Logs and history channels must be different."
+                                    ),
                                     ephemeral=True,
                                 )
                                 return
                             await self.grid.apply_setting(
                                 interaction,
-                                "logs_history",
-                                f"{self.grid.logs_channel_id}, {self.grid.history_channel_id}",
+                                setting,
+                                f"{first_id}, {second_id}",
                             )
                         else:
                             await interaction.response.edit_message(
-                                content="Select both the Logs and History channels.",
+                                content=(
+                                    "Select both the Public and Staff channels."
+                                    if setting == "public_staff"
+                                    else "Select both the Logs and History channels."
+                                ),
                                 view=self,
                             )
                     else:
@@ -995,15 +1014,37 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             super().__init__(grid.owner_id, grid.guild_id, timeout=300)
             self.grid = grid
             self.setting = setting
-            picker = discord.ui.RoleSelect(
-                placeholder=f"Select the {setting.replace('_', ' ')}",
-                min_values=1,
-                max_values=1,
-                row=0,
-            )
+            if setting == "captain_roles":
+                selectors = (
+                    ("pending_role", "Select the Pending Captain Role"),
+                    ("confirmed_role", "Select the Confirmed Captain Role"),
+                )
+            else:
+                selectors = ((setting, f"Select the {setting.replace('_', ' ')}"),)
+            self.selected: dict[str, int | None] = {
+                field: getattr(
+                    grid,
+                    f"{field}_id",
+                    None,
+                )
+                for field, _ in selectors
+            }
 
-            async def picker_callback(interaction: discord.Interaction) -> None:
-                if await self.interaction_check(interaction):
+            for field, placeholder in selectors:
+                picker = discord.ui.RoleSelect(
+                    placeholder=placeholder,
+                    min_values=1,
+                    max_values=1,
+                    row=0 if field == "pending_role" else 1,
+                )
+
+                async def picker_callback(
+                    interaction: discord.Interaction,
+                    picker=picker,
+                    field=field,
+                ) -> None:
+                    if not await self.interaction_check(interaction):
+                        return
                     role = picker.values[0]
                     if role.is_default() or role.managed:
                         await interaction.response.send_message(
@@ -1011,16 +1052,34 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                             ephemeral=True,
                         )
                         return
-                    await self.grid.apply_setting(
-                        interaction, setting, str(role.id)
-                    )
+                    self.selected[field] = role.id
+                    if setting == "captain_roles":
+                        pending_id = self.selected["pending_role"]
+                        confirmed_id = self.selected["confirmed_role"]
+                        if pending_id and confirmed_id:
+                            await self.grid.apply_setting(
+                                interaction,
+                                setting,
+                                f"{pending_id}, {confirmed_id}",
+                            )
+                        else:
+                            await interaction.response.edit_message(
+                                content=(
+                                    "Select both the Pending and Confirmed Captain roles."
+                                ),
+                                view=self,
+                            )
+                    else:
+                        await self.grid.apply_setting(
+                            interaction, setting, str(role.id)
+                        )
 
-            picker.callback = picker_callback
-            self.add_item(picker)
+                picker.callback = picker_callback
+                self.add_item(picker)
             back_button = discord.ui.Button(
                 label="Back",
                 style=discord.ButtonStyle.secondary,
-                row=1,
+                row=2 if setting == "captain_roles" else 1,
             )
 
             async def back_callback(interaction: discord.Interaction) -> None:
@@ -1392,15 +1451,18 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             )
             if self.is_edit:
                 channel_value = (
-                    f"Public: {self._mention_channel(self.public_channel_id)}\n"
-                    f"Staff: {self._mention_channel(self.staff_channel_id)}\n"
+                    f"Public + Staff:\n"
+                    f"  Public: {self._mention_channel(self.public_channel_id)}\n"
+                    f"  Staff: {self._mention_channel(self.staff_channel_id)}\n"
                     f"ID/PW: {self._mention_channel(self.target_channel_id)}\n"
-                    f"Logs: {self._mention_channel(self.logs_channel_id)}\n"
-                    f"History: {self._mention_channel(self.history_channel_id)}"
+                    f"Logs + History:\n"
+                    f"  Logs: {self._mention_channel(self.logs_channel_id)}\n"
+                    f"  History: {self._mention_channel(self.history_channel_id)}"
                 )
                 role_value = (
-                    f"Pending: {self._mention_role(self.pending_role_id)}\n"
-                    f"Confirmed: {self._mention_role(self.confirmed_role_id)}"
+                    f"Pending + Confirmed Captain Roles:\n"
+                    f"  Pending: {self._mention_role(self.pending_role_id)}\n"
+                    f"  Confirmed: {self._mention_role(self.confirmed_role_id)}"
                 )
                 settings_value = (
                     f"Matches: **{self.max_matches}** "
@@ -1414,14 +1476,14 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 description = "Current database values"
             else:
                 channel_value = (
-                    f"Public Ch.: {self._status(self.public_channel_id, self._mention_channel(self.public_channel_id))}\n"
-                    f"Staff Ch.: {self._status(self.staff_channel_id, self._mention_channel(self.staff_channel_id))}\n"
+                    f"Public + Staff Ch.: "
+                    f"{self._status(self.public_channel_id and self.staff_channel_id, 'Configured')}\n"
                     f"ID/PW Target: {self._status(self.target_channel_id, self._mention_channel(self.target_channel_id))}\n"
                     f"Logs & History: {self._status(self.logs_channel_id and self.history_channel_id, 'Configured')}"
                 )
                 role_value = (
-                    f"Pending Role: {self._status(self.pending_role_id, self._mention_role(self.pending_role_id))}\n"
-                    f"Confirmed Role: {self._status(self.confirmed_role_id, self._mention_role(self.confirmed_role_id))}"
+                    f"Pending + Confirmed Roles: "
+                    f"{self._status(self.pending_role_id and self.confirmed_role_id, 'Configured')}"
                 )
                 settings_value = (
                     f"Matches: {self._status(self.max_matches, str(self.max_matches))}\n"
@@ -1484,8 +1546,17 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             self.clear_items()
 
             specs = (
-                ("public", "Public Ch.", "Channel ID", "123456789", self.public_channel_id),
-                ("staff", "Staff Ch.", "Channel ID", "123456789", self.staff_channel_id),
+                (
+                    "public_staff",
+                    "Public + Staff Ch.",
+                    "Channel IDs",
+                    "public_id, staff_id",
+                    (
+                        f"{self.public_channel_id}, {self.staff_channel_id}"
+                        if self.public_channel_id and self.staff_channel_id
+                        else ""
+                    ),
+                ),
                 ("target", "ID/PW Target", "Channel ID", "123456789", self.target_channel_id),
                 (
                     "logs_history",
@@ -1514,7 +1585,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     default=default,
                 ) -> None:
                     if await self.interaction_check(interaction):
-                        if setting in {"public", "staff", "target", "logs_history"}:
+                        if setting in {"public_staff", "target", "logs_history"}:
                             await interaction.response.edit_message(
                                 content="Select an existing server channel.",
                                 embed=None,
@@ -1528,9 +1599,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 button.callback = callback
                 self.add_item(button)
 
-            for setting, label, default in (
-                ("pending_role", "Pending Role", self.pending_role_id),
-                ("confirmed_role", "Confirmed Role", self.confirmed_role_id),
+            for setting, label in (
+                ("captain_roles", "Pending + Confirmed Roles"),
             ):
                 button = discord.ui.Button(
                     label=label,
@@ -1542,7 +1612,6 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     interaction: discord.Interaction,
                     setting=setting,
                     label=label,
-                    default=default,
                 ) -> None:
                     if await self.interaction_check(interaction):
                         await interaction.response.edit_message(
@@ -1817,7 +1886,31 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 return
             guild = interaction.guild
             try:
-                if setting in {"public", "staff", "target"}:
+                if setting == "public_staff":
+                    values = [int(part.strip()) for part in raw_value.split(",")]
+                    if len(values) != 2 or any(value <= 0 for value in values):
+                        raise ValueError(
+                            "Enter exactly two channel IDs: public, staff."
+                        )
+                    if values[0] == values[1]:
+                        raise ValueError(
+                            "Public and staff channels must be different."
+                        )
+                    channels = [guild.get_channel(value) for value in values]
+                    if not all(
+                        isinstance(channel, discord.TextChannel)
+                        for channel in channels
+                    ):
+                        raise ValueError(
+                            "Both IDs must be existing text channels in this server."
+                        )
+                    permission_error = _channel_permissions_error(
+                        guild, channels[0], channels[1]
+                    )
+                    if permission_error:
+                        raise ValueError(permission_error)
+                    self.public_channel_id, self.staff_channel_id = values
+                elif setting in {"public", "staff", "target"}:
                     value = int(raw_value)
                     if value <= 0:
                         raise ValueError("Enter a positive Discord channel ID.")
@@ -1863,6 +1956,30 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     if values[0] == values[1]:
                         raise ValueError("Logs and history channels must be different.")
                     self.logs_channel_id, self.history_channel_id = values
+                elif setting == "captain_roles":
+                    values = [int(part.strip()) for part in raw_value.split(",")]
+                    if len(values) != 2 or any(value <= 0 for value in values):
+                        raise ValueError(
+                            "Enter exactly two role IDs: pending, confirmed."
+                        )
+                    if values[0] == values[1]:
+                        raise ValueError(
+                            "Pending and Confirmed Captain roles must be different."
+                        )
+                    roles = [guild.get_role(value) for value in values]
+                    if any(
+                        role is None or role.is_default() or role.managed
+                        for role in roles
+                    ):
+                        raise ValueError(
+                            "Both IDs must be existing regular server roles."
+                        )
+                    config = repository.get_server_config(self.guild_id)
+                    if config and config.staff_role_id in values:
+                        raise ValueError(
+                            "Captain roles must differ from the global Staff role."
+                        )
+                    self.pending_role_id, self.confirmed_role_id = values
                 elif setting in {"pending_role", "confirmed_role"}:
                     value = int(raw_value)
                     role = guild.get_role(value)
@@ -1937,12 +2054,28 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     await self._save_idpw(interaction)
                 elif setting in {"pw_mode", "timezone"}:
                     await self._save_idpw(interaction)
+                elif setting == "public_staff":
+                    await self._finish_edit(
+                        interaction,
+                        changes={
+                            "public_channel_id": self.public_channel_id,
+                            "staff_channel_id": self.staff_channel_id,
+                        },
+                    )
                 elif setting == "logs_history":
                     await self._finish_edit(
                         interaction,
                         changes={
                             "logs_channel_id": self.logs_channel_id,
                             "history_channel_id": self.history_channel_id,
+                        },
+                    )
+                elif setting == "captain_roles":
+                    await self._finish_edit(
+                        interaction,
+                        changes={
+                            "pending_role_id": self.pending_role_id,
+                            "confirmed_role_id": self.confirmed_role_id,
                         },
                     )
                 elif setting == "matches":
