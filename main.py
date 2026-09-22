@@ -386,6 +386,33 @@ async def configured_idpw_channel(guild: discord.Guild, channel_id: int):
     return channel
 
 
+def _format_idpw_reminder(
+    *,
+    title: str,
+    message: str,
+    confirmed_role_id: int | None,
+) -> str:
+    """Build the Discord-formatted reminder shown before a match."""
+    lines = [f"# **{title}**", f"**{message}**"]
+    if confirmed_role_id is not None:
+        lines.append(f"<@&{confirmed_role_id}>")
+    return "\n".join(lines)
+
+
+def _track_active_idpw_message(
+    scrim_id: str,
+    state: dict[str, object],
+    message: object,
+) -> bool:
+    """Track a sent reminder only while its ID/PW run is still current."""
+    if active_idpw.get(scrim_id) is not state:
+        return False
+    messages = state.setdefault("messages", [])
+    if isinstance(messages, list):
+        messages.append(message)
+    return True
+
+
 async def clear_active_idpw(scrim_id: str | None = None) -> None:
     """Cancel ID/PW alerts and remove the persisted announcement for a scrim."""
     scrim_ids = (
@@ -400,6 +427,12 @@ async def clear_active_idpw(scrim_id: str | None = None) -> None:
                 task.cancel()
 
         message = state.get("message")
+        messages = list(state.get("messages", []))
+        if message is not None and all(
+            getattr(existing, "id", None) != getattr(message, "id", None)
+            for existing in messages
+        ):
+            messages.insert(0, message)
         config = repository.get_idpw_config(current_id)
         scrim = repository.get(current_id)
         if message is None and config is not None and scrim is not None:
@@ -410,6 +443,11 @@ async def clear_active_idpw(scrim_id: str | None = None) -> None:
                 fetch_message = getattr(channel, "fetch_message", None)
                 if fetch_message is not None and config.announcement_message_id:
                     message = await fetch_message(config.announcement_message_id)
+                    if all(
+                        getattr(existing, "id", None) != getattr(message, "id", None)
+                        for existing in messages
+                    ):
+                        messages.insert(0, message)
             except discord.NotFound:
                 pass
             except (discord.Forbidden, discord.HTTPException):
@@ -418,7 +456,7 @@ async def clear_active_idpw(scrim_id: str | None = None) -> None:
                     current_id,
                 )
 
-        if message is not None:
+        for message in messages:
             try:
                 await message.delete()
             except discord.NotFound:
@@ -2132,7 +2170,8 @@ async def _publish_idpw(
                 scrim.current_match_counter = (
                     scrim.current_match_counter % scrim.max_matches
                 ) + 1
-        active_idpw[scrim.id] = {"message": message, "tasks": []}
+        state = {"message": message, "messages": [message], "tasks": []}
+        active_idpw[scrim.id] = state
     except (discord.Forbidden, discord.HTTPException):
         logger.exception("Could not publish MATCH ACCESS for scrim %s.", scrim.id)
         await send_private_command_feedback(
@@ -2145,20 +2184,30 @@ async def _publish_idpw(
         try:
             if minutes > 3:
                 await asyncio.sleep((minutes - 3) * 60)
-                await target_channel.send(
-                    f"<@&{scrim.confirmed_role_id}> "
-                    "The match starts in 3 minutes. Please prepare.",
+                reminder = await target_channel.send(
+                    content=_format_idpw_reminder(
+                        title="The match starts in 3 minutes",
+                        message="Please prepare.",
+                        confirmed_role_id=scrim.confirmed_role_id,
+                    ),
                     allowed_mentions=role_mentions,
                 )
+                if not _track_active_idpw_message(scrim.id, state, reminder):
+                    await reminder.delete()
                 await asyncio.sleep(2 * 60)
             elif minutes > 1:
                 await asyncio.sleep((minutes - 1) * 60)
             if minutes >= 1:
-                await target_channel.send(
-                    f"<@&{scrim.confirmed_role_id}> "
-                    "Final call. The match begins in 1 minute.",
+                reminder = await target_channel.send(
+                    content=_format_idpw_reminder(
+                        title="FINAL CALL",
+                        message="The match begins in 1 minute.",
+                        confirmed_role_id=scrim.confirmed_role_id,
+                    ),
                     allowed_mentions=role_mentions,
                 )
+                if not _track_active_idpw_message(scrim.id, state, reminder):
+                    await reminder.delete()
         except asyncio.CancelledError:
             raise
         except (discord.Forbidden, discord.HTTPException):
@@ -2243,7 +2292,8 @@ async def _publish_idpwg(
                 if game_number < scrim.max_matches
                 else 1
             )
-        active_idpw[scrim.id] = {"message": message, "tasks": []}
+        state = {"message": message, "messages": [message], "tasks": []}
+        active_idpw[scrim.id] = state
     except (discord.Forbidden, discord.HTTPException):
         logger.exception("Could not publish MATCH ACCESS for scrim %s.", scrim.id)
         await send_private_command_feedback(
