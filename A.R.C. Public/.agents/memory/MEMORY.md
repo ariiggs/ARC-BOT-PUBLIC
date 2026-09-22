@@ -1,9 +1,0 @@
-- [Discord slot interaction safety](discord-slot-interaction-safety.md) — serialize decisions, validate immutable assignment generations, and disable components manually.
-- [Two-stage captain roles](two-stage-captain-roles.md) — legacy per-scrim manager roles migrate to Pending; Confirmed stays unset until explicitly configured.
-- [Scrim lifecycle state](scrim-lifecycle-state.md) — keep cancellation, opening, and archive state durable so Discord boards can recover safely.
-- [Discord command privacy](discord-command-privacy.md) — DM legacy prefix-command feedback and remove public invocations when possible.
-- [Guild whitelist bootstrap](guild-whitelist-bootstrap.md) — whitelist access is empty by default; authorize target IDs before inviting or through the bot owner’s DM.
-- [Captain and co-captain slots](captain-co-captain-slots.md) — preserve manager compatibility while enforcing one primary captain plus one co-captain per slot.
-- [V1.5 storage migration](v15-storage-migration.md) — migrate scrim configuration through the atomic versioned JSON snapshot, not a duplicate SQL table.
-- [Match map rotation](match-map-rotation.md) — each configured game has exactly one unique map; reducing games keeps the next match counter valid.
-- [Setup navigation states](setup-panel-navigation.md) — keep dashboard, scrim selector, and selected-scrim actions as separate staff-bound views.
