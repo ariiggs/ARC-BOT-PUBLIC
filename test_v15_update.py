@@ -62,7 +62,7 @@ class V15UpdateTests(unittest.TestCase):
             self.assertEqual(restored.pw_type, "fixed")
             self.assertEqual(restored.fixed_pw, "")
             self.assertEqual(restored.current_match_counter, 1)
-            self.assertEqual(migrated.payload()["version"], 18)
+            self.assertEqual(migrated.payload()["version"], 19)
 
     def test_help_embed_has_requested_categories_and_commands(self):
         embed = build_help_embed()
@@ -72,6 +72,10 @@ class V15UpdateTests(unittest.TestCase):
         self.assertIn("🛠️ Staff & Setup", field_names)
         self.assertIn("🎮 Match Management", field_names)
         self.assertIn("👤 Players", field_names)
+        players = next(
+            field.value for field in embed.fields if field.name == "👤 Players"
+        )
+        self.assertIn("!register Team Name / Tag [/ @Manager]", players)
         self.assertTrue(any("!slots" in field.value for field in embed.fields))
         self.assertTrue(any("!idpwg[1-25]" in field.value for field in embed.fields))
 
