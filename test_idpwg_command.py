@@ -135,6 +135,37 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
         reminder.delete.assert_awaited_once_with()
         self.assertNotIn("scrim-1", active)
 
+    async def test_clearing_a_run_deletes_a_mismatched_persisted_announcement(self):
+        active_message = SimpleNamespace(id=101, delete=AsyncMock())
+        persisted_message = SimpleNamespace(id=202, delete=AsyncMock())
+        channel = SimpleNamespace(
+            fetch_message=AsyncMock(return_value=persisted_message)
+        )
+        scrim = SimpleNamespace(id="scrim-1", guild_id=123)
+        config = SimpleNamespace(
+            announcement_message_id=202,
+            target_channel_id=303,
+        )
+        active = {
+            "scrim-1": {
+                "message": active_message,
+                "messages": [active_message],
+                "tasks": [],
+            }
+        }
+
+        with (
+            patch("main.active_idpw", active),
+            patch("main.repository.get_idpw_config", return_value=config),
+            patch("main.repository.get", return_value=scrim),
+            patch("main.configured_text_channel", new=AsyncMock(return_value=channel)),
+            patch("main.repository.set_idpw_announcement"),
+        ):
+            await clear_active_idpw("scrim-1")
+
+        active_message.delete.assert_awaited_once_with()
+        persisted_message.delete.assert_awaited_once_with()
+
     async def test_fixed_mode_uses_the_individual_match_assignment(self):
         scrim = self.make_scrim(
             match_maps=["Miramar", "Erangel", "Erangel", "Miramar"]
