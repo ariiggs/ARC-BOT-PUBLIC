@@ -1,0 +1,86 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "N6Qoys1xCKIC4TwBeb6p_"
+uri = "file://exports/apex-scrims-manager.zip"
+type = "unspecified"
+title = "Apex Scrims Manager — projet ZIP"
+description = "Archive prête à télécharger puis importer dans un nouveau projet Replit. Le token Discord et la base SQLite ne sont pas inclus."
+logical_id = "2c2bb9b6-3a61-4009-802d-5cb2650dfb2f"
+content_hash = "sha256:b62b815bc64c1576848e2f160350f401a4146ea0407f3dbcc8d8bb1bbdcfc1a7"
+size = 3221937
+mtime_ms = 1789702282376
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/2c2bb9b6-3a61-4009-802d-5cb2650dfb2f/57180387-8d61-4b1f-9c48-b57b17f9c367"
+storage_version_token = "1789702286088504"
+content_type = "application/octet-stream"
+
+[[outputs]]
+id = "hBU8STkPIX3Ww_bNVCMb4"
+uri = "file://exports/apex-scrims-manager-runtime-updated.zip"
+type = "unspecified"
+title = "Apex Scrims Manager — export simplifié"
+description = "Archive complète sans !cap leave. !cap remove permet au capitaine principal de retirer le co-capitaine ou au co-capitaine de retirer le capitaine principal et prendre sa place."
+logical_id = "83383798-bb7a-42d1-b353-c8c8af29b62f"
+content_hash = "sha256:5a259637d98d21e6e855320f5afa989be8082f18a9c2a8ddd90bf24b74dcfc24"
+size = 55068
+mtime_ms = 1789978236881
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/83383798-bb7a-42d1-b353-c8c8af29b62f/4f756c13-a06c-415b-ad71-934f8b1a6944"
+storage_version_token = "1789978241676930"
+content_type = "application/octet-stream"
+
+[[outputs]]
+id = "EBqPEUlpf3iFXaOfmnK2d"
+uri = "file://exports/apex-scrims-manager-patch-main-scrim-state.zip"
+type = "unspecified"
+title = "Apex Scrims Manager — Patch"
+description = "Archive ZIP contenant uniquement le patch exporté."
+logical_id = "11d09876-a7e1-4968-a164-6a183a0d921c"
+content_hash = "sha256:d3be8d69073befbb9b884793dfe1af6f67b17dc28ce96c37b34bbfe2e2677e4b"
+size = 52344
+mtime_ms = 1789996344445
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/11d09876-a7e1-4968-a164-6a183a0d921c/6223f83f-d0cb-468d-8cfa-8d1cbe52a498"
+storage_version_token = "1790011471335548"
+content_type = "application/octet-stream"
+
+[[outputs]]
+id = "UOaPQPiJoDoVxcFQ1Aee3"
+uri = "file://exports/apex-scrims-manager-patch-latest.zip"
+type = "unspecified"
+title = "Apex Scrims Manager — Latest Patch"
+description = "Updated patch archive containing the new !slots statistics command, !publish_slots board publishing command, documentation, and tests."
+logical_id = "f3823121-9261-4cd7-9217-1545c3b44142"
+content_hash = "sha256:aefdccf4f90695d9833881bab3dee68472336a43d2c460500ddde014dc16922c"
+size = 65191
+mtime_ms = 1790092716991
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/f3823121-9261-4cd7-9217-1545c3b44142/a314b21c-94a0-4f8c-b602-217596b689f6"
+storage_version_token = "1790092721881331"
+content_type = "application/octet-stream"
+
+[[outputs]]
+id = "sX_nN_iA0k-qDbNDxGlO5"
+uri = "file://patches/arc-bot-v15-idpwg-update.patch"
+type = "unspecified"
+title = "A.R.C. Bot V1.5 + idpwg patch"
+description = "Unified patch from the pre-V1.5 baseline through the current storage migration, idpwg aliases, help updates, setup panel changes, and tests. Verified with git apply --check."
+logical_id = "d29d07b7-0e8b-49a5-aa05-54061565a695"
+content_hash = "sha256:c2a7f93f9e550b84d2db885a0197ca5d8309b25ce9f45b6a66ea42a2e6c7eac7"
+size = 38087
+mtime_ms = 1790097130429
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/d29d07b7-0e8b-49a5-aa05-54061565a695/3a7f1f35-1edd-4d74-81b8-b4089cffe9f9"
+storage_version_token = "1790097138406529"
+content_type = "application/octet-stream"
+
+[[outputs]]
+id = "9wEO_3CsoRQYpLqd0C8rP"
+uri = "file://exports/apex-scrims-manager-runtime-v15-idpwg.zip"
+type = "unspecified"
+title = "Apex Scrims Manager — IDPW FIXED/DYNAMIC update"
+description = "Corrected BotHosting runtime package. The ID/PW setup panel now lets staff choose FIXED or DYNAMIC mode, persists that choice, and validates the matching !idpw or !idpwg command behavior. Full suite: 85 tests passing."
+logical_id = "27c17ce5-dc62-4715-a7c4-7e1d9820c23d"
+content_hash = "sha256:fed0f515a0733245cd2a857c4df2391de3975cf5af17c968ec6899e595d9a1a4"
+size = 68860
+mtime_ms = 1790097944253
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/27c17ce5-dc62-4715-a7c4-7e1d9820c23d/70ee9847-bdce-4fcd-ab38-462d33c7e143"
+storage_version_token = "1790097957073812"
+content_type = "application/octet-stream"

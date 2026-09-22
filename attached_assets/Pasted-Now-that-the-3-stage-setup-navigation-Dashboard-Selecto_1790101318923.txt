@@ -1,0 +1,23 @@
+Now that the 3-stage `!setup` navigation (Dashboard > Selector > Management Menu) is successfully implemented and tested, let's build the detailed Configuration Grid for the "Add Scrim" (Setup Wizard) and "Edit Configuration" views.
+
+1. **The Button Grid Layout (Used in both Wizard and Edit modes):**
+   Implement a strict categorized button grid using `discord.ui.View` row properties:
+   - **Row 1 (Channels):** `Public Ch.` | `Staff Ch.` | `ID/PW Target` | `Logs & History` (Style: Primary)
+   - **Row 2 (Roles):** `Pending Role` | `Confirmed Role` (Style: Primary)
+   - **Row 3 (Settings):** `Matches` | `Custom Maps` | `PW Mode` | `Timezone` (Style: Primary)
+   - **Row 4 (Actions for Wizard):** `🟥 Cancel Draft` (Danger) | `🟩 ✅ Confirm & Activate` (Success, disabled until mandatory fields are set).
+   - **Row 4 (Actions for Edit Menu):** `🔄 Reset Match Counter` (Secondary) | `⬜ ↩️ Back to Selector` (Secondary).
+
+2. **Single-Input Modals:**
+   - Every Primary button in Rows 1, 2, and 3 must trigger a `discord.ui.Modal` containing EXACTLY ONE text input relevant to that setting (e.g., clicking "Public Ch." asks only for the channel ID).
+   - *Note:* Do NOT include a button for the staff role, as it is handled globally via the `!set` command.
+
+3. **"Matches" & "Custom Maps" Logic:**
+   - "Custom Maps" is strictly OPTIONAL. The `Confirm & Activate` button must unlock even if maps are left blank, provided all other fields are configured.
+   - Clicking `Custom Maps` opens a Modal with a placeholder like "Erangel, Miramar, Sanhok".
+   - **Smart Edit Dependency:** If the user is in the Edit Menu and updates the `Matches` count, the bot must immediately set the `maps` column to NULL in the database for that scrim. Return an ephemeral warning: "⚠️ Match count updated. Previous map rotation cleared. Click 'Custom Maps' to configure the new rotation."
+
+4. **Dynamic Embed Updates:**
+   - **Setup Wizard Embed:** Display a checklist using 🔴 (Missing) and 🟢 (Configured) for each setting.
+   - **Edit Menu Embed:** Display the actual current database values (e.g., `<#123456789>`, `4 Matches`, `DYNAMIC`).
+   - Every time a Modal is submitted, update the database and immediately re-render the View/Embed so the user sees the changes in real-time.

@@ -1,0 +1,43 @@
+Please analyze the current codebase of this Discord bot (specifically the SQLite database schema, the slot management UI, the `!setup` architecture, and the `!idpw` command logic). 
+
+I am preparing to deploy the "V1.6 Update" which completely overhauls the tournament management architecture. Compare my current code against the V1.6 requirements listed below, and generate a strict "Gap Analysis Report". 
+
+For each point, tell me:
+✅ ALREADY CONFIGURED (if the code currently handles it)
+⚠️ NEEDS MODIFICATION (if it partially exists but needs updating to match the new logic)
+❌ MISSING / TO BUILD (if it doesn't exist at all yet)
+
+### V1.6 Update Requirements:
+
+1. **Database Schema (`scrims` table):**
+   - Must contain: `timezone`, `maps`, `max_matches`, `pw_type` ('FIXED'/'DYNAMIC'), `fixed_pw`, and `current_match_counter`.
+   - Must NO LONGER require a per-scrim `staff_role` (should rely entirely on a global role set via `!set`).
+
+2. **Command Logic (`!idpw` and dynamic aliases):**
+   - `!idpw` base command auto-increments the `current_match_counter`.
+   - Dynamic aliases `!idpwg1` to `!idpwg32` available to force a specific match number.
+   - Command expects different arguments based on DB `pw_type` (2 args for FIXED, 3 args for DYNAMIC).
+   - Output format includes the conditional Map Name (if configured for that match index) and Start Time calculated with the DB `timezone`.
+
+3. **Anti-Spam Security:**
+   - The UI "Confirm" button for slot registration checks the DB first. If the slot is already 'Pending' or 'Confirmed', it aborts and sends an ephemeral message: "⏳ You have already confirmed your slot."
+
+4. **Global Dashboard UI (`!setup` Main Menu):**
+   - The `!setup` base message is a Global Dashboard showing a text list of all existing scrims and their statuses.
+   - It only has TWO buttons: `🟩 Add Scrim` and `🟦 Manage Scrims`.
+   - NO dropdown is present on this main view.
+
+5. **Setup Wizard UI (Add Scrim Flow):**
+   - Clicking `Add Scrim` triggers a Modal for the name, then creates an inactive DB draft.
+   - Transforms into a Setup Wizard View with a grid of individual buttons (Row 1: Channels, Row 2: Roles, Row 3: Settings).
+   - Dynamic checklist embedded (🔴 Missing / 🟢 Configured).
+   - "Custom Maps" configuration is optional and independent of Match Count.
+   - `Confirm & Activate` button remains locked (disabled) until all mandatory settings are filled.
+
+6. **Manage Scrims & Edit Flow:**
+   - Clicking `Manage Scrims` opens an interstitial view with a Dropdown to select the scrim.
+   - Upon selection, opens the Edit Grid (mirroring the Setup Wizard layout).
+   - Smart Match Dependency: Updating the Match Count automatically wipes the existing Maps list and warns the user.
+   - Includes operational buttons: `🔄 Reset Match Counter` (without wiping settings) and `🟥 Delete Scrim`.
+
+Please read my files and give me the Status Report now.
