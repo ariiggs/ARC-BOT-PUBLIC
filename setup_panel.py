@@ -1065,78 +1065,76 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
         def __init__(self, grid: "ConfigurationGridView"):
             super().__init__(grid.owner_id, grid.guild_id, timeout=300)
             self.grid = grid
-            for setting, label in (
-                ("registration_channel", "Registration Channel"),
-                ("registration_role", "Registration Role"),
-                ("registration_mode", "Registration Mode"),
-            ):
-                button = discord.ui.Button(
-                    label=label,
-                    style=discord.ButtonStyle.primary,
-                    row=0,
-                )
+            channel_picker = discord.ui.ChannelSelect(
+                channel_types=[discord.ChannelType.text],
+                placeholder="Select the Registration channel",
+                min_values=1,
+                max_values=1,
+                row=0,
+            )
+            role_picker = discord.ui.RoleSelect(
+                placeholder="Select the Registration role",
+                min_values=1,
+                max_values=1,
+                row=1,
+            )
+            mode_picker = discord.ui.Select(
+                placeholder="Select registration handling",
+                min_values=1,
+                max_values=1,
+                options=[
+                    discord.SelectOption(
+                        label="Auto-accept",
+                        description="Allocate the next available slot immediately.",
+                        value="auto",
+                        default=self.grid.registration_auto_accept,
+                    ),
+                    discord.SelectOption(
+                        label="Staff validation",
+                        description="Send each registration to staff for approval.",
+                        value="review",
+                        default=not self.grid.registration_auto_accept,
+                    ),
+                ],
+                row=2,
+            )
 
-                async def callback(
-                    interaction: discord.Interaction,
-                    setting=setting,
-                ) -> None:
-                    if not await self.interaction_check(interaction):
-                        return
-                    if setting == "registration_channel":
-                        await interaction.response.edit_message(
-                            content="Select the public team registration channel.",
-                            embed=None,
-                            view=GridChannelDropdownView(
-                                self.grid, "registration"
-                            ),
-                        )
-                    elif setting == "registration_role":
-                        await interaction.response.edit_message(
-                            content=(
-                                "Select the role allowed to use `!register`. "
-                                "You may select @everyone."
-                            ),
-                            embed=None,
-                            view=GridRoleDropdownView(
-                                self.grid, "registration_role"
-                            ),
-                        )
-                    else:
-                        await interaction.response.edit_message(
-                            content="Choose how public registrations are handled.",
-                            embed=None,
-                            view=GridDropdownView(
-                                self.grid,
-                                "registration_mode",
-                                title="Select registration handling",
-                                options=[
-                                    discord.SelectOption(
-                                        label="Auto-accept",
-                                        description=(
-                                            "Allocate the next available slot immediately."
-                                        ),
-                                        value="auto",
-                                        default=self.grid.registration_auto_accept,
-                                    ),
-                                    discord.SelectOption(
-                                        label="Staff validation",
-                                        description=(
-                                            "Send each registration to staff for approval."
-                                        ),
-                                        value="review",
-                                        default=not self.grid.registration_auto_accept,
-                                    ),
-                                ],
-                            ),
-                        )
+            async def channel_callback(interaction: discord.Interaction) -> None:
+                if await self.interaction_check(interaction):
+                    await self.grid.apply_setting(
+                        interaction,
+                        "registration",
+                        str(channel_picker.values[0].id),
+                    )
 
-                button.callback = callback
-                self.add_item(button)
+            async def role_callback(interaction: discord.Interaction) -> None:
+                if await self.interaction_check(interaction):
+                    role = role_picker.values[0]
+                    await self.grid.apply_setting(
+                        interaction,
+                        "registration_role",
+                        str(role.id),
+                    )
+
+            async def mode_callback(interaction: discord.Interaction) -> None:
+                if await self.interaction_check(interaction):
+                    await self.grid.apply_setting(
+                        interaction,
+                        "registration_mode",
+                        mode_picker.values[0],
+                    )
+
+            channel_picker.callback = channel_callback
+            role_picker.callback = role_callback
+            mode_picker.callback = mode_callback
+            self.add_item(channel_picker)
+            self.add_item(role_picker)
+            self.add_item(mode_picker)
 
             back_button = discord.ui.Button(
                 label="Back",
                 style=discord.ButtonStyle.secondary,
-                row=1,
+                row=3,
             )
 
             async def back_callback(interaction: discord.Interaction) -> None:
