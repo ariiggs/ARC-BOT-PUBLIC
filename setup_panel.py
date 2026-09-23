@@ -1440,8 +1440,13 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             self.history_channel_id = scrim.history_channel_id
             self.registration_channel_id = getattr(scrim, "registration_channel_id", None)
             self.registration_role_id = getattr(scrim, "registration_role_id", None)
-            self.registration_auto_accept = getattr(
+            registration_auto_accept = getattr(
                 scrim, "registration_auto_accept", False
+            )
+            self.registration_auto_accept = (
+                registration_auto_accept
+                if type(registration_auto_accept) is bool
+                else False
             )
             self.pending_role_id = scrim.pending_role_id
             self.confirmed_role_id = scrim.confirmed_role_id

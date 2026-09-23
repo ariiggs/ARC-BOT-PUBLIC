@@ -704,7 +704,8 @@ class ScrimRepository:
                 if payload["version"] < 19:
                     values.setdefault("registration_channel_id", None)
                     values.setdefault("registration_role_id", None)
-                    values.setdefault("registration_auto_accept", False)
+                    if type(values.get("registration_auto_accept")) is not bool:
+                        values["registration_auto_accept"] = False
                 # Match selectors now support at most 25 games. Keep older
                 # snapshots usable by trimming only the newly unsupported tail.
                 if type(values.get("max_matches")) is int and values["max_matches"] > MAX_MATCHES:
@@ -1548,6 +1549,8 @@ class ScrimRepository:
             if registration_auto_accept is _UNSET
             else registration_auto_accept
         )
+        if next_registration_auto_accept is None:
+            next_registration_auto_accept = False
         next_start = scrim.slot_start if slot_start is _UNSET else slot_start
         next_end = scrim.slot_end if slot_end is _UNSET else slot_end
         validate_slot_range(next_start, next_end)

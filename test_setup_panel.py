@@ -9,6 +9,59 @@ from slot_storage import SlotStateStore
 
 
 class SetupPanelTests(unittest.TestCase):
+    def test_legacy_null_registration_mode_migrates_before_channel_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SlotStateStore(Path(directory) / "state.sqlite3")
+            repository = ScrimRepository(store)
+            scrim = repository.create(
+                123,
+                "Legacy Registration",
+                101,
+                102,
+                cap_channel_id=103,
+                logs_channel_id=104,
+                history_channel_id=105,
+            )
+            legacy = repository.payload()
+            legacy["version"] = 18
+            legacy["scrims"][0]["registration_channel_id"] = None
+            legacy["scrims"][0]["registration_role_id"] = None
+            legacy["scrims"][0]["registration_auto_accept"] = None
+            store.save(legacy)
+
+            migrated = ScrimRepository(store)
+            migrated.load()
+            restored = migrated.get(scrim.id)
+            self.assertIsNotNone(restored)
+            self.assertFalse(restored.registration_auto_accept)
+
+            migrated.update_scrim(
+                scrim.id,
+                123,
+                registration_channel_id=106,
+                registration_role_id=None,
+                registration_auto_accept=restored.registration_auto_accept,
+            )
+            self.assertEqual(migrated.get(scrim.id).registration_channel_id, 106)
+
+    def test_update_normalizes_an_old_in_memory_null_registration_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScrimRepository(
+                SlotStateStore(Path(directory) / "state.sqlite3")
+            )
+            scrim = repository.create(123, "In Memory Legacy", 101, 102)
+            scrim.registration_auto_accept = None
+
+            repository.update_scrim(
+                scrim.id,
+                123,
+                registration_channel_id=106,
+            )
+
+            updated = repository.get(scrim.id)
+            self.assertEqual(updated.registration_channel_id, 106)
+            self.assertFalse(updated.registration_auto_accept)
+
     def test_registration_channel_update_persists_atomic_registration_settings(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = ScrimRepository(
