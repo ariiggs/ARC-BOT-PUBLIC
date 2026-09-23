@@ -366,13 +366,16 @@ async def send_private_registration_feedback(
 
 
 async def purge_channel_messages(channel) -> bool:
-    """Clear a channel in batches, reporting failure without aborting reset."""
+    """Clear unpinned channel messages in batches, preserving pinned messages."""
     purge = getattr(channel, "purge", None)
     if purge is None:
         return False
     try:
         while True:
-            deleted = await purge(limit=100)
+            deleted = await purge(
+                limit=100,
+                check=lambda message: not getattr(message, "pinned", False),
+            )
             if len(deleted) < 100:
                 return True
     except discord.Forbidden:
@@ -1977,6 +1980,7 @@ async def perform_scrim_reset(scrim: Scrim, invoking_channel) -> str:
             with repository.transaction():
                 for slot in scrim.slots.values():
                     slot.clear()
+                scrim.pending_registrations.clear()
                 scrim.current_match_counter = 1
         for manager_id in manager_ids:
             await revoke_manager_access_if_unused(scrim, manager_id)
@@ -1985,7 +1989,14 @@ async def perform_scrim_reset(scrim: Scrim, invoking_channel) -> str:
             return "This scrim no longer exists. The reset was stopped."
 
         channels_to_clear = []
-        for channel_id in (scrim.staff_channel_id, scrim.public_channel_id):
+        registration_channel_id = getattr(scrim, "registration_channel_id", None)
+        for channel_id in (
+            scrim.staff_channel_id,
+            scrim.public_channel_id,
+            registration_channel_id,
+        ):
+            if channel_id is None:
+                continue
             channel = (
                 invoking_channel
                 if invoking_channel is not None and invoking_channel.id == channel_id
@@ -2024,10 +2035,21 @@ async def perform_scrim_reset(scrim: Scrim, invoking_channel) -> str:
 
         channels_cleared = all(
             channel_clear_results.get(channel_id, False)
-            for channel_id in (scrim.staff_channel_id, scrim.public_channel_id)
+            for channel_id in (
+                scrim.staff_channel_id,
+                scrim.public_channel_id,
+                scrim.registration_channel_id,
+            )
+            if channel_id is not None
         )
         if updated and channels_cleared:
-            return "✅ All slots are now available and both scrim channels were cleared."
+            cleared_channel_label = "staff and public"
+            if registration_channel_id is not None:
+                cleared_channel_label += ", and registration"
+            return (
+                f"✅ All slots are now available and the {cleared_channel_label} "
+                "channels were cleared (pinned messages were kept)."
+            )
         if updated:
             return (
                 "✅ All slots are now available and the public board was updated, "
@@ -2153,11 +2175,15 @@ async def reset_slots(ctx: commands.Context) -> None:
     if scrim is None:
         return
     confirmation = ResetConfirmationView(scrim, ctx.channel.id)
+    reset_channel_label = "staff and public"
+    if getattr(scrim, "registration_channel_id", None) is not None:
+        reset_channel_label += ", and registration"
     confirmation_message = await send_private_command_feedback(
         ctx,
         (
             f"⚠️ Reset **{discord.utils.escape_markdown(scrim.name)}**? "
-            "This clears every slot and both configured scrim channels. "
+            f"This clears every slot and the configured {reset_channel_label} "
+            "channels, keeping pinned messages. "
             "Click **Confirm Reset** to continue."
         ),
         view=confirmation,
