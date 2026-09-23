@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from main import bot, build_help_embed
+from main import bot, build_help_copy_text, build_help_embed
 from scrim_state import DEFAULT_MATCH_MAPS, ScrimRepository
 from slot_storage import SlotStateStore
 
@@ -78,6 +78,15 @@ class V15UpdateTests(unittest.TestCase):
         self.assertIn("!register Team Name / Tag [/ @Manager]", captains)
         self.assertIn("!cap add", captains)
         self.assertIn("!slots", captains)
+
+    def test_help_copy_text_contains_both_categories_and_fits_discord_message_limit(self):
+        copy_text = build_help_copy_text()
+
+        self.assertIn("STAFF", copy_text)
+        self.assertIn("CAPTAINS", copy_text)
+        self.assertIn("multiple lines to bulk-add teams", copy_text)
+        self.assertIn("!register Team Name / Tag [/ @Manager]", copy_text)
+        self.assertLessEqual(len(copy_text), 2000)
 
     def test_specific_match_commands_are_registered(self):
         self.assertIsNotNone(bot.get_command("idpwg1"))
