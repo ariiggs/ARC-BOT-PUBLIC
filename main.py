@@ -3928,12 +3928,12 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
         return
 
     message = (
-        f"✅ **{discord.utils.escape_markdown(team_name)}** registered in "
+        f"✅ {discord.utils.escape_markdown(team_name)} registered in "
         f"Slot {snapshot.number:02d}. Your slot is reserved; use the public "
         "board to confirm it when prompted."
         if scrim.registration_auto_accept
         else (
-            f"📝 **{discord.utils.escape_markdown(team_name)}** registration "
+            f"✅ {discord.utils.escape_markdown(team_name)} registration "
             f"received for Slot {snapshot.number:02d}. Staff validation is required."
         )
     )
@@ -3944,12 +3944,12 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
         warnings.append("the slot board could not be refreshed")
     if warnings:
         message += " Warning: " + " and ".join(warnings) + "."
-    await ctx.send(
+    await send_private_command_feedback(
+        ctx,
         message,
-        allowed_mentions=discord.AllowedMentions.none(),
+        delete_command=False,
         delete_after=20,
     )
-    await delete_command_message(ctx)
 
 
 @bot.command(name="add")
