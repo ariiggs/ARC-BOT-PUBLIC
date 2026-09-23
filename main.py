@@ -2411,6 +2411,9 @@ HELP_STAFF_TEXT = (
     "`!confirm <slot> [slot ...]` — confirm one or more pending slots.\n"
     "`!remove <slot> [slot ...]` — release one or more registered slots.\n"
     "`!open` / `!close` — enable or disable manager board actions.\n"
+    "`!slots [Scrim Name]` — display real-time registration status; one scrim "
+    "is selected automatically and multiple scrims use a dropdown.\n"
+    "`!remind` — remind reserved managers to confirm or cancel.\n"
     "`!update [Scrim Name]` — publish or refresh the selected slot board.\n"
     "`!idpw <room_id> / <minutes>` — send room details and schedule alerts.\n"
     "`!idpwg[1-25] <room_id> / <minutes>` — fixed-password match access.\n"
@@ -2419,12 +2422,10 @@ HELP_STAFF_TEXT = (
 
 HELP_CAPTAINS_TEXT = (
     "`!register Team Name / Tag [/ @Manager]` — register a team in the "
-    "configured public registration channel; the manager mention is optional.\n"
-    "`!slots [Scrim Name]` — display real-time registration status; one scrim "
-    "is selected automatically and multiple scrims use a dropdown.\n"
-    "`!remind` — remind reserved managers to confirm or cancel.\n"
-    "`✅ Confirm` / `❌ Cancel` — manager actions on the public board.\n"
-    "`!cap add`, `!cap transfer`, `!cap remove` — manage team captains."
+    "configured public registration channel; captains and members with the "
+    "configured registration role may use it, and the manager mention is optional.\n"
+    "`!cap add`, `!cap transfer`, `!cap remove` — manage captains for your assigned team.\n"
+    "`✅ Confirm` / `❌ Cancel` — clickable slot actions for the assigned captain."
 )
 
 
