@@ -6,6 +6,7 @@ import copy
 import math
 import re
 import secrets
+import string
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -40,6 +41,13 @@ DEFAULT_EMOJI_AVAILABLE = "⚪"
 DEFAULT_EMOJI_RESERVED = "🔵"
 DEFAULT_EMOJI_PENDING = "🟠"
 DEFAULT_EMOJI_CONFIRMED = "🟢"
+DEFAULT_LICENSE_TYPE = "Standard"
+LICENSE_TYPES = ("Standard", "Gold")
+DEFAULT_KILL_POINTS_VALUE = 1
+DEFAULT_PLACEMENT_POINTS_STRING = "10 6 5 4 3 2 1"
+LEADERBOARD_LAYOUTS = ("1_col", "2_col")
+DEFAULT_LEADERBOARD_BACKGROUND = "reference"
+LEADERBOARD_BACKGROUNDS = ("reference", "legacy")
 EMOJI_FIELDS = (
     "emoji_available",
     "emoji_reserved",
@@ -52,6 +60,82 @@ DEFAULT_SCRIM_EMOJIS = {
     "emoji_pending": DEFAULT_EMOJI_PENDING,
     "emoji_confirmed": DEFAULT_EMOJI_CONFIRMED,
 }
+OPERATIONAL_MESSAGE_KEYS = (
+    "open_registration",
+    "close_registration",
+    "open_slots",
+    "close_slots",
+)
+OPERATIONAL_MESSAGE_CONTEXTS = ("registration", "slots")
+DEFAULT_OPERATIONAL_MESSAGE_REFS: dict[str, dict[str, int]] = {}
+DEFAULT_OPERATIONAL_MESSAGES = {
+    "open_registration": "✅ Registrations are now open for **{scrim}**.",
+    "close_registration": "🔒 Registrations are now closed for **{scrim}**.",
+    "open_slots": "✅ Slot confirmations are now open for **{scrim}**.",
+    "close_slots": "🔒 Slot confirmations are now closed for **{scrim}**.",
+}
+
+
+def normalize_operational_messages(value: object) -> dict[str, str]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError("Operational messages must be an object.")
+    if any(key not in OPERATIONAL_MESSAGE_KEYS for key in value):
+        raise ValueError("Operational messages contain an unknown key.")
+    normalized: dict[str, str] = {}
+    for key in OPERATIONAL_MESSAGE_KEYS:
+        message = value.get(key, DEFAULT_OPERATIONAL_MESSAGES[key])
+        if (
+            not isinstance(message, str)
+            or not message.strip()
+            or len(message) > 2000
+            or "\x00" in message
+        ):
+            raise ValueError("Operational messages must be 1–2000 characters.")
+        try:
+            fields = {
+                field_name
+                for _, field_name, _, _ in string.Formatter().parse(message)
+                if field_name is not None
+            }
+        except ValueError as error:
+            raise ValueError(
+                "Operational messages contain invalid placeholders."
+            ) from error
+        if not fields.issubset({"scrim", "channel"}):
+            raise ValueError(
+                "Operational messages may only use {scrim} and {channel}."
+            )
+        normalized[key] = message.strip()
+    return normalized
+
+
+def normalize_operational_message_refs(
+    value: object,
+) -> dict[str, dict[str, int]]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError("Operational message references must be an object.")
+    if any(key not in OPERATIONAL_MESSAGE_CONTEXTS for key in value):
+        raise ValueError("Operational message references contain an unknown key.")
+    normalized: dict[str, dict[str, int]] = {}
+    for context, reference in value.items():
+        if (
+            not isinstance(reference, dict)
+            or set(reference) != {"message_id", "channel_id"}
+            or type(reference["message_id"]) is not int
+            or reference["message_id"] <= 0
+            or type(reference["channel_id"]) is not int
+            or reference["channel_id"] <= 0
+        ):
+            raise ValueError("Operational message references are invalid.")
+        normalized[context] = {
+            "message_id": reference["message_id"],
+            "channel_id": reference["channel_id"],
+        }
+    return normalized
 
 
 def normalize_map_pool(
@@ -126,6 +210,14 @@ class RegistrationRequest:
     manager_id: int
     assignment_id: int
     registration_message_id: int | None = None
+
+
+@dataclass(frozen=True)
+class MatchScore:
+    match_number: int
+    slot_number: int
+    kills: int
+    placement: int
 
 
 @dataclass
@@ -206,6 +298,12 @@ class Scrim:
     staff_message_id: int | None = None
     is_open: bool = True
     registration_open: bool = True
+    operational_messages: dict[str, str] = field(
+        default_factory=lambda: dict(DEFAULT_OPERATIONAL_MESSAGES)
+    )
+    operational_message_refs: dict[str, dict[str, int]] = field(
+        default_factory=lambda: dict(DEFAULT_OPERATIONAL_MESSAGE_REFS)
+    )
     slot_start: int = DEFAULT_SLOT_START
     slot_end: int = DEFAULT_SLOT_END
     slots: dict[int, Slot] = field(default_factory=empty_slots)
@@ -216,6 +314,11 @@ class Scrim:
     pw_type: str = "fixed"
     fixed_pw: str = ""
     current_match_counter: int = 1
+    kill_points_value: int = DEFAULT_KILL_POINTS_VALUE
+    placement_points_string: str = DEFAULT_PLACEMENT_POINTS_STRING
+    leaderboard_layout: str = "1_col"
+    leaderboard_background: str = DEFAULT_LEADERBOARD_BACKGROUND
+    match_scores: dict[tuple[int, int], MatchScore] = field(default_factory=dict)
     pending_registrations: dict[str, RegistrationRequest] = field(
         default_factory=dict
     )
@@ -248,6 +351,11 @@ class Scrim:
             "staff_message_id": self.staff_message_id,
             "is_open": self.is_open,
             "registration_open": self.registration_open,
+            "operational_messages": dict(self.operational_messages),
+            "operational_message_refs": {
+                context: dict(reference)
+                for context, reference in self.operational_message_refs.items()
+            },
             "slot_start": self.slot_start,
             "slot_end": self.slot_end,
             "slots": [asdict(slot) for slot in self.slots.values()],
@@ -258,6 +366,14 @@ class Scrim:
             "pw_type": self.pw_type,
             "fixed_pw": self.fixed_pw,
             "current_match_counter": self.current_match_counter,
+            "kill_points_value": self.kill_points_value,
+            "placement_points_string": self.placement_points_string,
+            "leaderboard_layout": self.leaderboard_layout,
+            "leaderboard_background": self.leaderboard_background,
+            "match_scores": [
+                asdict(score)
+                for _, score in sorted(self.match_scores.items())
+            ],
             "pending_registrations": [
                 asdict(request) for request in self.pending_registrations.values()
             ],
@@ -270,6 +386,7 @@ class ServerConfig:
     head_staff_role_id: int | None
     staff_role_id: int | None
     logs_channel_id: int | None
+    license_type: str = DEFAULT_LICENSE_TYPE
 
     def payload(self) -> dict:
         return {
@@ -277,6 +394,7 @@ class ServerConfig:
             "head_staff_role_id": self.head_staff_role_id,
             "staff_role_id": self.staff_role_id,
             "logs_channel_id": self.logs_channel_id,
+            "license_type": self.license_type,
         }
 
 
@@ -464,6 +582,46 @@ def _read_registration_requests(
     return result
 
 
+def parse_placement_points(value: str) -> list[int]:
+    if not isinstance(value, str):
+        raise ValueError("Placement points must be text.")
+    parts = value.split()
+    if not parts or any(not part.isdigit() for part in parts):
+        raise ValueError("Placement points must be space-separated whole numbers.")
+    points = [int(part) for part in parts]
+    if any(point < 0 for point in points):
+        raise ValueError("Placement points cannot be negative.")
+    return points
+
+
+def _read_match_scores(entries, slots, max_matches: int) -> dict[tuple[int, int], MatchScore]:
+    if not isinstance(entries, list):
+        raise ValueError("Invalid match score list.")
+    result: dict[tuple[int, int], MatchScore] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {
+            "match_number", "slot_number", "kills", "placement"
+        }:
+            raise ValueError("Invalid match score fields.")
+        score = MatchScore(**entry)
+        if (
+            type(score.match_number) is not int
+            or not 1 <= score.match_number <= max_matches
+            or type(score.slot_number) is not int
+            or score.slot_number not in slots
+            or type(score.kills) is not int
+            or score.kills < 0
+            or type(score.placement) is not int
+            or score.placement < 1
+        ):
+            raise ValueError("Invalid match score.")
+        key = (score.match_number, score.slot_number)
+        if key in result:
+            raise ValueError("Duplicate match score.")
+        result[key] = score
+    return result
+
+
 def _legacy_payload(payload) -> dict:
     if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
         raise ValueError("Invalid legacy snapshot.")
@@ -602,7 +760,7 @@ class ScrimRepository:
 
     def payload(self) -> dict:
         return {
-            "version": 22,
+            "version": 26,
             "scrims": [s.payload() for s in self.scrims.values()],
             "server_configs": [
                 config.payload() for config in self.server_configs.values()
@@ -643,7 +801,7 @@ class ScrimRepository:
         try:
             version = payload.get("version")
             if type(version) is not int or version not in (
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26
             ):
                 raise ValueError("Unsupported snapshot version.")
             if not isinstance(payload["scrims"], list):
@@ -790,6 +948,29 @@ class ScrimRepository:
                             request.setdefault("registration_message_id", None)
                 if payload["version"] < 22:
                     values.setdefault("registration_open", True)
+                if payload["version"] < 25:
+                    values.setdefault(
+                        "operational_messages",
+                        dict(DEFAULT_OPERATIONAL_MESSAGES),
+                    )
+                if payload["version"] < 26:
+                    values.setdefault(
+                        "operational_message_refs",
+                        dict(DEFAULT_OPERATIONAL_MESSAGE_REFS),
+                    )
+                if payload["version"] < 23:
+                    values.setdefault("kill_points_value", DEFAULT_KILL_POINTS_VALUE)
+                    values.setdefault(
+                        "placement_points_string",
+                        DEFAULT_PLACEMENT_POINTS_STRING,
+                    )
+                    values.setdefault("leaderboard_layout", "1_col")
+                    values.setdefault("match_scores", [])
+                if payload["version"] < 24:
+                    values.setdefault(
+                        "leaderboard_background",
+                        DEFAULT_LEADERBOARD_BACKGROUND,
+                    )
                 # Match selectors now support at most 25 games. Keep older
                 # snapshots usable by trimming only the newly unsupported tail.
                 if type(values.get("max_matches")) is int and values["max_matches"] > MAX_MATCHES:
@@ -828,6 +1009,17 @@ class ScrimRepository:
                     values["slot_start"],
                     values["slot_end"],
                 )
+                values["match_scores"] = _read_match_scores(
+                    values["match_scores"],
+                    values["slots"],
+                    values["max_matches"],
+                )
+                values["operational_messages"] = normalize_operational_messages(
+                    values.get("operational_messages")
+                )
+                values["operational_message_refs"] = normalize_operational_message_refs(
+                    values.get("operational_message_refs")
+                )
                 # Runtime-only fields must never be read from disk.
                 if set(values) != {
                     "id", "guild_id", "name", "public_channel_id",
@@ -839,9 +1031,14 @@ class ScrimRepository:
                     "public_message_id", "staff_message_id",
                     "emoji_available", "emoji_reserved", "emoji_pending",
                      "emoji_confirmed", "is_open", "registration_open",
+                     "operational_messages",
+                     "operational_message_refs",
                      "slot_start", "slot_end", "slots",
                     "timezone", "maps", "max_matches", "match_maps", "pw_type", "fixed_pw",
-                    "current_match_counter", "pending_registrations",
+                     "current_match_counter", "kill_points_value",
+                     "placement_points_string", "leaderboard_layout",
+                     "leaderboard_background",
+                     "match_scores", "pending_registrations",
                 }:
                     raise ValueError("Invalid scrim fields.")
                 scrim = Scrim(**values)
@@ -938,6 +1135,14 @@ class ScrimRepository:
                     or any(character in scrim.fixed_pw for character in ("\r", "\n"))
                     or type(scrim.current_match_counter) is not int
                     or not 1 <= scrim.current_match_counter <= scrim.max_matches
+                    or type(scrim.kill_points_value) is not int
+                    or scrim.kill_points_value < 0
+                    or (
+                        not isinstance(scrim.placement_points_string, str)
+                        or not parse_placement_points(scrim.placement_points_string)
+                    )
+                    or scrim.leaderboard_layout not in LEADERBOARD_LAYOUTS
+                    or scrim.leaderboard_background not in LEADERBOARD_BACKGROUNDS
                 ):
                     raise ValueError("Invalid scrim identity or channel.")
                 name_key = (scrim.guild_id, scrim.name.casefold())
@@ -972,11 +1177,13 @@ class ScrimRepository:
                 if payload["version"] < 9:
                     for field_name in EMOJI_FIELDS:
                         config_entry.pop(field_name, None)
+                config_entry.setdefault("license_type", DEFAULT_LICENSE_TYPE)
                 if set(config_entry) != {
                     "guild_id",
                     "head_staff_role_id",
                     "staff_role_id",
                     "logs_channel_id",
+                    "license_type",
                 }:
                     raise ValueError("Invalid server configuration fields.")
                 config = ServerConfig(**config_entry)
@@ -998,6 +1205,7 @@ class ScrimRepository:
                         config.head_staff_role_id is not None
                         and config.head_staff_role_id == config.staff_role_id
                     )
+                    or config.license_type not in LICENSE_TYPES
                     or config.guild_id in configs
                 ):
                     raise ValueError("Invalid server configuration.")
@@ -1108,7 +1316,7 @@ class ScrimRepository:
             except (KeyError, TypeError, ValueError) as error:
                 raise SlotStorageError("Invalid legacy snapshot; migration was stopped.") from error
             new_payload = {
-            "version": 22,
+                "version": 26,
                 "scrims": [],
                 "server_configs": [],
                 "idpw_configs": [],
@@ -1150,7 +1358,7 @@ class ScrimRepository:
         self.authorized_guild_expires_at = authorized_guild_expires_at
         self.authorized_guild_duration_days = authorized_guild_duration_days
         self.authorized_admin_ids = authorized_admin_ids
-        if payload.get("version", 0) < 22:
+        if payload.get("version", 0) < 26:
             self.store.save(self.payload())
 
     @contextmanager
@@ -1204,8 +1412,16 @@ class ScrimRepository:
                     "public_message_id",
                     "staff_message_id",
                     "is_open",
+                    "registration_open",
+                    "operational_messages",
+                    "operational_message_refs",
                     "slot_start",
                     "slot_end",
+                    "kill_points_value",
+                    "placement_points_string",
+                    "leaderboard_layout",
+                    "leaderboard_background",
+                    "match_scores",
                     "pending_registrations",
                 ):
                     setattr(target, name, getattr(saved, name))
@@ -1215,7 +1431,6 @@ class ScrimRepository:
                 }
                 for number, slot in saved.slots.items():
                     target.slots[number].__dict__.update(vars(slot))
-                target.pending_registrations = saved.pending_registrations.copy()
                 target.deleted = False
             self.scrims = objects
             self.legacy = legacy
@@ -1237,12 +1452,14 @@ class ScrimRepository:
         head_staff_role_id: int,
         staff_role_id: int,
         logs_channel_id: int,
+        license_type: str = DEFAULT_LICENSE_TYPE,
     ) -> ServerConfig:
         config = ServerConfig(
             guild_id,
             head_staff_role_id,
             staff_role_id,
             logs_channel_id,
+            license_type,
         )
         if (
             not _positive_id(guild_id)
@@ -1250,6 +1467,7 @@ class ScrimRepository:
             or not _positive_id(staff_role_id)
             or not _positive_id(logs_channel_id)
             or head_staff_role_id == staff_role_id
+            or license_type not in LICENSE_TYPES
         ):
             raise ValueError("Invalid server configuration.")
         with self.transaction():
@@ -1266,6 +1484,7 @@ class ScrimRepository:
             current.head_staff_role_id if current is not None else None,
             staff_role_id,
             current.logs_channel_id if current is not None else None,
+            current.license_type if current is not None else DEFAULT_LICENSE_TYPE,
         )
         with self.transaction():
             self.server_configs[guild_id] = config
@@ -1298,6 +1517,190 @@ class ScrimRepository:
             for field_name, emoji in DEFAULT_SCRIM_EMOJIS.items():
                 setattr(scrim, field_name, emoji)
         return scrim
+
+    def update_operational_message(
+        self,
+        scrim_id: str,
+        guild_id: int,
+        key: str,
+        message: str,
+    ) -> Scrim:
+        return self.update_operational_messages(
+            scrim_id,
+            guild_id,
+            {key: message},
+        )
+
+    def update_operational_messages(
+        self,
+        scrim_id: str,
+        guild_id: int,
+        messages: dict[str, str],
+    ) -> Scrim:
+        if not isinstance(messages, dict) or any(
+            key not in OPERATIONAL_MESSAGE_KEYS for key in messages
+        ):
+            raise ValueError("Unknown operational message.")
+        scrim = self.get(scrim_id)
+        if scrim is None or scrim.guild_id != guild_id:
+            raise ValueError("This scrim does not exist on this server.")
+        normalized = normalize_operational_messages(
+            {**scrim.operational_messages, **messages}
+        )
+        with self.transaction():
+            scrim.operational_messages = normalized
+        return scrim
+
+    def set_operational_message_reference(
+        self,
+        scrim_id: str,
+        guild_id: int,
+        context: str,
+        message_id: int,
+        channel_id: int,
+    ) -> Scrim:
+        if context not in OPERATIONAL_MESSAGE_CONTEXTS:
+            raise ValueError("Unknown operational message context.")
+        refs = normalize_operational_message_refs(
+            {context: {"message_id": message_id, "channel_id": channel_id}}
+        )
+        scrim = self.get(scrim_id)
+        if scrim is None or scrim.guild_id != guild_id:
+            raise ValueError("This scrim does not exist on this server.")
+        updated = dict(scrim.operational_message_refs)
+        updated[context] = refs[context]
+        with self.transaction():
+            scrim.operational_message_refs = normalize_operational_message_refs(
+                updated
+            )
+        return scrim
+
+    def clear_operational_message_reference(
+        self,
+        scrim_id: str,
+        guild_id: int,
+        context: str,
+    ) -> Scrim:
+        if context not in OPERATIONAL_MESSAGE_CONTEXTS:
+            raise ValueError("Unknown operational message context.")
+        scrim = self.get(scrim_id)
+        if scrim is None or scrim.guild_id != guild_id:
+            raise ValueError("This scrim does not exist on this server.")
+        updated = dict(scrim.operational_message_refs)
+        updated.pop(context, None)
+        with self.transaction():
+            scrim.operational_message_refs = normalize_operational_message_refs(
+                updated
+            )
+        return scrim
+
+    def reset_operational_message(
+        self,
+        scrim_id: str,
+        guild_id: int,
+        key: str,
+    ) -> Scrim:
+        if key not in OPERATIONAL_MESSAGE_KEYS:
+            raise ValueError("Unknown operational message.")
+        scrim = self.get(scrim_id)
+        if scrim is None or scrim.guild_id != guild_id:
+            raise ValueError("This scrim does not exist on this server.")
+        updated = dict(scrim.operational_messages)
+        updated[key] = DEFAULT_OPERATIONAL_MESSAGES[key]
+        with self.transaction():
+            scrim.operational_messages = normalize_operational_messages(updated)
+        return scrim
+
+    def update_leaderboard_settings(
+        self,
+        scrim_id: str,
+        guild_id: int,
+        *,
+        kill_points_value: int | object = _UNSET,
+        placement_points_string: str | object = _UNSET,
+        leaderboard_layout: str | object = _UNSET,
+        leaderboard_background: str | object = _UNSET,
+    ) -> Scrim:
+        scrim = self.get(scrim_id)
+        if scrim is None or scrim.guild_id != guild_id:
+            raise ValueError("This scrim does not exist on this server.")
+        next_kill_points = (
+            scrim.kill_points_value
+            if kill_points_value is _UNSET
+            else kill_points_value
+        )
+        next_placement_points = (
+            scrim.placement_points_string
+            if placement_points_string is _UNSET
+            else placement_points_string
+        )
+        next_layout = (
+            scrim.leaderboard_layout
+            if leaderboard_layout is _UNSET
+            else leaderboard_layout
+        )
+        next_background = (
+            scrim.leaderboard_background
+            if leaderboard_background is _UNSET
+            else leaderboard_background
+        )
+        if (
+            type(next_kill_points) is not int
+            or next_kill_points < 0
+            or not parse_placement_points(next_placement_points)
+            or next_layout not in LEADERBOARD_LAYOUTS
+            or next_background not in LEADERBOARD_BACKGROUNDS
+        ):
+            raise ValueError("Invalid leaderboard configuration.")
+        with self.transaction():
+            scrim.kill_points_value = next_kill_points
+            scrim.placement_points_string = next_placement_points
+            scrim.leaderboard_layout = next_layout
+            scrim.leaderboard_background = next_background
+        return scrim
+
+    def get_match_scores(self, scrim_id: str) -> list[MatchScore]:
+        scrim = self.get(scrim_id)
+        if scrim is None:
+            return []
+        return [
+            score
+            for _, score in sorted(scrim.match_scores.items())
+        ]
+
+    def upsert_match_scores(
+        self,
+        scrim_id: str,
+        guild_id: int,
+        match_number: int,
+        scores: list[MatchScore],
+    ) -> int:
+        scrim = self.get(scrim_id)
+        if scrim is None or scrim.guild_id != guild_id:
+            raise ValueError("This scrim does not exist on this server.")
+        if (
+            type(match_number) is not int
+            or not 1 <= match_number <= scrim.max_matches
+        ):
+            raise ValueError(
+                f"Match number must be between 1 and {scrim.max_matches}."
+            )
+        for score in scores:
+            if (
+                not isinstance(score, MatchScore)
+                or score.match_number != match_number
+                or score.slot_number not in scrim.slots
+                or scrim.slots[score.slot_number].status == STATUS_AVAILABLE
+                or type(score.kills) is not int
+                or score.kills < 0
+                or type(score.placement) is not int
+                or score.placement < 1
+            ):
+                raise ValueError("Invalid match score.")
+        with self.transaction():
+            for score in scores:
+                scrim.match_scores[(score.match_number, score.slot_number)] = score
+        return len(scores)
 
     def get_idpw_config(self, scrim_id: str) -> IdPwConfig | None:
         return self.idpw_configs.get(scrim_id)
@@ -1386,6 +1789,10 @@ class ScrimRepository:
         max_matches: int = len(DEFAULT_MATCH_MAPS),
         maps: list[str] | tuple[str, ...] = DEFAULT_MATCH_MAPS,
         match_maps: list[str] | tuple[str, ...] | None = None,
+        kill_points_value: int = DEFAULT_KILL_POINTS_VALUE,
+        placement_points_string: str = DEFAULT_PLACEMENT_POINTS_STRING,
+        leaderboard_layout: str = "1_col",
+        leaderboard_background: str = DEFAULT_LEADERBOARD_BACKGROUND,
     ) -> Scrim:
         name = normalize_name(name)
         validate_slot_range(slot_start, slot_end)
@@ -1410,6 +1817,14 @@ class ScrimRepository:
             raise ValueError("Configured role and channel IDs must be positive integers.")
         if type(registration_auto_accept) is not bool:
             raise ValueError("Registration auto-acceptance must be a boolean.")
+        if (
+            type(kill_points_value) is not int
+            or kill_points_value < 0
+            or not parse_placement_points(placement_points_string)
+            or leaderboard_layout not in LEADERBOARD_LAYOUTS
+            or leaderboard_background not in LEADERBOARD_BACKGROUNDS
+        ):
+            raise ValueError("Invalid leaderboard configuration.")
         if (
             staff_role_id is not None
             and pending_role_id is not None
@@ -1494,6 +1909,10 @@ class ScrimRepository:
             max_matches=max_matches,
             maps=maps,
             match_maps=match_maps,
+            kill_points_value=kill_points_value,
+            placement_points_string=placement_points_string,
+            leaderboard_layout=leaderboard_layout,
+            leaderboard_background=leaderboard_background,
         )
 
     def create(
@@ -1518,6 +1937,10 @@ class ScrimRepository:
         max_matches: int = len(DEFAULT_MATCH_MAPS),
         maps: list[str] | tuple[str, ...] = DEFAULT_MATCH_MAPS,
         match_maps: list[str] | tuple[str, ...] | None = None,
+        kill_points_value: int = DEFAULT_KILL_POINTS_VALUE,
+        placement_points_string: str = DEFAULT_PLACEMENT_POINTS_STRING,
+        leaderboard_layout: str = "1_col",
+        leaderboard_background: str = DEFAULT_LEADERBOARD_BACKGROUND,
     ) -> Scrim:
         # The caller validates that selected Discord channels belong to this guild.
         # Reusing the original public channel adopts rather than overwrites v1 data.
@@ -1555,6 +1978,10 @@ class ScrimRepository:
             max_matches=max_matches,
             maps=maps,
             match_maps=match_maps,
+            kill_points_value=kill_points_value,
+            placement_points_string=placement_points_string,
+            leaderboard_layout=leaderboard_layout,
+            leaderboard_background=leaderboard_background,
         )
         with self.transaction():
             self.scrims[scrim.id] = scrim

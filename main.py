@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import logging
 import os
 import re
@@ -15,6 +16,7 @@ from pathlib import Path
 
 import discord
 from discord.ext import commands
+from PIL import Image, ImageDraw, ImageFont
 
 from slot_storage import SlotStateStore, SlotStorageError
 from scrim_state import (
@@ -22,12 +24,18 @@ from scrim_state import (
     STATUS_CONFIRMED,
     STATUS_PENDING,
     STATUS_RESERVED,
+    DEFAULT_PLACEMENT_POINTS_STRING,
+    DEFAULT_OPERATIONAL_MESSAGES,
+    OPERATIONAL_MESSAGE_KEYS,
+    LEADERBOARD_LAYOUTS,
+    MatchScore,
     MAX_MATCHES,
     Scrim,
     ScrimRepository,
     RegistrationRequest,
     Slot,
     SlotSnapshot,
+    parse_placement_points,
     timezone_for_name,
 )
 
@@ -39,6 +47,12 @@ logger = logging.getLogger("pung-scrim-bot")
 
 FIGURE_SPACE = "\u2007"
 SUPPORT_SERVER_URL = "https://discord.gg/S8uaGEJGv8"
+LEADERBOARD_BACKGROUND = (
+    Path(__file__).parent / "assets" / "leaderboard-background.png"
+)
+LEGACY_LEADERBOARD_BACKGROUND = (
+    Path(__file__).parent / "assets" / "leaderboard-background-legacy.png"
+)
 
 state_store = SlotStateStore(
     os.getenv("SLOTS_DB_PATH", str(Path(__file__).parent / "data" / "slots.sqlite3"))
@@ -56,6 +70,7 @@ _loaded = False
 # Each scrim owns its own live announcement and alert tasks.
 active_idpw: dict[str, dict[str, object]] = {}
 logs_coverage_snapshots_sent: set[str] = set()
+selected_scrims: dict[tuple[int, int], str] = {}
 
 
 class UnauthorizedGuild(commands.CheckFailure):
@@ -276,6 +291,12 @@ async def require_staff_scrim(
         )
         return None
     scrim = resolve_channel_scrim(ctx)
+    selected = False
+    if scrim is None and not public_only:
+        selected_scrim = resolve_selected_scrim(ctx)
+        if selected_scrim is not None:
+            scrim = selected_scrim
+            selected = True
     allowed_channel_ids = (
         (scrim.public_channel_id, scrim.staff_channel_id)
         if scrim is not None and allow_public
@@ -285,7 +306,7 @@ async def require_staff_scrim(
         if scrim is not None
         else ()
     )
-    if scrim is None or ctx.channel.id not in allowed_channel_ids:
+    if scrim is None or (not selected and ctx.channel.id not in allowed_channel_ids):
         if public_only:
             message = "This command must be used in the configured public slots channel."
         elif allow_public:
@@ -551,7 +572,23 @@ def resolve_channel_scrim(ctx: commands.Context, *, staff_only: bool = False) ->
     return matches[0] if len(matches) == 1 else None
 
 
+def resolve_selected_scrim(ctx: commands.Context) -> Scrim | None:
+    """Return the user's selected scrim while it remains active on this server."""
+    if ctx.guild is None:
+        return None
+    key = (ctx.guild.id, ctx.author.id)
+    scrim_id = selected_scrims.get(key)
+    if scrim_id is None:
+        return None
+    scrim = repository.get(scrim_id)
+    if scrim is None or scrim.guild_id != ctx.guild.id:
+        selected_scrims.pop(key, None)
+        return None
+    return scrim
+
+
 def resolve_registration_scrim(ctx: commands.Context) -> Scrim | None:
+    """Resolve the scrim whose optional public registration channel was used."""
     if ctx.guild is None:
         return None
     matches = [
@@ -562,7 +599,134 @@ def resolve_registration_scrim(ctx: commands.Context) -> Scrim | None:
     return matches[0] if len(matches) == 1 else None
 
 
+class UseScrimSelectView(discord.ui.View):
+    """Let Staff select an active scrim without typing its exact name."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        scrims: list[Scrim],
+    ) -> None:
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.scrim_ids = {scrim.id for scrim in scrims}
+        self.message = None
+
+        select = discord.ui.Select(
+            placeholder="Select an active scrim...",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=scrim.name[:100],
+                    value=scrim.id,
+                )
+                for scrim in scrims[:25]
+            ],
+        )
+
+        async def callback(interaction: discord.Interaction) -> None:
+            if interaction.user.id != self.owner_id:
+                await interaction.response.send_message(
+                    "This scrim selector belongs to another user.",
+                    ephemeral=True,
+                )
+                return
+            if interaction.guild is None or interaction.guild.id != self.guild_id:
+                await interaction.response.send_message(
+                    "This selector is not valid in this server.",
+                    ephemeral=True,
+                )
+                return
+
+            selected_id = select.values[0]
+            if selected_id not in self.scrim_ids:
+                await interaction.response.send_message(
+                    "That scrim selection is no longer available.",
+                    ephemeral=True,
+                )
+                self.stop()
+                return
+
+            scrim = repository.get(selected_id)
+            if (
+                scrim is None
+                or scrim.guild_id != self.guild_id
+                or not is_active(scrim)
+            ):
+                await interaction.response.send_message(
+                    "That scrim is no longer active.",
+                    ephemeral=True,
+                )
+                self.stop()
+                return
+            if not member_is_staff(interaction.user, scrim):
+                await interaction.response.send_message(
+                    "You need the configured Staff role to select this scrim.",
+                    ephemeral=True,
+                )
+                self.stop()
+                return
+
+            selected_scrims[(self.guild_id, interaction.user.id)] = scrim.id
+            await interaction.response.edit_message(
+                content=(
+                    f"✅ Selected scrim: "
+                    f"**{discord.utils.escape_markdown(scrim.name)}**. "
+                    "Staff commands can now use it outside a configured scrim "
+                    "channel."
+                ),
+                view=None,
+            )
+            self.stop()
+
+        select.callback = callback
+        self.add_item(select)
+
+
+@bot.command(name="use", aliases=["select"])
+@commands.guild_only()
+async def use_scrim(ctx: commands.Context) -> None:
+    """Select a scrim for staff commands used outside a configured channel."""
+    if ctx.guild is None:
+        return
+
+    active_scrims = [
+        scrim
+        for scrim in repository.list(ctx.guild.id)
+        if not getattr(scrim, "deleted", False)
+        and member_is_staff(ctx.author, scrim)
+    ]
+    if not active_scrims:
+        await send_private_command_feedback(
+            ctx,
+            "No active scrims are available for your Staff role.",
+            silent=False,
+        )
+        return
+
+    view = UseScrimSelectView(
+        owner_id=ctx.author.id,
+        guild_id=ctx.guild.id,
+        scrims=active_scrims,
+    )
+    try:
+        view.message = await ctx.send(
+            "Select an active scrim to use for your staff commands:",
+            view=view,
+            delete_after=120,
+        )
+    except discord.HTTPException:
+        logger.exception("Could not show the !use scrim selector.")
+    finally:
+        await delete_command_message(ctx)
+
+
 def registration_role_allows(ctx: commands.Context, scrim: Scrim) -> bool:
+    """Check the configured registration role, including @everyone."""
     role_id = getattr(scrim, "registration_role_id", None)
     if role_id is None or ctx.guild is None:
         return False
@@ -647,6 +811,507 @@ async def set_registration_channel_open(
         with repository.transaction():
             scrim.registration_open = is_open
     return True
+
+
+OPERATIONAL_MESSAGE_LABELS = {
+    "open_registration": "Open registrations",
+    "close_registration": "Close registrations",
+    "open_slots": "Open slot confirmations",
+    "close_slots": "Close slot confirmations",
+}
+
+
+def resolve_operational_scrim(ctx: commands.Context) -> Scrim | None:
+    """Resolve a scrim from its registration, public, or staff channel."""
+    return resolve_registration_scrim(ctx) or resolve_channel_scrim(ctx)
+
+
+def operational_message(scrim: Scrim, key: str) -> str:
+    template = getattr(scrim, "operational_messages", {}).get(
+        key, DEFAULT_OPERATIONAL_MESSAGES[key]
+    )
+    scrim_name = str(getattr(scrim, "name", "this scrim"))
+    public_channel_id = getattr(scrim, "public_channel_id", 0)
+    replacements = {
+        "scrim": discord.utils.escape_markdown(scrim_name),
+        "channel": f"<#{public_channel_id}>",
+    }
+    try:
+        return template.format(**replacements)
+    except (KeyError, ValueError):
+        logger.warning(
+            "Invalid operational message template for scrim %s and key %s.",
+            scrim.id,
+            key,
+        )
+        return DEFAULT_OPERATIONAL_MESSAGES[key].format(**replacements)
+
+
+async def send_operational_message(
+    ctx: commands.Context,
+    scrim: Scrim,
+    key: str,
+) -> None:
+    context = (
+        "registration"
+        if key in {"open_registration", "close_registration"}
+        else "slots"
+    )
+    reference = getattr(scrim, "operational_message_refs", {}).get(context)
+    if reference is not None:
+        channel = bot.get_channel(reference["channel_id"])
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(reference["channel_id"])
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                logger.exception(
+                    "Could not resolve the previous operational message channel "
+                    "for scrim %s.",
+                    scrim.id,
+                )
+        if channel is not None:
+            try:
+                previous = await channel.fetch_message(reference["message_id"])
+                await previous.delete()
+            except discord.NotFound:
+                try:
+                    repository.clear_operational_message_reference(
+                        scrim.id, scrim.guild_id, context
+                    )
+                except (SlotStorageError, ValueError):
+                    logger.exception(
+                        "Could not clear the missing operational message reference "
+                        "for scrim %s.",
+                        scrim.id,
+                    )
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception(
+                    "Could not delete the previous operational message for scrim %s.",
+                    scrim.id,
+                )
+            else:
+                try:
+                    repository.clear_operational_message_reference(
+                        scrim.id, scrim.guild_id, context
+                    )
+                except (SlotStorageError, ValueError):
+                    logger.exception(
+                        "Could not clear the previous operational message reference "
+                        "for scrim %s.",
+                        scrim.id,
+                    )
+    try:
+        sent = await ctx.send(
+            operational_message(scrim, key),
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                users=False,
+                roles=True,
+                replied_user=False,
+            ),
+        )
+    except discord.HTTPException:
+        logger.exception(
+            "Could not send operational message %s for scrim %s.",
+            key,
+            scrim.id,
+        )
+        return
+    sent_id = getattr(sent, "id", None)
+    channel_id = getattr(ctx.channel, "id", None)
+    if type(sent_id) is int and sent_id > 0 and type(channel_id) is int and channel_id > 0:
+        try:
+            repository.set_operational_message_reference(
+                scrim.id,
+                scrim.guild_id,
+                context,
+                sent_id,
+                channel_id,
+            )
+        except (SlotStorageError, ValueError):
+            logger.exception(
+                "Could not save the operational message reference for scrim %s.",
+                scrim.id,
+            )
+
+
+def operational_message_panel_text(scrim: Scrim | None) -> str:
+    if scrim is None:
+        return (
+            "**Operational Messages**\n"
+            "Select a scrim, then choose which `!open`/`!close` messages to edit."
+        )
+    return (
+        f"**Operational Messages — "
+        f"{discord.utils.escape_markdown(scrim.name)}**\n"
+        "Choose **Registrations** or **Slots** to edit the two messages for "
+        "that operational channel.\n"
+        "Available placeholders: `{scrim}` and `{channel}`."
+    )
+
+
+def operational_message_preview(message: str) -> str:
+    message = message.replace("```", "'''")
+    if len(message) > 900:
+        message = f"{message[:897]}..."
+    return message
+
+
+class OperationalMessageView(discord.ui.View):
+    """Staff-bound panel for editing a scrim's operational messages."""
+
+    def __init__(
+        self,
+        owner_id: int,
+        guild_id: int,
+        *,
+        selected_id: str | None = None,
+    ):
+        super().__init__(timeout=900)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.selected_id = selected_id
+        self.message: discord.Message | None = None
+        self.rebuild()
+
+    def scrims(self) -> list[Scrim]:
+        return repository.list(self.guild_id)
+
+    def selected_scrim(self) -> Scrim | None:
+        selected = repository.get(self.selected_id) if self.selected_id else None
+        return selected if selected and selected.guild_id == self.guild_id else None
+
+    def authorized(self, interaction: discord.Interaction) -> bool:
+        return bool(
+            interaction.guild is not None
+            and interaction.guild.id == self.guild_id
+            and interaction.user.id == self.owner_id
+            and member_is_staff_in_guild(interaction.user, self.guild_id)
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.authorized(interaction):
+            return True
+        text = (
+            "This message panel belongs to another staff member, "
+            "or you no longer have staff access."
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+        return False
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        logger.exception("Operational message panel interaction failed", exc_info=error)
+        text = (
+            "The message could not be saved. Nothing was changed."
+            if isinstance(error, (SlotStorageError, ValueError))
+            else "Something went wrong. Please try again."
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+
+    def content(self) -> str:
+        return operational_message_panel_text(self.selected_scrim())
+
+    def embed(self) -> discord.Embed:
+        scrim = self.selected_scrim()
+        embed = discord.Embed(
+            title="Operational Messages",
+            description=(
+                "Select a scrim below to edit the messages sent by `!open` "
+                "and `!close`."
+                if scrim is None
+                else (
+                    f"**{discord.utils.escape_markdown(scrim.name)}**\n"
+                    "The current templates are shown below. Choose a category "
+                    "to edit both its open and close messages."
+                )
+            ),
+            color=discord.Color.blurple(),
+        )
+        if scrim is not None:
+            messages = getattr(scrim, "operational_messages", {})
+            for key in OPERATIONAL_MESSAGE_KEYS:
+                embed.add_field(
+                    name=OPERATIONAL_MESSAGE_LABELS[key],
+                    value=operational_message_preview(
+                        messages.get(key, DEFAULT_OPERATIONAL_MESSAGES[key])
+                    ),
+                    inline=False,
+                )
+        return embed
+
+    def rebuild(self) -> None:
+        self.clear_items()
+        scrims = self.scrims()
+        selected = self.selected_scrim()
+        if selected is None and self.selected_id is not None:
+            self.selected_id = None
+
+        if scrims:
+            options = [
+                discord.SelectOption(
+                    label=discord.utils.escape_markdown(scrim.name)[:100],
+                    value=scrim.id,
+                    default=scrim.id == self.selected_id,
+                )
+                for scrim in scrims
+            ]
+            selector = discord.ui.Select(
+                placeholder="Select a scrim...",
+                min_values=1,
+                max_values=1,
+                options=options,
+                row=0,
+            )
+
+            async def select_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                self.selected_id = selector.values[0]
+                self.rebuild()
+                await interaction.response.edit_message(
+                    content=self.content(),
+                    embed=self.embed(),
+                    view=self,
+                )
+
+            selector.callback = select_callback
+            self.add_item(selector)
+
+        registration_button = discord.ui.Button(
+            label="Registrations",
+            emoji="📝",
+            style=discord.ButtonStyle.primary,
+            disabled=(
+                selected is None
+                or getattr(selected, "registration_channel_id", None) is None
+            ),
+            row=1,
+        )
+        slots_button = discord.ui.Button(
+            label="Slots",
+            emoji="🎮",
+            style=discord.ButtonStyle.primary,
+            disabled=selected is None,
+            row=1,
+        )
+
+        async def registration_callback(interaction: discord.Interaction) -> None:
+            if await self.interaction_check(interaction):
+                await interaction.response.send_modal(
+                    OperationalMessageModal(self, "registration")
+                )
+
+        async def slots_callback(interaction: discord.Interaction) -> None:
+            if await self.interaction_check(interaction):
+                await interaction.response.send_modal(
+                    OperationalMessageModal(self, "slots")
+                )
+
+        registration_button.callback = registration_callback
+        slots_button.callback = slots_callback
+        self.add_item(registration_button)
+        self.add_item(slots_button)
+
+        reset_button = discord.ui.Button(
+            label="Reset Selected",
+            emoji="↩️",
+            style=discord.ButtonStyle.danger,
+            disabled=selected is None,
+            row=2,
+        )
+        close_button = discord.ui.Button(
+            label="Close",
+            emoji="✖️",
+            style=discord.ButtonStyle.secondary,
+            row=2,
+        )
+
+        async def reset_callback(interaction: discord.Interaction) -> None:
+            if not await self.interaction_check(interaction):
+                return
+            scrim = self.selected_scrim()
+            if scrim is None:
+                await interaction.response.send_message(
+                    "Select a scrim first.", ephemeral=True
+                )
+                return
+            try:
+                repository.update_operational_messages(
+                    scrim.id,
+                    self.guild_id,
+                    dict(DEFAULT_OPERATIONAL_MESSAGES),
+                )
+            except (SlotStorageError, ValueError):
+                logger.exception("Could not reset operational messages")
+                await interaction.response.send_message(
+                    "The messages could not be reset. Nothing was changed.",
+                    ephemeral=True,
+                )
+                return
+            self.rebuild()
+            await interaction.response.edit_message(
+                content=self.content(),
+                embed=self.embed(),
+                view=self,
+            )
+
+        async def close_callback(interaction: discord.Interaction) -> None:
+            if not await self.interaction_check(interaction):
+                return
+            self.stop()
+            await interaction.response.edit_message(
+                content="Operational message panel closed.",
+                embed=None,
+                view=None,
+            )
+
+        reset_button.callback = reset_callback
+        close_button.callback = close_callback
+        self.add_item(reset_button)
+        self.add_item(close_button)
+
+    async def refresh_message(self) -> None:
+        self.rebuild()
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=self.content(),
+                embed=self.embed(),
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not refresh the operational message panel")
+
+
+class OperationalMessageModal(discord.ui.Modal):
+    open_message = discord.ui.TextInput(
+        label="Message after !open",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=2000,
+    )
+    close_message = discord.ui.TextInput(
+        label="Message after !close",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=2000,
+    )
+
+    def __init__(self, panel: OperationalMessageView, category: str):
+        super().__init__(
+            title=(
+                "Edit registration messages"
+                if category == "registration"
+                else "Edit slot messages"
+            )[:45],
+            timeout=300,
+        )
+        self.panel = panel
+        self.category = category
+        scrim = panel.selected_scrim()
+        if scrim is not None:
+            messages = getattr(scrim, "operational_messages", {})
+            prefix = "registration" if category == "registration" else "slots"
+            self.open_message.default = messages.get(
+                f"open_{prefix}", DEFAULT_OPERATIONAL_MESSAGES[f"open_{prefix}"]
+            )
+            self.close_message.default = messages.get(
+                f"close_{prefix}", DEFAULT_OPERATIONAL_MESSAGES[f"close_{prefix}"]
+            )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not self.panel.authorized(interaction):
+            await interaction.response.send_message(
+                "This message panel is no longer available to you.",
+                ephemeral=True,
+            )
+            return
+        scrim = self.panel.selected_scrim()
+        if scrim is None:
+            await interaction.response.send_message(
+                "That scrim no longer exists.", ephemeral=True
+            )
+            return
+        prefix = "registration" if self.category == "registration" else "slots"
+        try:
+            repository.update_operational_messages(
+                scrim.id,
+                self.panel.guild_id,
+                {
+                    f"open_{prefix}": str(self.open_message.value).strip(),
+                    f"close_{prefix}": str(self.close_message.value).strip(),
+                },
+            )
+        except (SlotStorageError, ValueError) as error:
+            await interaction.response.send_message(
+                f"The messages could not be saved. {error}",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        await self.panel.refresh_message()
+        await interaction.followup.send(
+            "✅ The operational messages were saved.",
+            ephemeral=True,
+        )
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception
+    ) -> None:
+        logger.exception("Operational message modal failed", exc_info=error)
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                "The messages could not be saved. Nothing was changed.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "The messages could not be saved. Nothing was changed.",
+                ephemeral=True,
+            )
+
+
+@bot.command(name="msg")
+@commands.guild_only()
+async def configure_operational_message(ctx: commands.Context) -> None:
+    """Open the staff panel for customizing !open and !close messages."""
+    if not member_is_staff_in_guild(ctx.author, ctx.guild.id):
+        await send_private_command_feedback(
+            ctx,
+            "You do not have the configured Staff role to use `!msg`.",
+            silent=False,
+        )
+        return
+    selected = resolve_operational_scrim(ctx)
+    panel = OperationalMessageView(
+        ctx.author.id,
+        ctx.guild.id,
+        selected_id=selected.id if selected is not None else None,
+    )
+    try:
+        panel.message = await ctx.send(
+            panel.content(),
+            embed=panel.embed(),
+            view=panel,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        logger.exception("Could not open the operational message panel")
+        return
+    await delete_command_message(ctx)
 
 
 async def require_channel_scrim(
@@ -1155,7 +1820,7 @@ async def send_reset_history_snapshot(scrim: Scrim) -> bool:
     )
     try:
         await channel.send(
-            f"🏆 **Résumé du Scrim — {discord.utils.escape_markdown(scrim.name)}**\n"
+            f"🏆 **Scrim Summary — {discord.utils.escape_markdown(scrim.name)}**\n"
             f"📅 {timestamp}\n\n"
             f"{build_slots_message(scrim)}",
             allowed_mentions=discord.AllowedMentions.none(),
@@ -1233,8 +1898,12 @@ def captain_slot_id(scrim: Scrim, slot: Slot) -> str:
 
 
 CAP_CHANNEL_RESTRICTION_MESSAGE = (
-    "❌ **Command restricted.** Please use the designated captain management "
+    "❌ **Command restricted.** Please use the designated Cap Transfer "
     "channel for this command."
+)
+CAP_ROLE_RESTRICTION_MESSAGE = (
+    "❌ **Command restricted.** You need the Pending or Confirmed Captain "
+    "role for this scrim to use captain commands."
 )
 
 
@@ -1249,19 +1918,68 @@ def cap_channel_is_allowed(
     )
 
 
+def cap_role_is_allowed(
+    member: object,
+    guild_id: int,
+    scrim: Scrim | None = None,
+    channel_id: int | None = None,
+) -> bool:
+    """Allow captain commands to captain-status roles and staff."""
+    if member_is_admin(member) or member_is_staff_in_guild(member, guild_id):
+        return True
+    roles = {
+        getattr(role, "id", None) for role in getattr(member, "roles", ())
+    }
+    scrims = (
+        [scrim]
+        if scrim is not None
+        else [
+            configured
+            for configured in repository.list(guild_id)
+            if configured.cap_channel_id == channel_id
+        ]
+    )
+    return any(
+        configured is not None
+        and bool(
+            {
+                role_id
+                for role_id in (
+                    getattr(configured, "pending_role_id", None),
+                    getattr(configured, "confirmed_role_id", None),
+                )
+                if role_id is not None
+            }.intersection(roles)
+        )
+        for configured in scrims
+    )
+
+
 async def require_cap_channel(
     ctx: commands.Context, scrim: Scrim | None = None
 ) -> bool:
     channel_id = getattr(ctx.channel, "id", None)
     allowed = cap_channel_is_allowed(ctx.guild.id, channel_id, scrim)
-    if allowed:
-        return True
-    await send_private_command_feedback(
-        ctx,
-        CAP_CHANNEL_RESTRICTION_MESSAGE,
-        silent=False,
-    )
-    return False
+    if not allowed:
+        await send_private_command_feedback(
+            ctx,
+            CAP_CHANNEL_RESTRICTION_MESSAGE,
+            silent=False,
+        )
+        return False
+    if not cap_role_is_allowed(
+        ctx.author,
+        ctx.guild.id,
+        scrim,
+        channel_id=channel_id,
+    ):
+        await send_private_command_feedback(
+            ctx,
+            CAP_ROLE_RESTRICTION_MESSAGE,
+            silent=False,
+        )
+        return False
+    return True
 
 
 async def revoke_manager_access(
@@ -1562,6 +2280,13 @@ class SlotReviewView(DurableView):
                 if confirm
                 else f"Team **{result.team_name}** has been released."
             )
+            if confirm and self.registration_request and not access_ok:
+                text += " Pending Captain access could not be completed."
+            if confirm and self.registration_request:
+                if not await update_registration_reaction(
+                    self.scrim, approved_registration
+                ):
+                    text += " The registration message reaction could not be updated."
             if (
                 confirm
                 and not self.registration_request
@@ -1570,13 +2295,6 @@ class SlotReviewView(DurableView):
                 )
             ):
                 text += " The confirmed captain role could not be updated."
-            if confirm and self.registration_request and not access_ok:
-                text += " Pending Captain access could not be completed."
-            if confirm and self.registration_request:
-                if not await update_registration_reaction(
-                    self.scrim, approved_registration
-                ):
-                    text += " The registration message reaction could not be updated."
             if confirm and not await refresh_public_slots(self.scrim):
                 text += " The public board could not be updated."
             await send_scrim_log(
@@ -1659,6 +2377,7 @@ async def notify_staff_for_review(scrim: Scrim, slot: SlotSnapshot) -> bool:
 async def notify_staff_for_registration(
     scrim: Scrim, request: RegistrationRequest | None
 ) -> bool:
+    """Send a staff-only review message for a public team registration."""
     if request is None:
         return False
     channel = await staff_channel(scrim)
@@ -1688,7 +2407,9 @@ async def notify_staff_for_registration(
         )
         return True
     except discord.HTTPException:
-        logger.exception("Could not send the registration review (%s).", scrim.id)
+        logger.exception(
+            "Could not send the registration review (%s).", scrim.id
+        )
         return False
 
 
@@ -2268,7 +2989,7 @@ async def reset_slots(ctx: commands.Context) -> None:
     confirmation.message = confirmation_message
 
 
-@bot.command(name="open")
+@bot.command(name="open", aliases=["o"])
 @commands.guild_only()
 async def open_scrim(ctx: commands.Context) -> None:
     """Open managers or registrations based on the configured command channel."""
@@ -2290,8 +3011,11 @@ async def open_scrim(ctx: commands.Context) -> None:
             "REGISTRATIONS OPENED",
             "The configured registration role can now send messages.",
         )
+        await send_operational_message(
+            ctx, registration_scrim, "open_registration"
+        )
         return
-    scrim = await require_staff_scrim(ctx, public_only=True)
+    scrim = await require_staff_scrim(ctx, allow_public=True)
     if scrim is None:
         return
     async with scrim.state_lock:
@@ -2305,9 +3029,10 @@ async def open_scrim(ctx: commands.Context) -> None:
     await refresh_public_slots(scrim)
     await delete_command_message(ctx)
     await send_scrim_log(scrim, "SCRIM OPENED", "Manager interactions were opened.")
+    await send_operational_message(ctx, scrim, "open_slots")
 
 
-@bot.command(name="close")
+@bot.command(name="close", aliases=["c"])
 @commands.guild_only()
 async def close_scrim(ctx: commands.Context) -> None:
     """Close managers or registrations based on the configured command channel."""
@@ -2329,8 +3054,11 @@ async def close_scrim(ctx: commands.Context) -> None:
             "REGISTRATIONS CLOSED",
             "The configured registration role can no longer send messages.",
         )
+        await send_operational_message(
+            ctx, registration_scrim, "close_registration"
+        )
         return
-    scrim = await require_staff_scrim(ctx, public_only=True)
+    scrim = await require_staff_scrim(ctx, allow_public=True)
     if scrim is None:
         return
     async with scrim.state_lock:
@@ -2344,6 +3072,7 @@ async def close_scrim(ctx: commands.Context) -> None:
     await remove_public_controls(scrim)
     await send_scrim_log(scrim, "SCRIM CLOSED", "Manager interactions were closed.")
     await delete_command_message(ctx)
+    await send_operational_message(ctx, scrim, "close_slots")
 
 
 @bot.command(name="idpw")
@@ -2689,52 +3418,188 @@ def _register_specific_idpw_commands() -> None:
 _register_specific_idpw_commands()
 
 
-HELP_STAFF_TEXT = (
-    "`!setup` — configure scrims, roles, channels, maps, and ID/PW.\n"
-    "`!set <@Role>` — set the global Staff role.\n"
-    "`!say <message>` — publish a Staff announcement.\n"
-    "`!export` — export the registration list.\n"
-    "`!add Team / TAG / @Captain` — add a team; use multiple lines for bulk "
-    "teams. Multiple teams show a preview before applying.\n"
-    "`!reset` — archive and clear registrations.\n"
-    "`!confirm <slot> [slot ...]` / `!remove <slot> [slot ...]` — confirm or "
-    "release slots.\n"
-    "`!open` / `!close` — toggle manager board actions.\n"
-    "`!slots [Scrim Name]` — display real-time registration status; one scrim "
-    "is selected automatically and multiple scrims use a dropdown.\n"
-    "`!remind` — remind managers to confirm or cancel.\n"
-    "`!update [Scrim Name]` — refresh the selected slot board.\n"
-    "`!idpw <room_id> / <minutes>` — send room details and alerts.\n"
-    "`!idpwg[1-25] <room_id> / <minutes>` — fixed-password access.\n"
-    "`!idpwg[1-25] <room_id> / <password> / <minutes>` — dynamic-password access."
-)
+async def _record_match_scores(
+    ctx: commands.Context,
+    match_number: int,
+    input_string: str,
+) -> None:
+    scrim = await require_staff_scrim(ctx)
+    if scrim is None:
+        return
+    scores = parse_match_score_lines(
+        input_string,
+        match_number=match_number,
+        scrim=scrim,
+    )
+    if not scores:
+        await send_private_command_feedback(
+            ctx,
+            f"❌ No valid scores found for Match {match_number}. "
+            "Use one `slot kills placement` entry per line.",
+            silent=False,
+        )
+        return
+    try:
+        processed = repository.upsert_match_scores(
+            scrim.id,
+            scrim.guild_id,
+            match_number,
+            scores,
+        )
+    except ValueError as error:
+        await send_private_command_feedback(ctx, f"❌ {error}", silent=False)
+        return
+    await send_private_command_feedback(
+        ctx,
+        f"✅ Scores saved for Match {match_number}: "
+        f"Processed {processed} teams.",
+        silent=False,
+    )
 
-HELP_CAPTAINS_TEXT = (
-    "`!register Team Name / Tag [/ @Manager]` — register a team in the "
-    "configured public registration channel; only members with the configured "
-    "registration role may use it, and the manager mention is optional.\n"
-    "`!cap add`, `!cap transfer`, `!cap remove` — manage captains for your assigned team.\n"
-    "`✅ Confirm` / `❌ Cancel` — clickable slot actions for the assigned captain."
+
+def _register_specific_score_commands() -> None:
+    for match_number in range(1, 11):
+        def make_score_handler(game_number: int):
+            async def specific_score(
+                ctx: commands.Context,
+                *,
+                input_string: str,
+            ) -> None:
+                await _record_match_scores(ctx, game_number, input_string)
+
+            return specific_score
+
+        specific_score = make_score_handler(match_number)
+        specific_score.__name__ = f"record_match_scores{match_number}"
+        bot.command(name=f"resg{match_number}")(specific_score)
+
+
+_register_specific_score_commands()
+
+
+@bot.command(name="res", aliases=["leaderboard", "lb"])
+@commands.guild_only()
+async def leaderboard_command(ctx: commands.Context) -> None:
+    """Render the final current leaderboard image."""
+    scrim = await require_staff_scrim(ctx, allow_public=True)
+    if scrim is None:
+        return
+    try:
+        rows = calculate_leaderboard(scrim)
+        if not rows:
+            await send_private_command_feedback(
+                ctx,
+                "❌ No registered teams are available for this leaderboard.",
+                silent=False,
+            )
+            return
+        image = build_leaderboard_image(scrim, rows)
+        await ctx.send(
+            file=discord.File(image, filename="leaderboard.png"),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except (OSError, ValueError) as error:
+        logger.exception("Could not generate leaderboard for scrim %s.", scrim.id)
+        await send_private_command_feedback(
+            ctx,
+            f"❌ The leaderboard could not be generated: {error}",
+            silent=False,
+        )
+        return
+    finally:
+        await delete_command_message(ctx)
+
+
+HELP_COPY_TEXT = (
+    "A.R.C. HELP\n"
+    "STAFF: !setup | !set @Role | !use [Scrim] | !say text | !export | "
+    "!reset\n"
+    "SLOTS: !add Team / TAG / @Captain | !confirm 03 04 | !remove 03 | "
+    "!open | !close | !remind\n"
+    "STATUS: !slots [Scrim] | !update [Scrim] | !res / !lb | "
+    "!resg1-25 slot kills placement\n"
+    "ROOM: !idpw room / minutes | !idpwg1-25 room / minutes\n"
+    "CAPTAINS: !register Team / TAG [/ @Manager] | "
+    "!cap add|transfer|remove @User\n"
+    "Use ! for every command. Staff, registration, Manager, and Cap Transfer "
+    "commands require their configured role/channel."
 )
 
 
 def build_help_text() -> str:
-    """Return the Discord quote-formatted help content."""
+    """Return the condensed, Discord-formatted help content."""
     return (
-        ">>> **A.R.C. Bot - Command Center**\n\n"
-        "**STAFF**\n"
-        f"{HELP_STAFF_TEXT}\n\n"
-        "**CAPTAINS**\n"
-        f"{HELP_CAPTAINS_TEXT}\n"
+        ">>> **A.R.C. HELP**\n"
+        "**STAFF** `!setup` `!set @Role` `!use [Scrim]` `!say text` "
+        "`!export` `!reset`\n"
+        "**SLOTS** `!add Team / TAG / @Captain` `!confirm 03 04` "
+        "`!remove 03` `!open` `!close` `!remind`\n"
+        "**STATUS** `!slots [Scrim]` `!update [Scrim]` `!res`/`!lb` "
+        "`!resg1-25 slot kills placement`\n"
+        "**ROOM** `!idpw room / minutes` `!idpwg1-25 room / minutes`\n"
+        "**CAPTAINS** `!register Team / TAG [/ @Manager]` "
+        "`!cap add|transfer|remove @User`\n"
+        "_Use `!` for every command. Configured roles and channels apply._"
     )
 
 
-@bot.command(name="help")
+class HelpView(discord.ui.View):
+    """Owner-only controls for the condensed help message."""
+
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "This help panel belongs to another user.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Copy text",
+        emoji="📋",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def copy_text(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.send_message(
+            HELP_COPY_TEXT,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(
+        label="Close",
+        emoji="✖️",
+        style=discord.ButtonStyle.danger,
+    )
+    async def close(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        self.stop()
+        await interaction.response.edit_message(
+            content="Help closed.",
+            view=None,
+        )
+
+
+@bot.command(name="help", aliases=["h"])
 async def help_command(ctx: commands.Context) -> None:
+    view = HelpView(ctx.author.id)
     await send_private_command_feedback(
         ctx,
         build_help_text(),
         delete_after=None,
+        view=view,
     )
 
 
@@ -3204,6 +4069,50 @@ def build_slot_status_embed(scrim: Scrim) -> discord.Embed:
         ),
         color=discord.Color.blurple(),
     )
+    available = [
+        f"`{slot.number:02d}`"
+        for slot in sorted(scrim.slots.values(), key=lambda item: item.number)
+        if slot.status == STATUS_AVAILABLE
+    ]
+    embed.add_field(
+        name=f"{scrim.emoji_available} Available Slots ({counts[STATUS_AVAILABLE]})",
+        value=", ".join(available) if available else "None",
+        inline=False,
+    )
+
+    status_labels = (
+        (STATUS_RESERVED, "Reserved Teams", scrim.emoji_reserved),
+        (STATUS_PENDING, "Pending Teams", scrim.emoji_pending),
+        (STATUS_CONFIRMED, "Confirmed Teams", scrim.emoji_confirmed),
+    )
+    for status, field_name, status_emoji in status_labels:
+        teams = []
+        for slot in sorted(scrim.slots.values(), key=lambda item: item.number):
+            if slot.status != status:
+                continue
+            team_name = (
+                discord.utils.escape_mentions(
+                    discord.utils.escape_markdown(
+                        str(getattr(slot, "team_name", "") or "").strip()
+                    )
+                )
+                or "Unnamed team"
+            )
+            tag = (
+                discord.utils.escape_mentions(
+                    discord.utils.escape_markdown(
+                        str(getattr(slot, "tag", "") or "").strip()
+                    )
+                )
+                or "No tag"
+            )
+            teams.append(f"`{slot.number:02d}` {team_name} · `{tag}`")
+        embed.add_field(
+            name=f"{status_emoji} {field_name} ({counts[status]})",
+            value="\n".join(teams) if teams else "None",
+            inline=False,
+        )
+    embed.set_footer(text="Public status view · team names and slot states only")
     return embed
 
 
@@ -3217,6 +4126,388 @@ async def send_slot_status_embed(ctx: commands.Context, scrim: Scrim) -> None:
         logger.exception("Could not send the slot status summary for %s.", scrim.id)
     finally:
         await delete_command_message(ctx)
+
+
+@dataclass(frozen=True)
+class LeaderboardRow:
+    slot_number: int
+    team_name: str
+    wins: int
+    kills: int
+    placement_points: int
+    total_points: int
+
+
+def calculate_leaderboard(scrim: Scrim) -> list[LeaderboardRow]:
+    """Calculate totals for every registered team in a scrim."""
+    placement_points = parse_placement_points(
+        getattr(scrim, "placement_points_string", DEFAULT_PLACEMENT_POINTS_STRING)
+    )
+    registered_slots = [
+        slot
+        for slot in scrim.slots.values()
+        if slot.status != STATUS_AVAILABLE and slot.team_name
+    ]
+    if len(placement_points) < len(registered_slots):
+        placement_points.extend([0] * (len(registered_slots) - len(placement_points)))
+    scores = getattr(scrim, "match_scores", {})
+    rows: list[LeaderboardRow] = []
+    for slot in registered_slots:
+        wins = 0
+        kills = 0
+        placement_total = 0
+        for score in scores.values():
+            if score.slot_number != slot.number:
+                continue
+            if score.placement == 1:
+                wins += 1
+            kills += score.kills
+            placement_index = score.placement - 1
+            if 0 <= placement_index < len(placement_points):
+                placement_total += placement_points[placement_index]
+        total = kills * getattr(scrim, "kill_points_value", 1) + placement_total
+        rows.append(
+            LeaderboardRow(
+                slot_number=slot.number,
+                team_name=slot.team_name,
+                wins=wins,
+                kills=kills,
+                placement_points=placement_total,
+                total_points=total,
+            )
+        )
+    return sorted(
+        rows,
+        key=lambda row: (
+            -row.total_points,
+            -row.placement_points,
+            -row.kills,
+            row.slot_number,
+        ),
+    )
+
+
+def parse_match_score_lines(
+    input_string: str,
+    *,
+    match_number: int,
+    scrim: Scrim,
+) -> list[MatchScore]:
+    """Parse `slot kills placement` lines, ignoring malformed entries."""
+    scores: list[MatchScore] = []
+    seen_slots: set[int] = set()
+    for line in str(input_string).splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        try:
+            slot_number, kills, placement = (int(part) for part in parts)
+        except ValueError:
+            continue
+        if (
+            slot_number in seen_slots
+            or slot_number not in scrim.slots
+            or scrim.slots[slot_number].status == STATUS_AVAILABLE
+            or kills < 0
+            or placement < 1
+        ):
+            continue
+        seen_slots.add(slot_number)
+        scores.append(
+            MatchScore(
+                match_number=match_number,
+                slot_number=slot_number,
+                kills=kills,
+                placement=placement,
+            )
+        )
+    return scores
+
+
+def _load_font(size: int, *, mono: bool = False):
+    candidates = (
+        (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+        )
+        if mono
+        else (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        )
+    )
+    for path in candidates:
+        if Path(path).exists():
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
+
+def _fit_font(
+    text: str,
+    *,
+    max_width: int,
+    max_height: int,
+    max_size: int = 64,
+    min_size: int = 12,
+):
+    """Choose the largest regular font that fits inside the scrim-name banner."""
+    for size in range(max_size, min_size - 1, -1):
+        font = _load_font(size)
+        probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        left, top, right, bottom = probe.textbbox((0, 0), text, font=font)
+        if right - left <= max_width and bottom - top <= max_height:
+            return font
+    return _load_font(min_size)
+
+
+def _build_reference_leaderboard_image(
+    scrim: Scrim,
+    rows: list[LeaderboardRow],
+    *,
+    background_path: Path,
+) -> io.BytesIO:
+    """Render scored rows into the approved 479x640 reference artwork."""
+    with Image.open(background_path) as source:
+        template = source.convert("RGBA")
+
+    width, height = template.size
+    row_height = 22
+    first_row_y = 164
+    visible_rows = 17
+    extra_rows = max(0, len(rows) - visible_rows)
+    footer_top = 553
+
+    if extra_rows:
+        # Keep the decorative footer intact while adding more table bands above it.
+        body = template.crop((0, 0, width, footer_top))
+        row_band = template.crop((0, 512, width, 534))
+        footer = template.crop((0, footer_top, width, height))
+        output = Image.new(
+            "RGBA",
+            (width, height + extra_rows * row_height),
+            (0, 0, 0, 0),
+        )
+        output.paste(body, (0, 0))
+        for index in range(extra_rows):
+            output.paste(row_band, (0, footer_top + index * row_height))
+        output.paste(footer, (0, footer_top + extra_rows * row_height))
+        draw = ImageDraw.Draw(output)
+        bottom = footer_top + extra_rows * row_height
+        draw.line((20, bottom, 458, bottom), fill=(119, 91, 42, 255), width=2)
+        draw.line((20, 534, 20, bottom), fill=(119, 91, 42, 255), width=2)
+        draw.line((458, 534, 458, bottom), fill=(119, 91, 42, 255), width=2)
+    else:
+        output = template.copy()
+        draw = ImageDraw.Draw(output)
+
+    # The approved artwork already contains the title and column headings.
+    scrim_name = str(getattr(scrim, "name", "")).strip()
+    if scrim_name:
+        banner_font = _fit_font(
+            scrim_name,
+            max_width=150,
+            max_height=16,
+            max_size=14,
+            min_size=7,
+        )
+        left, top, right, bottom = draw.textbbox((0, 0), scrim_name, font=banner_font)
+        draw.text(
+            (
+                239 - ((right - left) // 2) - left,
+                112 - ((bottom - top) // 2) - top,
+            ),
+            scrim_name,
+            font=banner_font,
+            fill=(231, 207, 163, 255),
+        )
+
+    row_font = _load_font(11, mono=True)
+    row_fill = (231, 213, 176, 255)
+    for row_index, row in enumerate(rows):
+        y = first_row_y + row_index * row_height
+        rank = row_index + 1
+        draw.text((32, y), str(rank), font=row_font, fill=row_fill)
+        draw.text((76, y), row.team_name[:27], font=row_font, fill=row_fill)
+        draw.text((315, y), str(row.wins), font=row_font, fill=row_fill, anchor="ra")
+        draw.text(
+            (360, y),
+            str(row.placement_points),
+            font=row_font,
+            fill=row_fill,
+            anchor="ra",
+        )
+        draw.text((406, y), str(row.kills), font=row_font, fill=row_fill, anchor="ra")
+        draw.text((451, y), str(row.total_points), font=row_font, fill=row_fill, anchor="ra")
+
+    buffer = io.BytesIO()
+    output.convert("RGB").save(buffer, format="PNG", optimize=True)
+    buffer.seek(0)
+    return buffer
+
+
+def build_leaderboard_image(
+    scrim: Scrim,
+    rows: list[LeaderboardRow] | None = None,
+    *,
+    background_path: Path = LEADERBOARD_BACKGROUND,
+) -> io.BytesIO:
+    """Render a leaderboard by repeating a middle background slice."""
+    if rows is None:
+        rows = calculate_leaderboard(scrim)
+
+    using_reference_background = (
+        background_path.resolve() == LEADERBOARD_BACKGROUND.resolve()
+    )
+    two_columns = (
+        getattr(scrim, "leaderboard_layout", "1_col") == "2_col"
+        and getattr(repository.get_server_config(scrim.guild_id), "license_type", "Standard")
+        == "Gold"
+    )
+    if using_reference_background and not two_columns:
+        return _build_reference_leaderboard_image(
+            scrim,
+            rows,
+            background_path=background_path,
+        )
+    if using_reference_background and two_columns:
+        # The approved artwork is a single-column composition. Preserve the
+        # existing Gold two-column mode on its original wide template.
+        background_path = LEGACY_LEADERBOARD_BACKGROUND
+
+    with Image.open(background_path) as source:
+        base = source.convert("RGBA")
+    width, height = base.size
+    header_height = min(240, height)
+    footer_height = min(200, max(0, height - header_height))
+    body_slice_height = min(100, max(1, height - header_height - footer_height))
+    header = base.crop((0, 0, width, header_height))
+    footer = base.crop((0, height - footer_height, width, height))
+    body_slice_top = header_height + max(
+        0, (height - header_height - footer_height - body_slice_height) // 2
+    )
+    body_slice = base.crop(
+        (0, body_slice_top, width, body_slice_top + body_slice_height)
+    )
+
+    row_height = 38 if two_columns else 48
+    title_area_height = 112
+    body_padding = title_area_height + 64
+    rows_per_column = (len(rows) + 1) // 2 if two_columns else len(rows)
+    body_height = max(
+        body_slice_height,
+        body_padding + (rows_per_column + 1) * row_height,
+    )
+    output = Image.new("RGBA", (width, header_height + body_height + footer_height))
+    output.paste(header, (0, 0))
+    for y in range(header_height, header_height + body_height, body_slice_height):
+        output.paste(body_slice, (0, y))
+    output.paste(footer, (0, header_height + body_height))
+
+    draw = ImageDraw.Draw(output)
+    header_font = _load_font(20, mono=True)
+    row_font = _load_font(20, mono=True)
+    title_font = _load_font(42)
+    title = "LEADERBOARD"
+    title_left, title_top, title_right, title_bottom = draw.textbbox(
+        (0, 0), title, font=title_font
+    )
+    draw.text(
+        (
+            (width - (title_right - title_left)) // 2 - title_left,
+            18 - title_top,
+        ),
+        title,
+        font=title_font,
+        fill=(235, 245, 255, 255),
+    )
+    title_left = 72
+    title_top = header_height + 12
+    title_width = width - (title_left * 2)
+    title_height = title_area_height - 24
+    scrim_name = str(getattr(scrim, "name", "Leaderboard")).strip() or "Leaderboard"
+    scrim_font = _fit_font(
+        scrim_name,
+        max_width=title_width,
+        max_height=title_height,
+    )
+    name_left, name_top, name_right, name_bottom = draw.textbbox(
+        (0, 0), scrim_name, font=scrim_font
+    )
+    name_width = name_right - name_left
+    name_height = name_bottom - name_top
+    draw.text(
+        (
+            title_left + (title_width - name_width) // 2 - name_left,
+            title_top + (title_height - name_height) // 2 - name_top,
+        ),
+        scrim_name,
+        font=scrim_font,
+        fill=(245, 248, 255, 255),
+    )
+    table_top = header_height + title_area_height + 12
+    table_left = 52
+    table_right = width - 52
+    table_bottom = table_top + (rows_per_column + 1) * row_height + 18
+    draw.rectangle(
+        (table_left, table_top - 16, table_right, table_bottom),
+        fill=(8, 14, 20, 220),
+        outline=(0, 174, 255, 210),
+        width=2,
+    )
+    draw.line(
+        (table_left, table_top + 30, table_right, table_top + 30),
+        fill=(0, 174, 255, 170),
+        width=2,
+    )
+    column_count = 2 if two_columns else 1
+    split_index = (len(rows) + 1) // 2
+    for column_index in range(column_count):
+        column_rows = (
+            rows[:split_index]
+            if two_columns and column_index == 0
+            else rows[split_index:]
+            if two_columns
+            else rows
+        )
+        x = table_left + 12 + column_index * (width // 2)
+        draw.text(
+            (x, table_top),
+            "# Team Name Win Kills Place Total",
+            font=header_font,
+            fill=(120, 190, 255, 255),
+        )
+        for row_index, row in enumerate(column_rows):
+            rank = (
+                row_index + 1
+                if not two_columns or column_index == 0
+                else (len(rows) + 1) // 2 + row_index + 1
+            )
+            line = (
+                f"{rank:>2}   {row.team_name[:15]:<15} "
+                f"{row.wins:>4}   {row.kills:>5}   "
+                f"{row.placement_points:>5}   {row.total_points:>5}"
+            )
+            draw.text(
+                (x, table_top + (row_index + 1) * row_height),
+                line,
+                font=row_font,
+                fill=(245, 248, 255, 255),
+            )
+            draw.line(
+                (
+                    table_left + column_index * (width // 2) + 10,
+                    table_top + (row_index + 2) * row_height - 5,
+                    table_left + (column_index + 1) * (width // 2) - 10,
+                    table_top + (row_index + 2) * row_height - 5,
+                ),
+                fill=(45, 91, 120, 125),
+                width=1,
+            )
+
+    buffer = io.BytesIO()
+    output.convert("RGB").save(buffer, format="PNG", optimize=True)
+    buffer.seek(0)
+    return buffer
 
 
 class SlotsScrimSelectView(discord.ui.View):
@@ -3305,7 +4596,7 @@ class SlotsScrimSelectView(discord.ui.View):
         self.add_item(select)
 
 
-@bot.command(name="slots")
+@bot.command(name="slots", aliases=["s"])
 @commands.guild_only()
 async def show_slots(ctx: commands.Context, *, name: str | None = None) -> None:
     """Show compact slot statistics for an active scrim."""
@@ -3463,7 +4754,7 @@ class UpdateScrimSelectView(discord.ui.View):
         self.add_item(select)
 
 
-@bot.command(name="update", aliases=["publier_slots"])
+@bot.command(name="update", aliases=["u", "publier_slots"])
 @commands.guild_only()
 async def update_slots_command(
     ctx: commands.Context, *, name: str | None = None
@@ -3498,6 +4789,19 @@ async def update_slots_command(
             await send_private_command_feedback(ctx, "The slot board has been updated.")
         return
 
+    selected = resolve_selected_scrim(ctx)
+    if selected is not None:
+        if not member_is_staff(ctx.author, selected):
+            await send_private_command_feedback(
+                ctx,
+                "You must have the authorized Staff role to update this board.",
+                silent=True,
+            )
+            return
+        if await publish_scrim(selected):
+            await send_private_command_feedback(ctx, "The slot board has been updated.")
+        return
+
     if len(active_scrims) == 1:
         scrim = active_scrims[0]
         if not member_is_staff(ctx.author, scrim):
@@ -3528,7 +4832,7 @@ async def update_slots_command(
         await delete_command_message(ctx)
 
 
-@bot.command(name="say")
+@bot.command(name="say", aliases=["announce"])
 @commands.guild_only()
 async def say_message(ctx: commands.Context, *, message: str) -> None:
     """Publish an anonymous bot message for authorized staff."""
@@ -3663,7 +4967,7 @@ class ExportScrimSelectView(discord.ui.View):
             messages = build_export_messages(scrim)
             if not messages:
                 await interaction.response.send_message(
-                    "Aucune équipe enregistrée.",
+                    "No teams are registered.",
                     ephemeral=True,
                 )
                 self.stop()
@@ -3913,6 +5217,11 @@ async def apply_add_entries(
 def parse_registration_arguments(arguments: str) -> tuple[str, str, str | None]:
     """Parse ``!register Team Name / Tag [/ @Manager]``."""
     raw = arguments.strip()
+    if "\n" in raw or "\r" in raw:
+        raise ValueError(
+            "`!register` accepts one team per command. Use `!add` for bulk "
+            "staff registrations."
+        )
     parts = [part.strip() for part in raw.split("/")]
     if len(parts) not in {2, 3} or not all(parts):
         raise ValueError(
@@ -3926,7 +5235,9 @@ def parse_registration_arguments(arguments: str) -> tuple[str, str, str | None]:
         raise ValueError("The team name or tag is too long.")
     if any(character in team_name or character in tag for character in ("\r", "\n")):
         raise ValueError("The team name and tag must stay on one line.")
-    if manager_text is not None and not re.fullmatch(r"<@!?\d+>", manager_text):
+    if manager_text is not None and not re.fullmatch(
+        r"<@!?\d+>", manager_text
+    ):
         raise ValueError(
             "The manager must be a member mention, such as `@Manager`."
         )
@@ -3939,6 +5250,7 @@ async def apply_registration_entry(
     *,
     registration_message_id: int | None = None,
 ) -> tuple[SlotSnapshot | None, str | None, bool, bool]:
+    """Create a Reserved slot or a durable unassigned registration request."""
     snapshot: SlotSnapshot | None = None
     auto_accept = getattr(scrim, "registration_auto_accept", False) is True
     async with scrim.state_lock:
@@ -3995,6 +5307,7 @@ async def apply_registration_entry(
             f"captain <@{entry.member.id}>",
         )
         return snapshot, None, access_ok, board_refreshed
+
     notified = await notify_staff_for_registration(scrim, request)
     await send_scrim_log(
         scrim,
@@ -4162,10 +5475,10 @@ class AddRegistrationView(DurableView):
         await self._finish_cancel(interaction)
 
 
-@bot.command(name="register")
+@bot.command(name="register", aliases=["reg"])
 @commands.guild_only()
 async def register_team(ctx: commands.Context, *, arguments: str) -> None:
-    """Register a team through the configured public registration channel."""
+    """Register the invoking member's team through the configured public channel."""
     scrim = resolve_registration_scrim(ctx)
     if scrim is None:
         await send_private_command_feedback(
@@ -4194,7 +5507,6 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
     except ValueError as error:
         await send_private_registration_feedback(ctx, str(error))
         return
-
     manager = ctx.author
     if manager_text is not None:
         try:
@@ -4217,7 +5529,7 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
             (
                 slot.number
                 for slot in scrim.slots.values()
-                if registration_slot_is_available(scrim, slot)
+                        if registration_slot_is_available(scrim, slot)
             ),
             None,
         )
@@ -4270,7 +5582,7 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
             logger.exception("Could not acknowledge successful registration.")
 
 
-@bot.command(name="add")
+@bot.command(name="add", aliases=["a"])
 @commands.guild_only()
 async def add_team(ctx: commands.Context, *, arguments: str) -> None:
     scrim = await require_staff_scrim(ctx, allow_public=True)
@@ -4431,6 +5743,14 @@ class CaptainSlotSelectView(discord.ui.View):
             ):
                 await interaction.response.send_message(
                     CAP_CHANNEL_RESTRICTION_MESSAGE,
+                    ephemeral=True,
+                )
+                return
+            if not cap_role_is_allowed(
+                interaction.user, self.guild_id, captured_scrim
+            ):
+                await interaction.response.send_message(
+                    CAP_ROLE_RESTRICTION_MESSAGE,
                     ephemeral=True,
                 )
                 return
@@ -4805,7 +6125,7 @@ def parse_add_arguments(arguments: str) -> tuple[str, str, str]:
     return team_name, tag, manager_text
 
 
-@bot.command(name="remind")
+@bot.command(name="remind", aliases=["rem"])
 @commands.guild_only()
 async def remind_managers(ctx: commands.Context) -> None:
     """Mention managers whose assigned slots still need their confirmation."""
@@ -4855,7 +6175,7 @@ async def remind_managers(ctx: commands.Context) -> None:
         embed.set_footer(text=f"Scrim: {scrim.name}")
         await ctx.send(
             content=(
-                "***Please Confirm / Cancel your Slot !***\n"
+                "***Reserved teams: please Confirm or Cancel your Slot.***\n"
                 f"<@&{scrim.pending_role_id}>"
             ),
             embed=embed,
@@ -4866,7 +6186,7 @@ async def remind_managers(ctx: commands.Context) -> None:
     await delete_command_message(ctx)
 
 
-@bot.command(name="confirm")
+@bot.command(name="confirm", aliases=["cf"])
 @commands.guild_only()
 async def confirm_slot(ctx: commands.Context, *, slot_numbers: str) -> None:
     scrim = await require_staff_scrim(
@@ -4944,7 +6264,7 @@ async def confirm_slot(ctx: commands.Context, *, slot_numbers: str) -> None:
     )
 
 
-@bot.command(name="remove")
+@bot.command(name="remove", aliases=["rm"])
 @commands.guild_only()
 async def remove_team(ctx: commands.Context, *, slot_numbers: str) -> None:
     scrim = await require_staff_scrim(ctx)

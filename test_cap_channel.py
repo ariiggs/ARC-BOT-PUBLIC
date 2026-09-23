@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from main import (
     CAP_CHANNEL_RESTRICTION_MESSAGE,
+    CAP_ROLE_RESTRICTION_MESSAGE,
     CaptainSlotSelectView,
     captain_assignment_or_selection,
     captain_slot_id,
@@ -65,8 +66,8 @@ class CapChannelRestrictionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             CAP_CHANNEL_RESTRICTION_MESSAGE,
-            "❌ **Command restricted.** Please use the designated captain "
-            "management channel for this command.",
+            "❌ **Command restricted.** Please use the designated Cap Transfer "
+            "channel for this command.",
         )
 
     async def test_no_slots_returns_requested_error(self):
@@ -92,7 +93,12 @@ class CapChannelRestrictionTests(unittest.IsolatedAsyncioTestCase):
     async def test_one_slot_proceeds_without_a_selector(self):
         ctx = self.make_context()
         target = SimpleNamespace(id=2)
-        scrim = SimpleNamespace(id="a" * 16, cap_channel_id=42)
+        scrim = SimpleNamespace(
+            id="a" * 16,
+            cap_channel_id=42,
+            pending_role_id=202,
+            confirmed_role_id=203,
+        )
         slot = Slot(
             3,
             status=STATUS_RESERVED,
@@ -163,7 +169,12 @@ class CapChannelRestrictionTests(unittest.IsolatedAsyncioTestCase):
     async def test_selector_callback_executes_selected_slot_and_confirms(self):
         ctx = self.make_context()
         target = SimpleNamespace(id=2)
-        scrim = SimpleNamespace(id="a" * 16, cap_channel_id=42)
+        scrim = SimpleNamespace(
+            id="a" * 16,
+            cap_channel_id=42,
+            pending_role_id=202,
+            confirmed_role_id=203,
+        )
         slot = Slot(
             3,
             status=STATUS_RESERVED,
@@ -177,7 +188,7 @@ class CapChannelRestrictionTests(unittest.IsolatedAsyncioTestCase):
         select = view.children[0]
         select._values = [captain_slot_id(scrim, slot)]
         interaction = SimpleNamespace(
-            user=SimpleNamespace(id=1),
+            user=SimpleNamespace(id=1, roles=[SimpleNamespace(id=202)]),
             guild=SimpleNamespace(id=123),
             channel_id=42,
             response=SimpleNamespace(
@@ -256,13 +267,64 @@ class CapChannelRestrictionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_configured_channel_is_allowed_for_the_scrim(self):
         ctx = SimpleNamespace(
+            author=SimpleNamespace(roles=[SimpleNamespace(id=202)]),
             channel=SimpleNamespace(id=42),
             guild=SimpleNamespace(id=123),
         )
-        scrim = SimpleNamespace(cap_channel_id=42)
+        scrim = SimpleNamespace(
+            cap_channel_id=42,
+            pending_role_id=202,
+            confirmed_role_id=203,
+        )
 
         with patch("main.send_private_command_feedback", new_callable=AsyncMock):
             self.assertTrue(await require_cap_channel(ctx, scrim))
+
+    async def test_pending_or_confirmed_role_is_required(self):
+        for role_id in (202, 203):
+            with self.subTest(role_id=role_id):
+                ctx = SimpleNamespace(
+                    author=SimpleNamespace(
+                        roles=[SimpleNamespace(id=role_id)]
+                    ),
+                    channel=SimpleNamespace(id=42),
+                    guild=SimpleNamespace(id=123),
+                )
+                scrim = SimpleNamespace(
+                    cap_channel_id=42,
+                    pending_role_id=202,
+                    confirmed_role_id=203,
+                )
+
+                with patch(
+                    "main.send_private_command_feedback",
+                    new_callable=AsyncMock,
+                ):
+                    self.assertTrue(await require_cap_channel(ctx, scrim))
+
+    async def test_missing_captain_role_is_rejected(self):
+        ctx = SimpleNamespace(
+            author=SimpleNamespace(roles=[SimpleNamespace(id=999)]),
+            channel=SimpleNamespace(id=42),
+            guild=SimpleNamespace(id=123),
+        )
+        scrim = SimpleNamespace(
+            cap_channel_id=42,
+            pending_role_id=202,
+            confirmed_role_id=203,
+        )
+
+        with patch(
+            "main.send_private_command_feedback",
+            new_callable=AsyncMock,
+        ) as feedback:
+            self.assertFalse(await require_cap_channel(ctx, scrim))
+
+        feedback.assert_awaited_once_with(
+            ctx,
+            CAP_ROLE_RESTRICTION_MESSAGE,
+            silent=False,
+        )
 
 
 if __name__ == "__main__":

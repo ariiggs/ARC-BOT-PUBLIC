@@ -48,15 +48,15 @@ class SlotsCommandTests(unittest.IsolatedAsyncioTestCase):
     def manager_config(self):
         return SimpleNamespace(manager_role_id=77, staff_role_id=77)
 
-    def test_embed_keeps_pending_separate_from_confirmed(self):
+    def test_embed_merges_pending_into_confirmed(self):
         embed = build_slot_status_embed(self.make_scrim())
 
         self.assertEqual(embed.title, "📊 Slot Status - Friday Scrim")
         self.assertIn("**Total Slots:** 4", embed.description)
         self.assertIn("⚪ **Free:** 1", embed.description)
         self.assertIn("🔵 **Reserved:** 1", embed.description)
-        self.assertIn("🟠 **Pending:** 1", embed.description)
-        self.assertIn("🟢 **Confirmed:** 1", embed.description)
+        self.assertIn("🟢 **Confirmed:** 2", embed.description)
+        self.assertNotIn("Pending", embed.description)
 
     async def test_category_match_renders_the_matching_scrim(self):
         ctx = self.make_context(category_id=555)

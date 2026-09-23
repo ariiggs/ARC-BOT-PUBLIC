@@ -1,2 +1,2 @@
 discord.py>=2.4.0,<3
-discord.py>=2.4.0,<3
+Pillow>=12.3.0,<13

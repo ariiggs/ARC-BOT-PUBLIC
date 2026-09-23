@@ -12,15 +12,19 @@ from discord.ext import commands
 from global_setup import extract_raw_emoji
 from slot_storage import SlotStorageError
 from scrim_state import (
+    DEFAULT_KILL_POINTS_VALUE,
     DEFAULT_IDPW_TIMEZONE,
     DEFAULT_MATCH_MAPS,
+    DEFAULT_PLACEMENT_POINTS_STRING,
     DEFAULT_SLOT_END,
     DEFAULT_SLOT_START,
     IDPW_TIMEZONE_CHOICES,
+    LEADERBOARD_LAYOUTS,
     MAX_MATCHES,
     PASSWORD_TYPES,
     normalize_map_pool,
     normalize_match_configuration,
+    parse_placement_points,
     validate_slot_range,
 )
 
@@ -64,6 +68,11 @@ def _scrim_configuration_details(scrim, repository) -> str:
     maps = getattr(scrim, "maps", list(DEFAULT_MATCH_MAPS))
     max_matches = getattr(scrim, "max_matches", len(maps))
     current_match = getattr(scrim, "current_match_counter", 1)
+    kill_points_value = getattr(scrim, "kill_points_value", DEFAULT_KILL_POINTS_VALUE)
+    placement_points = getattr(
+        scrim, "placement_points_string", DEFAULT_PLACEMENT_POINTS_STRING
+    )
+    leaderboard_layout = getattr(scrim, "leaderboard_layout", "1_col")
     map_details = (
         f"**{max_matches} Matches Configured** ({', '.join(maps)})"
         if maps
@@ -73,7 +82,7 @@ def _scrim_configuration_details(scrim, repository) -> str:
         f"Name: **{_safe_name(scrim.name)}**\n"
         f"Public channel: {_channel_ref(scrim.public_channel_id)}\n"
         f"Staff channel: {_channel_ref(scrim.staff_channel_id)}\n"
-        f"Captain management channel: {_channel_ref(scrim.cap_channel_id)}\n"
+        f"Cap Transfer channel: {_channel_ref(scrim.cap_channel_id)}\n"
         f"Logs channel: {_channel_ref(scrim.logs_channel_id)}\n"
         f"History channel: {_channel_ref(scrim.history_channel_id)}\n"
         f"Registration channel: {_channel_ref(getattr(scrim, 'registration_channel_id', None))}\n"
@@ -87,6 +96,8 @@ def _scrim_configuration_details(scrim, repository) -> str:
         f"Timezone: `{timezone_name}`\n"
         f"Map rotation: {map_details}\n"
         f"Current match: **{current_match}** / {max_matches}\n"
+        f"Leaderboard: **{kill_points_value} point(s)/kill**, "
+        f"placements `{placement_points}`, layout **{leaderboard_layout}**\n"
         f"ID/PW target: "
         f"{_channel_ref(idpw.target_channel_id) if idpw else 'not configured'}"
     )
@@ -490,28 +501,26 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
         def content(self) -> str:
             if not self.scrims:
                 return (
-                    "**Global Scrim Dashboard**\n"
+                    "**Scrim Setup**\n"
                     "No scrims are configured for this server. Select "
-                    "**Add Scrim** to configure one using existing text channels."
+                    "**Create New** to start a scrim configuration."
                 )
             return (
-                "**Global Scrim Dashboard**\n"
-                "Use **Manage Scrims** to select a scrim and update its "
-                "configuration or operational settings."
+                "**Scrim Setup**\n"
+                "Select a scrim from the list, then choose an action below."
             )
 
         def embed(self) -> discord.Embed:
             embed = discord.Embed(
-                title="Global Scrim Dashboard",
+                title="Scrim Setup",
                 description=(
                     "\n".join(
-                        f"• **{_short_name(scrim.name)}** — "
-                        f"{'🟢 OPEN' if scrim.is_open else '🔴 CLOSED'}"
+                        f"• **{_short_name(scrim.name)}**"
                         for scrim in self.scrims
                     )
                     if self.scrims
                     else (
-                        "No scrims are configured yet. Select **Add Scrim** "
+                        "No scrims are configured yet. Select **Create New** "
                         "to begin."
                     )
                 ),
@@ -522,25 +531,33 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
         def rebuild(self) -> None:
             self.clear_items()
             self.load_scrims()
-            add_button = discord.ui.Button(
-                label="Add Scrim",
-                emoji="🟩",
+            create_button = discord.ui.Button(
+                label="Create New",
+                emoji="➕",
                 style=discord.ButtonStyle.success,
                 row=0,
             )
 
-            async def add_callback(interaction: discord.Interaction) -> None:
+            async def create_callback(interaction: discord.Interaction) -> None:
                 if not await self.interaction_check(interaction):
                     return
-                await interaction.response.send_modal(
-                    ScrimNameModal(self, self.owner_id, self.guild_id)
+                wizard = ScrimSetupWizardView(
+                    self,
+                    self.owner_id,
+                    self.guild_id,
+                    name="",
+                )
+                await interaction.response.edit_message(
+                    content=wizard.content(),
+                    embed=wizard.embed(),
+                    view=wizard,
                 )
 
-            add_button.callback = add_callback
-            self.add_item(add_button)
+            create_button.callback = create_callback
+            self.add_item(create_button)
 
             manage_button = discord.ui.Button(
-                label="Manage Scrims",
+                label="Manage Scrim",
                 emoji="🟦",
                 style=discord.ButtonStyle.primary,
                 disabled=not self.scrims,
@@ -567,6 +584,26 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
             manage_button.callback = manage_callback
             self.add_item(manage_button)
+
+            close_button = discord.ui.Button(
+                label="Close",
+                emoji="✖️",
+                style=discord.ButtonStyle.secondary,
+                row=0,
+            )
+
+            async def close_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                self.stop()
+                await interaction.response.edit_message(
+                    content="Setup closed.",
+                    embed=None,
+                    view=None,
+                )
+
+            close_button.callback = close_callback
+            self.add_item(close_button)
 
         async def refresh_message(self) -> bool:
             try:
@@ -614,7 +651,6 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                             label=scrim.name[:100],
                             value=scrim.id,
                             description=(
-                                f"{'OPEN' if scrim.is_open else 'CLOSED'} · "
                                 f"Slots {scrim.slot_start:02d}–{scrim.slot_end:02d}"
                             )[:100],
                         )
@@ -683,7 +719,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
         def content(self) -> str:
             return (
-                "**Manage Scrims**\n"
+                "**Manage Scrim**\n"
                 "Select a scrim from the dropdown to open its management menu."
             )
 
@@ -699,7 +735,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             )
 
     class ScrimManagementView(BoundView):
-        """The selected-scrim state with only operational management actions."""
+        """The selected-scrim state with configuration-only actions."""
 
         def __init__(
             self,
@@ -722,14 +758,14 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
         def rebuild(self) -> None:
             self.clear_items()
 
-            edit_button = discord.ui.Button(
-                label="Edit Configuration",
-                emoji="✏️",
+            required_button = discord.ui.Button(
+                label="Edit Required Settings",
+                emoji="🛠️",
                 style=discord.ButtonStyle.primary,
                 row=0,
             )
 
-            async def edit_callback(interaction: discord.Interaction) -> None:
+            async def required_callback(interaction: discord.Interaction) -> None:
                 if not await self.interaction_check(interaction):
                     return
                 selected = self.scrim()
@@ -741,16 +777,52 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     )
                     return
                 edit_view = ScrimEditView(
-                    self.panel, self.owner_id, self.guild_id, self.scrim_id
+                    self.panel,
+                    self.owner_id,
+                    self.guild_id,
+                    self.scrim_id,
+                    section="required",
                 )
                 await interaction.response.edit_message(
                     content=edit_view.content(),
+                    embed=edit_view.embed(),
                     view=edit_view,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
 
-            edit_button.callback = edit_callback
-            self.add_item(edit_button)
+            required_button.callback = required_callback
+            self.add_item(required_button)
+
+            additional_button = discord.ui.Button(
+                label="Edit Additional Settings",
+                emoji="⚙️",
+                style=discord.ButtonStyle.primary,
+                row=0,
+            )
+
+            async def additional_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                selected = self.scrim()
+                if selected is None:
+                    await interaction.response.edit_message(
+                        content="That scrim no longer exists.",
+                        embed=None,
+                        view=None,
+                    )
+                    return
+                additional_view = AdditionalSettingsMenuView(
+                    self.panel, self.owner_id, self.guild_id, self.scrim_id
+                )
+                await interaction.response.edit_message(
+                    content=additional_view.content(),
+                    embed=additional_view.embed(),
+                    view=additional_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+            additional_button.callback = additional_callback
+            self.add_item(additional_button)
 
             delete_button = discord.ui.Button(
                 label="Delete Scrim",
@@ -773,8 +845,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 await interaction.response.edit_message(
                     content=(
                         f"Delete **{_safe_name(selected.name)}**? This permanently "
-                        "removes its saved slot data, but does not delete either "
-                        "Discord channel."
+                        "removes its saved slot data, but does not delete any "
+                        "Discord channels."
                     ),
                     embed=None,
                     view=DeleteConfirmation(
@@ -813,7 +885,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 return "That scrim no longer exists."
             return (
                 f"**Scrim Management — {_safe_name(selected.name)}**\n"
-                "Choose an action below."
+                "Review the configuration, then choose what to edit."
             )
 
         def embed(self) -> discord.Embed:
@@ -823,18 +895,240 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     title="Scrim no longer exists",
                     color=discord.Color.red(),
                 )
-            state = "🟢 OPEN" if selected.is_open else "🔴 CLOSED"
-            password_mode = getattr(selected, "pw_type", "fixed").upper()
-            max_matches = getattr(selected, "max_matches", len(selected.maps))
-            current_match = getattr(selected, "current_match_counter", 1)
-            return discord.Embed(
+            config = repository.get_idpw_config(selected.id)
+            channel_values = (
+                ("Slots Public", selected.public_channel_id),
+                ("Slots Staff", selected.staff_channel_id),
+                ("Logs", selected.logs_channel_id),
+                ("History", selected.history_channel_id),
+            )
+            channel_ready = all(value for _, value in channel_values)
+            role_values = (
+                ("Pending", selected.pending_role_id),
+                ("Confirmed", selected.confirmed_role_id),
+            )
+            roles_ready = all(value for _, value in role_values)
+            slots_ready = (
+                selected.slot_start is not None
+                and selected.slot_end is not None
+            )
+            slot_text = (
+                f"{selected.slot_start:02d}–{selected.slot_end:02d} "
+                f"({selected.slot_end - selected.slot_start + 1} slots)"
+                if slots_ready
+                else "Missing"
+            )
+            matches = getattr(selected, "max_matches", 0)
+            maps = list(getattr(selected, "maps", []))
+            match_maps = list(getattr(selected, "match_maps", maps))
+            assigned_maps = sum(
+                bool(game_map) for game_map in match_maps[:matches]
+            )
+            matches_ready = matches > 0
+            registration_channel = getattr(
+                selected, "registration_channel_id", None
+            )
+            registration_role = getattr(selected, "registration_role_id", None)
+            registration_complete = bool(registration_channel and registration_role)
+            registration_partial = bool(registration_channel or registration_role)
+            target_channel = config.target_channel_id if config else None
+            password_type = getattr(selected, "pw_type", None) or (
+                config.password_type if config else None
+            )
+            timezone_name = getattr(selected, "timezone", None) or (
+                config.timezone_name if config else None
+            )
+            idpw_ready = bool(target_channel and password_type and timezone_name)
+            idpw_partial = bool(target_channel or password_type or timezone_name)
+            embed = discord.Embed(
                 title=f"Manage Scrim — {_safe_name(selected.name)}",
+                description="Configuration overview",
+                color=discord.Color.blurple(),
+            )
+            required_channels = "\n".join(
+                f"{'🟢' if value else '🔴'} {label}: "
+                f"{self._mention_channel(value)}"
+                for label, value in channel_values
+            )
+            required_roles = "\n".join(
+                f"{'🟢' if value else '🔴'} {label}: "
+                f"{self._mention_role(value)}"
+                for label, value in role_values
+            )
+            embed.add_field(
+                name="Required Settings",
+                value=(
+                    f"🟢 Scrim Name: **{_safe_name(selected.name)}**\n"
+                    f"{'🟢' if channel_ready else '🔴'} Channels:\n"
+                    f"{required_channels}\n"
+                    f"{'🟢' if roles_ready else '🔴'} Roles:\n"
+                    f"{required_roles}\n"
+                    f"{'🟢' if slots_ready else '🔴'} Slots: **{slot_text}**"
+                ),
+                inline=False,
+            )
+            registration_text = (
+                f"Channel: {self._mention_channel(registration_channel)}\n"
+                f"Role: {self._mention_role(registration_role)}\n"
+                f"Validation mode: **"
+                f"{'Auto-accept' if getattr(selected, 'registration_auto_accept', False) else 'Staff validation'}**"
+                if registration_partial
+                else "Not configured"
+            )
+            idpw_text = (
+                f"Target: {self._mention_channel(target_channel)}\n"
+                f"Password mode: **{str(password_type).upper()}**\n"
+                f"Timezone: **{timezone_name}**"
+                if idpw_ready
+                else "Not configured"
+            )
+            embed.add_field(
+                name="Additional Settings",
+                value=(
+                    f"{'🟢' if matches_ready else '⚪'} Matches & Maps:\n"
+                    f"Matches: **{matches or 'Not configured'}**\n"
+                    f"Maps: **{assigned_maps}/{matches} assigned**"
+                    if matches_ready
+                    else "⚪ Matches & Maps: Not configured"
+                ),
+                inline=False,
+            )
+            embed.add_field(
+                name="Registrations",
+                value=(
+                    f"{'🟢' if registration_complete else '🟡' if registration_partial else '⚪'} "
+                    f"{registration_text}"
+                ),
+                inline=False,
+            )
+            embed.add_field(
+                name="ID&PW",
+                value=(
+                    f"{'🟢' if idpw_ready else '🟡' if idpw_partial else '⚪'} "
+                    f"{idpw_text}"
+                ),
+                inline=False,
+            )
+            return embed
+
+        @staticmethod
+        def _mention_channel(value: int | None) -> str:
+            return f"<#{value}>" if value else "Missing"
+
+        @staticmethod
+        def _mention_role(value: int | None) -> str:
+            return f"<@&{value}>" if value else "Missing"
+
+    class AdditionalSettingsMenuView(BoundView):
+        """Second-level menu for optional scrim configuration."""
+
+        def __init__(
+            self,
+            panel: SetupPanel,
+            owner_id: int,
+            guild_id: int,
+            scrim_id: str,
+        ):
+            super().__init__(owner_id, guild_id)
+            self.panel = panel
+            self.scrim_id = scrim_id
+            self.rebuild()
+
+        def scrim(self) -> Any | None:
+            selected = repository.get(self.scrim_id)
+            if selected is None or selected.guild_id != self.guild_id:
+                return None
+            return selected
+
+        def rebuild(self) -> None:
+            self.clear_items()
+            options = (
+                ("matches_maps", "Matches & Maps", "🎮"),
+                ("registration", "Registrations", "📝"),
+                ("idpw", "ID&PW", "🔐"),
+            )
+            for section, label, emoji in options:
+                button = discord.ui.Button(
+                    label=label,
+                    emoji=emoji,
+                    style=discord.ButtonStyle.primary,
+                    row=0,
+                )
+
+                async def callback(
+                    interaction: discord.Interaction,
+                    section=section,
+                ) -> None:
+                    if not await self.interaction_check(interaction):
+                        return
+                    if self.scrim() is None:
+                        await interaction.response.edit_message(
+                            content="That scrim no longer exists.",
+                            embed=None,
+                            view=None,
+                        )
+                        return
+                    edit_view = ScrimEditView(
+                        self.panel,
+                        self.owner_id,
+                        self.guild_id,
+                        self.scrim_id,
+                        section=section,
+                    )
+                    await interaction.response.edit_message(
+                        content=edit_view.content(),
+                        embed=edit_view.embed(),
+                        view=edit_view,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+
+                button.callback = callback
+                self.add_item(button)
+
+            back_button = discord.ui.Button(
+                label="Back to Management",
+                emoji="↩️",
+                style=discord.ButtonStyle.secondary,
+                row=1,
+            )
+
+            async def back_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                management = ScrimManagementView(
+                    self.panel, self.owner_id, self.guild_id, self.scrim_id
+                )
+                await interaction.response.edit_message(
+                    content=management.content(),
+                    embed=management.embed(),
+                    view=management,
+                )
+
+            back_button.callback = back_callback
+            self.add_item(back_button)
+
+        def content(self) -> str:
+            selected = self.scrim()
+            if selected is None:
+                return "That scrim no longer exists."
+            return (
+                f"**Edit Additional Settings — {_safe_name(selected.name)}**\n"
+                "Choose an optional configuration category."
+            )
+
+        def embed(self) -> discord.Embed:
+            selected = self.scrim()
+            if selected is None:
+                return discord.Embed(
+                    title="Scrim no longer exists",
+                    color=discord.Color.red(),
+                )
+            return discord.Embed(
+                title=f"Additional Settings — {_safe_name(selected.name)}",
                 description=(
-                    f"Status: **{state}**\n"
-                    f"Slots: **{selected.slot_start:02d}–{selected.slot_end:02d}** "
-                    f"({len(selected.slots)} total)\n"
-                    f"Current match: **{current_match} / {max_matches}**\n"
-                    f"Password mode: **{password_mode}**"
+                    "Matches & Maps, Registrations, and ID&PW are optional. "
+                    "This panel shows configuration only; live registration and "
+                    "slot states are handled elsewhere."
                 ),
                 color=discord.Color.blurple(),
             )
@@ -943,20 +1237,50 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             super().__init__(grid.owner_id, grid.guild_id, timeout=300)
             self.grid = grid
             self.setting = setting
-            if setting == "logs_history":
+            if setting == "required_channels":
+                selectors = (
+                    ("public", "Select the Slots Public channel"),
+                    ("staff", "Select the Slots Staff channel"),
+                    ("logs", "Select the Logs channel"),
+                    ("history", "Select the History channel"),
+                )
+            elif setting == "logs_history":
                 selectors = (
                     ("logs", "Select the Logs channel"),
                     ("history", "Select the History channel"),
                 )
+            elif setting == "public_staff":
+                selectors = (
+                    ("public", "Select the Public channel"),
+                    ("staff", "Select the Staff channel"),
+                )
+            elif setting == "registration":
+                selectors = (("registration", "Select the Registration channel"),)
             else:
                 selectors = ((setting, f"Select the {setting} channel"),)
+            self.selected: dict[str, int | None] = {
+                field: getattr(
+                    grid,
+                    "registration_channel_id"
+                    if field == "registration"
+                    else f"{field}_channel_id",
+                    None,
+                )
+                for field, _ in selectors
+            }
             for field, placeholder in selectors:
                 picker = discord.ui.ChannelSelect(
                     channel_types=[discord.ChannelType.text],
                     placeholder=placeholder,
                     min_values=1,
                     max_values=1,
-                    row=0 if field == "logs" else (1 if field == "history" else 0),
+                    row=(
+                        {"public": 0, "staff": 1, "logs": 2, "history": 3}.get(
+                            field, 0
+                        )
+                        if setting == "required_channels"
+                        else (0 if field in {"logs", "public"} else 1)
+                    ),
                 )
 
                 async def picker_callback(
@@ -966,32 +1290,61 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 ) -> None:
                     if not await self.interaction_check(interaction):
                         return
-                    if setting == "logs_history":
-                        if field == "logs":
-                            self.grid.logs_channel_id = picker.values[0].id
-                        else:
-                            self.grid.history_channel_id = picker.values[0].id
-                        if (
-                            self.grid.logs_channel_id
-                            and self.grid.history_channel_id
-                        ):
-                            if (
-                                self.grid.logs_channel_id
-                                == self.grid.history_channel_id
-                            ):
+                    self.selected[field] = picker.values[0].id
+                    if setting == "required_channels":
+                        fields = ("public", "staff", "logs", "history")
+                        values = [self.selected[field] for field in fields]
+                        if all(values):
+                            if len(set(values)) != len(values):
                                 await interaction.response.send_message(
-                                    "Logs and history channels must be different.",
+                                    "Public, staff, logs, and history channels must all be different.",
                                     ephemeral=True,
                                 )
                                 return
                             await self.grid.apply_setting(
                                 interaction,
-                                "logs_history",
-                                f"{self.grid.logs_channel_id}, {self.grid.history_channel_id}",
+                                setting,
+                                ", ".join(str(value) for value in values),
                             )
                         else:
                             await interaction.response.edit_message(
-                                content="Select both the Logs and History channels.",
+                                content=(
+                                    "Select the Slots Public, Slots Staff, Logs, "
+                                    "and History channels."
+                                ),
+                                view=self,
+                            )
+                    elif setting in {"logs_history", "public_staff"}:
+                        first_field, second_field = (
+                            ("logs", "history")
+                            if setting == "logs_history"
+                            else ("public", "staff")
+                        )
+                        first_id = self.selected[first_field]
+                        second_id = self.selected[second_field]
+                        if first_id and second_id:
+                            if first_id == second_id:
+                                await interaction.response.send_message(
+                                    (
+                                        "Public and staff channels must be different."
+                                        if setting == "public_staff"
+                                        else "Logs and history channels must be different."
+                                    ),
+                                    ephemeral=True,
+                                )
+                                return
+                            await self.grid.apply_setting(
+                                interaction,
+                                setting,
+                                f"{first_id}, {second_id}",
+                            )
+                        else:
+                            await interaction.response.edit_message(
+                                content=(
+                                    "Select both the Public and Staff channels."
+                                    if setting == "public_staff"
+                                    else "Select both the Logs and History channels."
+                                ),
                                 view=self,
                             )
                     else:
@@ -1004,7 +1357,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             back_button = discord.ui.Button(
                 label="Back",
                 style=discord.ButtonStyle.secondary,
-                row=2,
+                row=4 if setting == "required_channels" else 2,
             )
 
             async def back_callback(interaction: discord.Interaction) -> None:
@@ -1023,15 +1376,37 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             super().__init__(grid.owner_id, grid.guild_id, timeout=300)
             self.grid = grid
             self.setting = setting
-            picker = discord.ui.RoleSelect(
-                placeholder=f"Select the {setting.replace('_', ' ')}",
-                min_values=1,
-                max_values=1,
-                row=0,
-            )
+            if setting == "captain_roles":
+                selectors = (
+                    ("pending_role", "Select the Pending Captain Role"),
+                    ("confirmed_role", "Select the Confirmed Captain Role"),
+                )
+            else:
+                selectors = ((setting, f"Select the {setting.replace('_', ' ')}"),)
+            self.selected: dict[str, int | None] = {
+                field: getattr(
+                    grid,
+                    f"{field}_id",
+                    None,
+                )
+                for field, _ in selectors
+            }
 
-            async def picker_callback(interaction: discord.Interaction) -> None:
-                if await self.interaction_check(interaction):
+            for field, placeholder in selectors:
+                picker = discord.ui.RoleSelect(
+                    placeholder=placeholder,
+                    min_values=1,
+                    max_values=1,
+                    row=0 if field == "pending_role" else 1,
+                )
+
+                async def picker_callback(
+                    interaction: discord.Interaction,
+                    picker=picker,
+                    field=field,
+                ) -> None:
+                    if not await self.interaction_check(interaction):
+                        return
                     role = picker.values[0]
                     if (role.is_default() or role.managed) and setting != "registration_role":
                         await interaction.response.send_message(
@@ -1039,16 +1414,34 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                             ephemeral=True,
                         )
                         return
-                    await self.grid.apply_setting(
-                        interaction, setting, str(role.id)
-                    )
+                    self.selected[field] = role.id
+                    if setting == "captain_roles":
+                        pending_id = self.selected["pending_role"]
+                        confirmed_id = self.selected["confirmed_role"]
+                        if pending_id and confirmed_id:
+                            await self.grid.apply_setting(
+                                interaction,
+                                setting,
+                                f"{pending_id}, {confirmed_id}",
+                            )
+                        else:
+                            await interaction.response.edit_message(
+                                content=(
+                                    "Select both the Pending and Confirmed Captain roles."
+                                ),
+                                view=self,
+                            )
+                    else:
+                        await self.grid.apply_setting(
+                            interaction, setting, str(role.id)
+                        )
 
-            picker.callback = picker_callback
-            self.add_item(picker)
+                picker.callback = picker_callback
+                self.add_item(picker)
             back_button = discord.ui.Button(
                 label="Back",
                 style=discord.ButtonStyle.secondary,
-                row=1,
+                row=2 if setting == "captain_roles" else 1,
             )
 
             async def back_callback(interaction: discord.Interaction) -> None:
@@ -1435,11 +1828,13 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             *,
             name: str | None = None,
             scrim_id: str | None = None,
+            section: str = "all",
         ):
             super().__init__(owner_id, guild_id, timeout=900)
             self.panel = panel
             self.scrim_id = scrim_id
             self.is_edit = scrim_id is not None
+            self.section = section
             self.name = name or ""
             self.public_channel_id: int | None = None
             self.staff_channel_id: int | None = None
@@ -1451,14 +1846,19 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             self.registration_auto_accept = False
             self.pending_role_id: int | None = None
             self.confirmed_role_id: int | None = None
-            self.slot_start = DEFAULT_SLOT_START
-            self.slot_end = DEFAULT_SLOT_END
-            self.max_matches = len(DEFAULT_MATCH_MAPS)
+            self.slot_start: int | None = (
+                DEFAULT_SLOT_START if self.is_edit else None
+            )
+            self.slot_end: int | None = DEFAULT_SLOT_END if self.is_edit else None
+            self.max_matches = len(DEFAULT_MATCH_MAPS) if self.is_edit else 0
             self.maps: list[str] = []
             self.match_maps: list[str] = []
             self.pw_type: str | None = None
             self.fixed_pw = ""
             self.timezone_name: str | None = None
+            self.kill_points_value = DEFAULT_KILL_POINTS_VALUE
+            self.placement_points_string = DEFAULT_PLACEMENT_POINTS_STRING
+            self.leaderboard_layout = "1_col"
             if self.is_edit:
                 self.load_scrim()
             self.rebuild()
@@ -1502,6 +1902,13 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             self.timezone_name = getattr(scrim, "timezone", None)
             if config is not None and config.timezone_name:
                 self.timezone_name = config.timezone_name
+            self.kill_points_value = getattr(
+                scrim, "kill_points_value", DEFAULT_KILL_POINTS_VALUE
+            )
+            self.placement_points_string = getattr(
+                scrim, "placement_points_string", DEFAULT_PLACEMENT_POINTS_STRING
+            )
+            self.leaderboard_layout = getattr(scrim, "leaderboard_layout", "1_col")
             return scrim
 
         @staticmethod
@@ -1529,16 +1936,267 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
         def content(self) -> str:
             if self.is_edit:
+                section_titles = {
+                    "required": "Required Settings",
+                    "matches_maps": "Matches & Maps",
+                    "registration": "Registrations",
+                    "idpw": "ID&PW",
+                }
+                section_title = section_titles.get(
+                    self.section, "Configuration"
+                )
                 return (
-                    f"**Edit Configuration — {_safe_name(self.name)}**\n"
+                    f"**Edit {section_title} — {_safe_name(self.name)}**\n"
                     "Choose a setting below. Changes are saved immediately."
                 )
             return (
-                f"**Setup Wizard — {_safe_name(self.name)}**\n"
-                "Configure the required settings, then activate the scrim."
+                "**Create New Scrim**\n"
+                "Complete the required settings below. Optional settings will be "
+                "added after the required setup is validated."
             )
 
+        def _edit_back_view(self) -> discord.ui.View:
+            if self.section == "required" or self.section == "all":
+                return ScrimManagementView(
+                    self.panel, self.owner_id, self.guild_id, self.scrim_id
+                )
+            return AdditionalSettingsMenuView(
+                self.panel, self.owner_id, self.guild_id, self.scrim_id
+            )
+
+        def _add_edit_back_button(self, row: int = 2) -> None:
+            back_button = discord.ui.Button(
+                label=(
+                    "Back to Management"
+                    if self.section in {"required", "all"}
+                    else "Back to Additional Settings"
+                ),
+                emoji="↩️",
+                style=discord.ButtonStyle.secondary,
+                row=row,
+            )
+
+            async def back_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                next_view = self._edit_back_view()
+                await interaction.response.edit_message(
+                    content=next_view.content(),
+                    embed=next_view.embed(),
+                    view=next_view,
+                )
+
+            back_button.callback = back_callback
+            self.add_item(back_button)
+
+        def _rebuild_edit_section(self) -> None:
+            if self.section == "required":
+                specs = (
+                    ("name", "Scrim Name", "Scrim name", "Example: Friday Night Scrim", self.name),
+                    ("public_staff", "Public + Staff Ch.", "Channel IDs", "public_id, staff_id", (
+                        f"{self.public_channel_id}, {self.staff_channel_id}"
+                        if self.public_channel_id and self.staff_channel_id
+                        else ""
+                    )),
+                    ("logs_history", "Logs & History", "Channel IDs", "logs_id, history_id", (
+                        f"{self.logs_channel_id}, {self.history_channel_id}"
+                        if self.logs_channel_id and self.history_channel_id
+                        else ""
+                    )),
+                    ("captain_roles", "Pending + Confirmed Roles", "", "", ""),
+                    ("slots", "Slots", "", "", ""),
+                )
+            elif self.section == "matches_maps":
+                specs = (
+                    ("matches", "Matches", "Match count", f"1-{MAX_MATCHES}", self.max_matches),
+                    ("maps", "Maps", "Map rotation (optional)", "Erangel, Miramar, Sanhok", ", ".join(self.maps)),
+                )
+            elif self.section == "registration":
+                button = discord.ui.Button(
+                    label="Registration Settings",
+                    emoji="📝",
+                    style=discord.ButtonStyle.primary,
+                    row=0,
+                )
+
+                async def registration_callback(
+                    interaction: discord.Interaction,
+                ) -> None:
+                    if not await self.interaction_check(interaction):
+                        return
+                    await interaction.response.edit_message(
+                        content="Configure public team registration settings.",
+                        embed=None,
+                        view=RegistrationSettingsView(self),
+                    )
+
+                button.callback = registration_callback
+                self.add_item(button)
+                self._add_edit_back_button(row=1)
+                return
+            elif self.section == "idpw":
+                specs = (
+                    ("target", "ID/PW Channel", "Channel ID", "123456789", self.target_channel_id),
+                    ("pw_mode", "Password Mode", "Password mode", "DYNAMIC or FIXED:your-password", (
+                        f"{self.pw_type.upper()}:{self.fixed_pw}"
+                        if self.pw_type == "fixed" and self.fixed_pw
+                        else (self.pw_type or "")
+                    )),
+                    ("timezone", "Timezone", "UTC offset", "UTC+01:00", self.timezone_name or ""),
+                )
+            else:
+                return
+
+            for setting, label, modal_label, placeholder, default in specs:
+                button = discord.ui.Button(
+                    label=label,
+                    style=discord.ButtonStyle.primary,
+                    row=0 if self.section == "required" else 0,
+                )
+
+                async def callback(
+                    interaction: discord.Interaction,
+                    setting=setting,
+                    modal_label=modal_label,
+                    placeholder=placeholder,
+                    default=default,
+                ) -> None:
+                    if not await self.interaction_check(interaction):
+                        return
+                    if setting == "name":
+                        await interaction.response.send_modal(
+                            self._modal(
+                                "name",
+                                "Scrim name",
+                                "Example: Friday Night Scrim",
+                                self.name,
+                            )
+                        )
+                    elif setting in {"public_staff", "logs_history", "target"}:
+                        await interaction.response.edit_message(
+                            content="Select an existing server channel.",
+                            embed=None,
+                            view=GridChannelDropdownView(self, setting),
+                        )
+                    elif setting == "captain_roles":
+                        await interaction.response.edit_message(
+                            content="Select an existing server role.",
+                            embed=None,
+                            view=GridRoleDropdownView(self, setting),
+                        )
+                    elif setting == "slots":
+                        await interaction.response.send_modal(
+                            CreateSlotRangeModal(self)
+                        )
+                    elif setting == "matches":
+                        await interaction.response.edit_message(
+                            content="Select the number of matches.",
+                            embed=None,
+                            view=MatchCountDropdownView(self),
+                        )
+                    elif setting == "timezone":
+                        await interaction.response.edit_message(
+                            content="Select the ID/PW timezone.",
+                            embed=None,
+                            view=GridDropdownView(
+                                self,
+                                setting,
+                                title="Select a timezone",
+                                options=[
+                                    discord.SelectOption(
+                                        label=choice_label,
+                                        value=value,
+                                        default=value == self.timezone_name,
+                                    )
+                                    for value, choice_label in IDPW_TIMEZONE_CHOICES
+                                ],
+                            ),
+                        )
+                    elif setting == "pw_mode":
+                        await interaction.response.edit_message(
+                            content="Select the password mode.",
+                            embed=None,
+                            view=GridDropdownView(
+                                self,
+                                setting,
+                                title="Select DYNAMIC or FIXED",
+                                options=[
+                                    discord.SelectOption(
+                                        label="Dynamic password",
+                                        value="dynamic",
+                                        default=self.pw_type == "dynamic",
+                                    ),
+                                    discord.SelectOption(
+                                        label="Fixed password",
+                                        value="fixed",
+                                        default=self.pw_type == "fixed",
+                                    ),
+                                ],
+                            ),
+                        )
+                    else:
+                        await interaction.response.send_modal(
+                            self._modal(
+                                setting,
+                                modal_label,
+                                placeholder,
+                                default,
+                            )
+                        )
+
+                button.callback = callback
+                self.add_item(button)
+            self._add_edit_back_button(row=1 if self.section != "required" else 2)
+
         def embed(self) -> discord.Embed:
+            if not self.is_edit:
+                channel_ready = all(
+                    (
+                        self.public_channel_id,
+                        self.staff_channel_id,
+                        self.logs_channel_id,
+                        self.history_channel_id,
+                    )
+                )
+                roles_ready = all(
+                    (self.pending_role_id, self.confirmed_role_id)
+                )
+                slots_ready = (
+                    self.slot_start is not None
+                    and self.slot_end is not None
+                )
+                slot_value = (
+                    f"{self.slot_start:02d}–{self.slot_end:02d} "
+                    f"({self.slot_end - self.slot_start + 1} slots)"
+                    if slots_ready
+                    else "Not configured"
+                )
+                embed = discord.Embed(
+                    title="Create New Scrim",
+                    description="🔴 Missing · 🟢 Configured",
+                    color=discord.Color.blurple(),
+                )
+                embed.add_field(
+                    name="Required Settings",
+                    value=(
+                        f"**Scrim Name:** {self._status(self.name.strip(), self.name or 'Missing')}\n"
+                        f"**Channels:** {self._status(channel_ready)}\n"
+                        f"**Roles:** {self._status(roles_ready)}\n"
+                        f"**Slots:** {self._status(slots_ready, slot_value)}"
+                    ),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="Additional Settings",
+                    value=(
+                        "📌 Additional Settings can be added in the "
+                        "**Manage Scrim** menu from the main menu!\n"
+                        "*(Matches & Maps · Registrations · ID&PW)*"
+                    ),
+                    inline=False,
+                )
+                return embed
+
             maps_value = (
                 f"{len(self.maps)} custom maps"
                 if self.maps
@@ -1555,17 +2213,20 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             )
             if self.is_edit:
                 channel_value = (
-                    f"Public: {self._mention_channel(self.public_channel_id)}\n"
-                    f"Staff: {self._mention_channel(self.staff_channel_id)}\n"
+                    f"Public + Staff:\n"
+                    f"  Public: {self._mention_channel(self.public_channel_id)}\n"
+                    f"  Staff: {self._mention_channel(self.staff_channel_id)}\n"
                     f"ID/PW: {self._mention_channel(self.target_channel_id)}\n"
-                    f"Logs: {self._mention_channel(self.logs_channel_id)}\n"
-                    f"History: {self._mention_channel(self.history_channel_id)}\n"
-                    f"Registration: {self._mention_channel(self.registration_channel_id)}"
+                    f"Logs + History:\n"
+                    f"  Logs: {self._mention_channel(self.logs_channel_id)}\n"
+                    f"  History: {self._mention_channel(self.history_channel_id)}"
+                    f"\nRegistration channel: {self._mention_channel(self.registration_channel_id)}"
                 )
                 role_value = (
-                    f"Pending: {self._mention_role(self.pending_role_id)}\n"
-                    f"Confirmed: {self._mention_role(self.confirmed_role_id)}\n"
-                    f"Registration: {self._mention_role(self.registration_role_id)}"
+                    f"Pending + Confirmed Captain Roles:\n"
+                    f"  Pending: {self._mention_role(self.pending_role_id)}\n"
+                    f"  Confirmed: {self._mention_role(self.confirmed_role_id)}\n"
+                    f"Registration role: {self._mention_role(self.registration_role_id)}"
                 )
                 settings_value = (
                     f"Matches: **{self.max_matches}** "
@@ -1578,29 +2239,6 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 )
                 title = f"Edit Configuration — {_safe_name(self.name)}"
                 description = "Current database values"
-            else:
-                channel_value = (
-                    f"Public Ch.: {self._status(self.public_channel_id, self._mention_channel(self.public_channel_id))}\n"
-                    f"Staff Ch.: {self._status(self.staff_channel_id, self._mention_channel(self.staff_channel_id))}\n"
-                    f"ID/PW Target: {self._status(self.target_channel_id, self._mention_channel(self.target_channel_id))}\n"
-                    f"Logs & History: {self._status(self.logs_channel_id and self.history_channel_id, 'Configured')}\n"
-                    f"Registration: {self._status(self.registration_channel_id, self._mention_channel(self.registration_channel_id))}"
-                )
-                role_value = (
-                    f"Pending Role: {self._status(self.pending_role_id, self._mention_role(self.pending_role_id))}\n"
-                    f"Confirmed Role: {self._status(self.confirmed_role_id, self._mention_role(self.confirmed_role_id))}\n"
-                    f"Registration Role: {self._status(self.registration_role_id, self._mention_role(self.registration_role_id))}"
-                )
-                settings_value = (
-                    f"Matches: {self._status(self.max_matches, str(self.max_matches))}\n"
-                    f"Custom Maps: 🟢 {maps_value}\n"
-                    f"Match Maps: {self._status(not self.maps or assigned_count == self.max_matches, match_maps_value)}\n"
-                    f"PW Mode: {self._status(self.pw_type, (self.pw_type or '').upper())}\n"
-                    f"Timezone: {self._status(self.timezone_name, self.timezone_name or '')}\n"
-                    f"Registration: 🟢 {'Auto-accept' if self.registration_auto_accept else 'Staff validation'}"
-                )
-                title = f"Setup Wizard — {_safe_name(self.name)}"
-                description = "🔴 Missing · 🟢 Configured"
             embed = discord.Embed(
                 title=title,
                 description=description,
@@ -1652,9 +2290,96 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
         def rebuild(self) -> None:
             self.clear_items()
 
+            if not self.is_edit:
+                required_buttons = (
+                    ("name", "Scrim Name", "📝"),
+                    ("channels", "Channels", "📺"),
+                    ("roles", "Roles", "🎭"),
+                    ("slots", "Slots", "🔢"),
+                )
+                for setting, label, emoji in required_buttons:
+                    button = discord.ui.Button(
+                        label=label,
+                        emoji=emoji,
+                        style=discord.ButtonStyle.primary,
+                        row=0,
+                    )
+
+                    async def required_callback(
+                        interaction: discord.Interaction,
+                        setting=setting,
+                    ) -> None:
+                        if not await self.interaction_check(interaction):
+                            return
+                        if setting == "name":
+                            await interaction.response.send_modal(
+                                self._modal(
+                                    "name",
+                                    "Scrim name",
+                                    "Example: Friday Night Scrim",
+                                    self.name,
+                                )
+                            )
+                        elif setting == "channels":
+                            await interaction.response.edit_message(
+                                content="Configure the required scrim channels.",
+                                embed=None,
+                                view=GridChannelDropdownView(
+                                    self, "required_channels"
+                                ),
+                            )
+                        elif setting == "roles":
+                            await interaction.response.edit_message(
+                                content="Configure the required captain roles.",
+                                embed=None,
+                                view=GridRoleDropdownView(
+                                    self, "captain_roles"
+                                ),
+                            )
+                        else:
+                            await interaction.response.send_modal(
+                                CreateSlotRangeModal(self)
+                            )
+
+                    button.callback = required_callback
+                    self.add_item(button)
+
+                cancel_button = discord.ui.Button(
+                    label="Cancel Draft",
+                    emoji="🟥",
+                    style=discord.ButtonStyle.danger,
+                    row=1,
+                )
+
+                async def cancel_callback(interaction: discord.Interaction) -> None:
+                    if await self.interaction_check(interaction):
+                        self.stop()
+                        await interaction.response.edit_message(
+                            content="Draft cancelled. Nothing was created.",
+                            embed=None,
+                            view=None,
+                        )
+
+                cancel_button.callback = cancel_callback
+                self.add_item(cancel_button)
+                return
+
+            if self.section != "all":
+                self._rebuild_edit_section()
+                return
+
             specs = (
-                ("public", "Public Ch.", "Channel ID", "123456789", self.public_channel_id),
-                ("staff", "Staff Ch.", "Channel ID", "123456789", self.staff_channel_id),
+                (
+                    "public_staff",
+                    "Public + Staff Ch.",
+                    "Channel IDs",
+                    "public_id, staff_id",
+                    (
+                        f"{self.public_channel_id}, {self.staff_channel_id}"
+                        if self.public_channel_id and self.staff_channel_id
+                        else ""
+                    ),
+                ),
                 ("target", "ID/PW Target", "Channel ID", "123456789", self.target_channel_id),
                 (
                     "logs_history",
@@ -1683,7 +2408,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     default=default,
                 ) -> None:
                     if await self.interaction_check(interaction):
-                        if setting in {"public", "staff", "target", "logs_history", "registration"}:
+                        if setting in {"public_staff", "target", "logs_history"}:
                             await interaction.response.edit_message(
                                 content="Select an existing server channel.",
                                 embed=None,
@@ -1697,9 +2422,9 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 button.callback = callback
                 self.add_item(button)
 
-            for setting, label, default in (
-                ("pending_role", "Pending Role", self.pending_role_id),
-                ("confirmed_role", "Confirmed Role", self.confirmed_role_id),
+            for setting, label in (
+                ("captain_roles", "Pending + Confirmed Roles"),
+                ("registration", "Registration"),
             ):
                 button = discord.ui.Button(
                     label=label,
@@ -1711,36 +2436,25 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     interaction: discord.Interaction,
                     setting=setting,
                     label=label,
-                    default=default,
                 ) -> None:
                     if await self.interaction_check(interaction):
-                        await interaction.response.edit_message(
-                            content="Select an existing server role.",
-                            embed=None,
-                            view=GridRoleDropdownView(self, setting),
-                        )
+                        if setting == "registration":
+                            await interaction.response.edit_message(
+                                content=(
+                                    "Configure public team registration settings."
+                                ),
+                                embed=None,
+                                view=RegistrationSettingsView(self),
+                            )
+                        else:
+                            await interaction.response.edit_message(
+                                content="Select an existing server role.",
+                                embed=None,
+                                view=GridRoleDropdownView(self, setting),
+                            )
 
                 button.callback = callback
                 self.add_item(button)
-
-            registration_button = discord.ui.Button(
-                label="Registration",
-                style=discord.ButtonStyle.primary,
-                row=1,
-            )
-
-            async def registration_callback(
-                interaction: discord.Interaction,
-            ) -> None:
-                if await self.interaction_check(interaction):
-                    await interaction.response.edit_message(
-                        content="Configure public team registration settings.",
-                        embed=None,
-                        view=RegistrationSettingsView(self),
-                    )
-
-            registration_button.callback = registration_callback
-            self.add_item(registration_button)
 
             settings = (
                 ("matches", "Matches", "Match count", f"1-{MAX_MATCHES}", self.max_matches),
@@ -1831,27 +2545,9 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                                     ],
                                 ),
                             )
-                        elif setting == "registration_mode":
-                            await interaction.response.edit_message(
-                                content="Choose how public registrations are handled.",
-                                embed=None,
-                                view=GridDropdownView(
-                                    self,
-                                    setting,
-                                    title="Select registration handling",
-                                    options=[
-                                        discord.SelectOption(
-                                            label="Auto-accept",
-                                            value="auto",
-                                            default=self.registration_auto_accept,
-                                        ),
-                                        discord.SelectOption(
-                                            label="Staff validation",
-                                            value="review",
-                                            default=not self.registration_auto_accept,
-                                        ),
-                                    ],
-                                ),
+                        elif setting == "leaderboard":
+                            await interaction.response.send_modal(
+                                self._modal(setting, modal_label, placeholder, default)
                             )
                         else:
                             await interaction.response.send_modal(
@@ -1862,39 +2558,6 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 self.add_item(button)
 
             if self.is_edit:
-                reset_button = discord.ui.Button(
-                    label="Reset Match Counter",
-                    emoji="🔄",
-                    style=discord.ButtonStyle.secondary,
-                    row=3,
-                )
-
-                async def reset_callback(interaction: discord.Interaction) -> None:
-                    if not await self.interaction_check(interaction):
-                        return
-                    scrim = repository.get(self.scrim_id)
-                    if scrim is None or scrim.guild_id != self.guild_id:
-                        await interaction.response.send_message(
-                            "That scrim no longer exists.", ephemeral=True
-                        )
-                        return
-                    await interaction.response.defer()
-                    try:
-                        with repository.transaction():
-                            scrim.current_match_counter = 1
-                        await self.panel.refresh_message()
-                        self.load_scrim()
-                        await interaction.edit_original_response(
-                            content="✅ Match counter reset to 1.",
-                            embed=self.embed(),
-                            view=self,
-                        )
-                    except (SlotStorageError, ValueError) as error:
-                        await _send_error(interaction, error)
-
-                reset_button.callback = reset_callback
-                self.add_item(reset_button)
-
                 back_button = discord.ui.Button(
                     label="Back to Selector",
                     emoji="↩️",
@@ -2029,7 +2692,78 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 return
             guild = interaction.guild
             try:
-                if setting in {"public", "staff", "target", "registration"}:
+                if setting == "name":
+                    value = raw_value.strip()
+                    if not value:
+                        raise ValueError("The scrim name cannot be empty.")
+                    if any(
+                        scrim.name.casefold() == value.casefold()
+                        for scrim in repository.list(self.guild_id)
+                        if not self.is_edit
+                        or scrim.id != self.scrim_id
+                    ):
+                        raise ValueError(
+                            "A scrim with that name already exists in this server."
+                        )
+                    self.name = value
+                elif setting == "required_channels":
+                    values = [int(part.strip()) for part in raw_value.split(",")]
+                    if len(values) != 4 or any(value <= 0 for value in values):
+                        raise ValueError(
+                            "Select the Slots Public, Slots Staff, Logs, and History channels."
+                        )
+                    if len(set(values)) != 4:
+                        raise ValueError(
+                            "Public, staff, logs, and history channels must all be different."
+                        )
+                    channels = [guild.get_channel(value) for value in values]
+                    if not all(
+                        isinstance(channel, discord.TextChannel)
+                        for channel in channels
+                    ):
+                        raise ValueError(
+                            "All four selections must be existing text channels in this server."
+                        )
+                    permission_error = _channel_permissions_error(
+                        guild,
+                        channels[0],
+                        channels[1],
+                        (channels[2], "logs"),
+                        (channels[3], "history"),
+                    )
+                    if permission_error:
+                        raise ValueError(permission_error)
+                    (
+                        self.public_channel_id,
+                        self.staff_channel_id,
+                        self.logs_channel_id,
+                        self.history_channel_id,
+                    ) = values
+                elif setting == "public_staff":
+                    values = [int(part.strip()) for part in raw_value.split(",")]
+                    if len(values) != 2 or any(value <= 0 for value in values):
+                        raise ValueError(
+                            "Enter exactly two channel IDs: public, staff."
+                        )
+                    if values[0] == values[1]:
+                        raise ValueError(
+                            "Public and staff channels must be different."
+                        )
+                    channels = [guild.get_channel(value) for value in values]
+                    if not all(
+                        isinstance(channel, discord.TextChannel)
+                        for channel in channels
+                    ):
+                        raise ValueError(
+                            "Both IDs must be existing text channels in this server."
+                        )
+                    permission_error = _channel_permissions_error(
+                        guild, channels[0], channels[1]
+                    )
+                    if permission_error:
+                        raise ValueError(permission_error)
+                    self.public_channel_id, self.staff_channel_id = values
+                elif setting in {"public", "staff", "target"}:
                     value = int(raw_value)
                     if value <= 0:
                         raise ValueError("Enter a positive Discord channel ID.")
@@ -2057,8 +2791,6 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                         self.public_channel_id = value
                     elif setting == "staff":
                         self.staff_channel_id = value
-                    elif setting == "registration":
-                        self.registration_channel_id = value
                     else:
                         self.target_channel_id = value
                 elif setting == "logs_history":
@@ -2077,6 +2809,30 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     if values[0] == values[1]:
                         raise ValueError("Logs and history channels must be different.")
                     self.logs_channel_id, self.history_channel_id = values
+                elif setting == "captain_roles":
+                    values = [int(part.strip()) for part in raw_value.split(",")]
+                    if len(values) != 2 or any(value <= 0 for value in values):
+                        raise ValueError(
+                            "Enter exactly two role IDs: pending, confirmed."
+                        )
+                    if values[0] == values[1]:
+                        raise ValueError(
+                            "Pending and Confirmed Captain roles must be different."
+                        )
+                    roles = [guild.get_role(value) for value in values]
+                    if any(
+                        role is None or role.is_default() or role.managed
+                        for role in roles
+                    ):
+                        raise ValueError(
+                            "Both IDs must be existing regular server roles."
+                        )
+                    config = repository.get_server_config(self.guild_id)
+                    if config and config.staff_role_id in values:
+                        raise ValueError(
+                            "Captain roles must differ from the global Staff role."
+                        )
+                    self.pending_role_id, self.confirmed_role_id = values
                 elif setting in {"pending_role", "confirmed_role"}:
                     value = int(raw_value)
                     role = guild.get_role(value)
@@ -2097,14 +2853,41 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                         self.pending_role_id = value
                     else:
                         self.confirmed_role_id = value
+                elif setting == "registration":
+                    value = int(raw_value)
+                    if value <= 0:
+                        raise ValueError("Enter a positive Discord channel ID.")
+                    channel = guild.get_channel(value)
+                    if not isinstance(channel, discord.TextChannel):
+                        raise ValueError(
+                            "That ID is not an existing text channel in this server."
+                        )
+                    member = guild.me
+                    permissions = channel.permissions_for(member) if member else None
+                    required = ("view_channel", "send_messages", "read_message_history")
+                    missing = [
+                        permission.replace("_", " ").title()
+                        for permission in required
+                        if permissions is None
+                        or not getattr(permissions, permission, False)
+                    ]
+                    if missing:
+                        raise ValueError(
+                            f"I am missing {', '.join(missing)} in {channel.mention}."
+                        )
+                    self.registration_channel_id = value
                 elif setting == "registration_role":
                     value = int(raw_value)
                     role = guild.get_role(value)
                     if role is None or role.managed:
                         raise ValueError(
-                            "Enter an existing server role. @everyone is allowed."
+                            "Select an existing server role. @everyone is allowed."
                         )
                     self.registration_role_id = value
+                elif setting == "registration_mode":
+                    if raw_value not in {"auto", "review"}:
+                        raise ValueError("Choose Auto-accept or Staff validation.")
+                    self.registration_auto_accept = raw_value == "auto"
                 elif setting == "matches":
                     value = int(raw_value)
                     if not 1 <= value <= MAX_MATCHES:
@@ -2148,10 +2931,27 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                             "Use one of the supported values such as UTC, UTC+01:00, or UTC-05:00."
                         )
                     self.timezone_name = raw_value
-                elif setting == "registration_mode":
-                    if raw_value not in {"auto", "review"}:
-                        raise ValueError("Choose Auto-accept or Staff validation.")
-                    self.registration_auto_accept = raw_value == "auto"
+                elif setting == "leaderboard":
+                    values = [part.strip() for part in raw_value.split("|")]
+                    if len(values) != 3:
+                        raise ValueError(
+                            "Use: kill points | placement points | 1_col or 2_col."
+                        )
+                    self.kill_points_value = int(values[0])
+                    if self.kill_points_value < 0:
+                        raise ValueError("Kill points cannot be negative.")
+                    self.placement_points_string = " ".join(values[1].split())
+                    if not parse_placement_points(self.placement_points_string):
+                        raise ValueError("Placement points must be whole numbers.")
+                    self.leaderboard_layout = values[2]
+                    if self.leaderboard_layout not in LEADERBOARD_LAYOUTS:
+                        raise ValueError("Layout must be 1_col or 2_col.")
+                    config = repository.get_server_config(self.guild_id)
+                    if (
+                        self.leaderboard_layout == "2_col"
+                        and getattr(config, "license_type", "Standard") != "Gold"
+                    ):
+                        raise ValueError("The 2-column layout requires a Gold license.")
                 else:
                     raise ValueError("Unknown configuration setting.")
             except (TypeError, ValueError) as error:
@@ -2163,6 +2963,14 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     await self._save_idpw(interaction)
                 elif setting in {"pw_mode", "timezone"}:
                     await self._save_idpw(interaction)
+                elif setting == "public_staff":
+                    await self._finish_edit(
+                        interaction,
+                        changes={
+                            "public_channel_id": self.public_channel_id,
+                            "staff_channel_id": self.staff_channel_id,
+                        },
+                    )
                 elif setting == "logs_history":
                     await self._finish_edit(
                         interaction,
@@ -2170,6 +2978,29 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                             "logs_channel_id": self.logs_channel_id,
                             "history_channel_id": self.history_channel_id,
                         },
+                    )
+                elif setting == "captain_roles":
+                    await self._finish_edit(
+                        interaction,
+                        changes={
+                            "pending_role_id": self.pending_role_id,
+                            "confirmed_role_id": self.confirmed_role_id,
+                        },
+                    )
+                elif setting in {
+                    "registration",
+                    "registration_role",
+                    "registration_mode",
+                }:
+                    registration_view = RegistrationSettingsView(self)
+                    await self._finish_edit(
+                        interaction,
+                        changes={
+                            "registration_channel_id": self.registration_channel_id,
+                            "registration_role_id": self.registration_role_id,
+                            "registration_auto_accept": self.registration_auto_accept,
+                        },
+                        success_view=registration_view,
                     )
                 elif setting == "matches":
                     await self._finish_edit(
@@ -2188,21 +3019,25 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                             "match_maps": list(self.match_maps),
                         },
                     )
-                elif setting in {
-                    "registration",
-                    "registration_role",
-                    "registration_mode",
-                }:
-                    registration_view = RegistrationSettingsView(self)
-                    await self._finish_edit(
-                        interaction,
-                        changes={
-                            "registration_channel_id": self.registration_channel_id,
-                            "registration_role_id": self.registration_role_id,
-                            "registration_auto_accept": self.registration_auto_accept,
-                        },
-                        success_view=registration_view,
-                    )
+                elif setting == "leaderboard":
+                    await interaction.response.defer()
+                    try:
+                        repository.update_leaderboard_settings(
+                            self.scrim_id,
+                            self.guild_id,
+                            kill_points_value=self.kill_points_value,
+                            placement_points_string=self.placement_points_string,
+                            leaderboard_layout=self.leaderboard_layout,
+                        )
+                        await self.panel.refresh_message()
+                        self.load_scrim()
+                        await interaction.edit_original_response(
+                            content=self.content(),
+                            embed=self.embed(),
+                            view=self,
+                        )
+                    except (SlotStorageError, ValueError) as error:
+                        await _send_error(interaction, error)
                 else:
                     field = {
                         "public": "public_channel_id",
@@ -2319,6 +3154,9 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     max_matches=self.max_matches,
                     maps=self.maps,
                     match_maps=self.match_maps,
+                    kill_points_value=self.kill_points_value,
+                    placement_points_string=self.placement_points_string,
+                    leaderboard_layout=self.leaderboard_layout,
                 )
                 repository.save_idpw_config(
                     scrim.id,
@@ -2377,12 +3215,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             owner_id: int,
             guild_id: int,
             scrim_id: str,
+            *,
+            section: str = "all",
         ):
             super().__init__(
                 panel,
                 owner_id,
                 guild_id,
                 scrim_id=scrim_id,
+                section=section,
             )
 
     class ScrimSetupWizardView(ConfigurationGridView):
@@ -3275,10 +4116,16 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 max_values=1,
             )
             cap_picker = discord.ui.ChannelSelect(
-                placeholder="Select the designated !cap text channel",
+                placeholder="Select an optional Cap Transfer channel",
                 channel_types=[discord.ChannelType.text],
                 min_values=1,
                 max_values=1,
+                row=0,
+            )
+            skip_cap_button = discord.ui.Button(
+                label="Skip Cap Transfer Channel",
+                style=discord.ButtonStyle.secondary,
+                row=1,
             )
 
             async def cap_picker_callback(
@@ -3301,7 +4148,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     self.history_channel_id,
                 }:
                     await interaction.response.send_message(
-                        "The !cap channel must be different from the public, staff, logs, and history channels.",
+                        "The Cap Transfer channel must be different from the public, staff, logs, and history channels.",
                         ephemeral=True,
                     )
                     return
@@ -3331,18 +4178,19 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             async def create_callback(interaction: discord.Interaction) -> None:
                 if not await self.interaction_check(interaction):
                     return
-                if (
-                    self.history_channel_id is None
-                    or self.cap_channel_id is None
-                ):
+                if self.history_channel_id is None:
                     await interaction.response.send_message(
-                        "Select the History and designated !cap channels before completing scrim setup.",
+                        "Select the History channel before completing scrim setup.",
                         ephemeral=True,
                     )
                     return
                 guild = interaction.guild
                 history_channel = guild.get_channel(self.history_channel_id)
-                cap_channel = guild.get_channel(self.cap_channel_id)
+                cap_channel = (
+                    guild.get_channel(self.cap_channel_id)
+                    if self.cap_channel_id is not None
+                    else None
+                )
                 channels = [
                     guild.get_channel(channel_id)
                     for channel_id in (
@@ -3353,7 +4201,10 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 ]
                 if (
                     not isinstance(history_channel, discord.TextChannel)
-                    or not isinstance(cap_channel, discord.TextChannel)
+                    or (
+                        self.cap_channel_id is not None
+                        and not isinstance(cap_channel, discord.TextChannel)
+                    )
                     or not all(
                         isinstance(channel, discord.TextChannel)
                         for channel in channels
@@ -3363,20 +4214,25 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                         "Select existing text channels in this server.", ephemeral=True
                     )
                     return
-                all_channels = [*channels, history_channel, cap_channel]
-                if len({channel.id for channel in all_channels}) != 5:
+                all_channels = [*channels, history_channel]
+                if cap_channel is not None:
+                    all_channels.append(cap_channel)
+                if len({channel.id for channel in all_channels}) != len(all_channels):
                     await interaction.response.send_message(
-                        "Public, staff, logs, history, and !cap channels must be different.",
+                        "Configured scrim channels must all be different.",
                         ephemeral=True,
                     )
                     return
-                permission_error = _channel_permissions_error(
-                    guild,
+                permission_channels = [
                     channels[0],
                     channels[1],
                     (channels[2], "logs"),
                     (history_channel, "history"),
-                    (cap_channel, "!cap"),
+                ]
+                if cap_channel is not None:
+                    permission_channels.append((cap_channel, "Cap Transfer"))
+                permission_error = _channel_permissions_error(
+                    guild, *permission_channels
                 )
                 if permission_error:
                     await interaction.response.send_message(
@@ -3517,16 +4373,26 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 self.history_channel_id = history_channel.id
                 self.clear_items()
                 self.add_item(cap_picker)
+                self.add_item(skip_cap_button)
                 await interaction.response.edit_message(
                     content=(
                         f"History channel selected: {history_channel.mention}\n"
-                        "Now select the designated !cap channel."
+                        "Optionally select the Cap Transfer channel for `!cap`, "
+                        "or skip it to leave captain commands disabled."
                     ),
                     view=self,
                 )
 
             picker.callback = picker_callback
             cap_picker.callback = cap_picker_callback
+
+            async def skip_cap_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                self.cap_channel_id = None
+                await create_callback(interaction)
+
+            skip_cap_button.callback = skip_cap_callback
             self.add_item(picker)
 
     class LegacyScrimEditView(BoundView):
@@ -3672,7 +4538,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 style=discord.ButtonStyle.secondary, row=0
             )
             cap_channel_button = discord.ui.Button(
-                label="Set !cap Channel",
+                label="Set Cap Transfer Channel",
                 emoji="⚙️",
                 style=discord.ButtonStyle.secondary,
                 row=0,
@@ -3746,7 +4612,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 interaction, "history_channel_id", "history"
             )
             cap_channel_button.callback = lambda interaction: edit_channel(
-                interaction, "cap_channel_id", "!cap"
+                interaction, "cap_channel_id", "Cap Transfer"
             )
             range_button.callback = edit_range
             matches_button.callback = edit_matches
@@ -3795,7 +4661,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 f"{f'<@&{scrim.pending_role_id}>' if scrim.pending_role_id else 'not configured'}\n"
                 f"**Confirmed Captain Role:** "
                 f"{f'<@&{scrim.confirmed_role_id}>' if scrim.confirmed_role_id else 'not configured'}\n"
-                f"!cap channel: {_channel_ref(scrim.cap_channel_id)}\n"
+                f"Cap Transfer channel: {_channel_ref(scrim.cap_channel_id)}\n"
                 f"Public channel: {_channel_ref(scrim.public_channel_id)}\n"
                 f"Staff channel: {_channel_ref(scrim.staff_channel_id)}\n"
                 f"Logs channel: {_channel_ref(scrim.logs_channel_id)}\n"
@@ -3925,6 +4791,30 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             picker.callback = callback
             self.add_item(picker)
 
+            if self.field == "cap_channel_id":
+                clear_button = discord.ui.Button(
+                    label="Disable Cap Transfer",
+                    style=discord.ButtonStyle.secondary,
+                    row=1,
+                )
+
+                async def clear_callback(
+                    interaction: discord.Interaction,
+                ) -> None:
+                    if not await self.interaction_check(interaction):
+                        return
+                    await interaction.response.defer()
+                    await apply_scrim_change(
+                        interaction,
+                        self.edit_view.panel,
+                        self.edit_view.scrim_id,
+                        changes={self.field: None},
+                        notice="Cap Transfer is disabled for this scrim.",
+                    )
+
+                clear_button.callback = clear_callback
+                self.add_item(clear_button)
+
     class ScrimNameEditModal(discord.ui.Modal, title="Edit scrim name"):
         name = discord.ui.TextInput(
             label="Scrim name",
@@ -4002,6 +4892,58 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 self.edit_view.scrim_id,
                 changes={"slot_start": start, "slot_end": end},
                 response_mode="modal",
+            )
+
+        async def on_error(
+            self, interaction: discord.Interaction, error: Exception
+        ) -> None:
+            await _send_error(interaction, error)
+
+    class CreateSlotRangeModal(discord.ui.Modal, title="Configure slots"):
+        slot_start = discord.ui.TextInput(
+            label="First slot number",
+            placeholder="Example: 01, 03, or 05",
+            min_length=1,
+            max_length=2,
+        )
+        slot_count = discord.ui.TextInput(
+            label="Number of slots",
+            placeholder="Example: 16, 23, or 25",
+            min_length=1,
+            max_length=2,
+        )
+
+        def __init__(self, grid: "ConfigurationGridView"):
+            super().__init__(timeout=300)
+            self.grid = grid
+            if grid.slot_start is not None:
+                self.slot_start.default = str(grid.slot_start)
+            if grid.slot_start is not None and grid.slot_end is not None:
+                self.slot_count.default = str(
+                    grid.slot_end - grid.slot_start + 1
+                )
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            if not await self.grid.interaction_check(interaction):
+                return
+            try:
+                start, end = _slot_range_from_count(
+                    self.slot_start,
+                    self.slot_count,
+                )
+            except (TypeError, ValueError) as error:
+                await interaction.response.send_message(
+                    f"Invalid slot range. {error}",
+                    ephemeral=True,
+                )
+                return
+            self.grid.slot_start = start
+            self.grid.slot_end = end
+            self.grid.rebuild()
+            await interaction.response.edit_message(
+                content=self.grid.content(),
+                embed=self.grid.embed(),
+                view=self.grid,
             )
 
         async def on_error(
@@ -4305,8 +5247,16 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             )
             return
         panel = SetupPanel(interaction.user.id, interaction.guild.id)
-        await interaction.response.send_modal(
-            ScrimNameModal(panel, interaction.user.id, interaction.guild.id)
+        wizard = ScrimSetupWizardView(
+            panel,
+            interaction.user.id,
+            interaction.guild.id,
+            name="",
+        )
+        await interaction.response.edit_message(
+            content=wizard.content(),
+            embed=wizard.embed(),
+            view=wizard,
         )
 
     bot.start_scrim_wizard = start_scrim_wizard

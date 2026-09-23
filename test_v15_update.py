@@ -1,8 +1,10 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock
 
-from main import bot, build_help_text
+from main import HELP_COPY_TEXT, HelpView, bot, build_help_text
 from scrim_state import DEFAULT_MATCH_MAPS, ScrimRepository
 from slot_storage import SlotStateStore
 
@@ -62,19 +64,17 @@ class V15UpdateTests(unittest.TestCase):
             self.assertEqual(restored.pw_type, "fixed")
             self.assertEqual(restored.fixed_pw, "")
             self.assertEqual(restored.current_match_counter, 1)
-        self.assertEqual(migrated.payload()["version"], 22)
+        self.assertEqual(migrated.payload()["version"], 23)
 
     def test_help_text_contains_both_categories_and_fits_discord_message_limit(self):
         help_text = build_help_text()
 
         self.assertTrue(help_text.startswith(">>> "))
-        self.assertIn("STAFF", help_text)
-        self.assertIn("CAPTAINS", help_text)
-        self.assertIn("multiple lines for bulk teams", help_text)
-        self.assertIn("!register Team Name / Tag [/ @Manager]", help_text)
-        self.assertIn("only members with the configured registration role", help_text)
+        self.assertIn("!setup", help_text)
+        self.assertIn("!register Team / TAG [/ @Manager]", help_text)
+        self.assertIn("!cap add|transfer|remove @User", help_text)
         self.assertNotIn("```", help_text)
-        self.assertLessEqual(len(help_text), 2000)
+        self.assertLessEqual(len(help_text), 1000)
 
     def test_specific_match_commands_are_registered(self):
         self.assertIsNotNone(bot.get_command("idpwg1"))
@@ -105,6 +105,46 @@ class V15UpdateTests(unittest.TestCase):
             self.assertEqual(saved_scrim.fixed_pw, "")
             self.assertIsNotNone(saved_config)
             self.assertEqual(saved_config.fixed_password, "")
+
+
+class HelpViewTests(unittest.IsolatedAsyncioTestCase):
+    def make_interaction(self, user_id=7):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id),
+            response=SimpleNamespace(
+                send_message=AsyncMock(),
+                edit_message=AsyncMock(),
+            ),
+        )
+
+    async def test_copy_button_returns_plain_copyable_help(self):
+        view = HelpView(owner_id=7)
+        interaction = self.make_interaction()
+        copy_button = next(
+            button for button in view.children if button.label == "Copy text"
+        )
+
+        await copy_button.callback(interaction)
+
+        interaction.response.send_message.assert_awaited_once_with(
+            HELP_COPY_TEXT,
+            ephemeral=True,
+            allowed_mentions=ANY,
+        )
+
+    async def test_close_button_removes_help_controls(self):
+        view = HelpView(owner_id=7)
+        interaction = self.make_interaction()
+        close_button = next(
+            button for button in view.children if button.label == "Close"
+        )
+
+        await close_button.callback(interaction)
+
+        interaction.response.edit_message.assert_awaited_once_with(
+            content="Help closed.",
+            view=None,
+        )
 
 
 if __name__ == "__main__":

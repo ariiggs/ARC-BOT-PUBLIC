@@ -133,9 +133,6 @@ class CustomEmojiTests(unittest.TestCase):
                     "pending_role_id",
                     "confirmed_role_id",
                     "cap_channel_id",
-                    "registration_channel_id",
-                    "registration_role_id",
-                    "registration_auto_accept",
                     "logs_channel_id",
                     "history_channel_id",
                     "emoji_available",
@@ -145,7 +142,6 @@ class CustomEmojiTests(unittest.TestCase):
                     "public_message_id",
                     "staff_message_id",
                     "is_open",
-                     "registration_open",
                     "slot_start",
                     "slot_end",
                     "slots",
@@ -156,7 +152,6 @@ class CustomEmojiTests(unittest.TestCase):
                     "pw_type",
                     "fixed_pw",
                     "current_match_counter",
-                    "pending_registrations",
                 },
             )
 
@@ -196,7 +191,7 @@ class CustomEmojiTests(unittest.TestCase):
                     "logs_channel_id",
                 },
             )
-        self.assertEqual(migrated.payload()["version"], 22)
+            self.assertEqual(migrated.payload()["version"], 18)
 
 
 if __name__ == "__main__":
