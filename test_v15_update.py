@@ -69,15 +69,15 @@ class V15UpdateTests(unittest.TestCase):
 
         self.assertEqual(embed.title, "A.R.C. Bot - Command Center")
         field_names = [field.name for field in embed.fields]
-        self.assertIn("🛠️ Staff & Setup", field_names)
-        self.assertIn("🎮 Match Management", field_names)
-        self.assertIn("👤 Players", field_names)
-        players = next(
-            field.value for field in embed.fields if field.name == "👤 Players"
-        )
-        self.assertIn("!register Team Name / Tag [/ @Manager]", players)
-        self.assertTrue(any("!slots" in field.value for field in embed.fields))
-        self.assertTrue(any("!idpwg[1-25]" in field.value for field in embed.fields))
+        self.assertEqual(field_names, ["🛠️ Staff", "🎖️ Captains"])
+        staff = embed.fields[0].value
+        captains = embed.fields[1].value
+        self.assertIn("!add Team / TAG / @Captain", staff)
+        self.assertIn("multiple lines to bulk-add teams", staff)
+        self.assertIn("!say <message>", staff)
+        self.assertIn("!register Team Name / Tag [/ @Manager]", captains)
+        self.assertIn("!cap add", captains)
+        self.assertIn("!slots", captains)
 
     def test_specific_match_commands_are_registered(self):
         self.assertIsNotNone(bot.get_command("idpwg1"))
