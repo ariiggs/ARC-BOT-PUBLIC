@@ -3927,29 +3927,21 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
         )
         return
 
-    message = (
-        f"✅ {discord.utils.escape_markdown(team_name)} registered in "
-        f"Slot {snapshot.number:02d}. Your slot is reserved; use the public "
-        "board to confirm it when prompted."
-        if scrim.registration_auto_accept
-        else (
-            f"✅ {discord.utils.escape_markdown(team_name)} registration "
-            f"received for Slot {snapshot.number:02d}. Staff validation is required."
+    if not access_ok or not board_refreshed:
+        logger.warning(
+            "Registration succeeded with follow-up warnings for scrim %s: "
+            "access_ok=%s board_refreshed=%s",
+            scrim.id,
+            access_ok,
+            board_refreshed,
         )
-    )
-    warnings = []
-    if not access_ok:
-        warnings.append("captain access could not be configured")
-    if not board_refreshed:
-        warnings.append("the slot board could not be refreshed")
-    if warnings:
-        message += " Warning: " + " and ".join(warnings) + "."
-    await send_private_command_feedback(
-        ctx,
-        message,
-        delete_command=False,
-        delete_after=20,
-    )
+    message = getattr(ctx, "message", None)
+    add_reaction = getattr(message, "add_reaction", None)
+    if add_reaction is not None:
+        try:
+            await add_reaction("✅")
+        except discord.HTTPException:
+            logger.exception("Could not acknowledge successful registration.")
 
 
 @bot.command(name="add")
