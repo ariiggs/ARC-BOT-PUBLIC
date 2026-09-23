@@ -271,6 +271,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
         response_mode: str = "deferred",
         notice: str | None = None,
         ephemeral_notice: str | None = None,
+        success_view: discord.ui.View | None = None,
     ) -> None:
         if response_mode == "modal":
             await interaction.response.defer(ephemeral=True)
@@ -425,17 +426,19 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
         )
         if not board_refreshed:
             text += " The saved configuration is active, but the slot boards need a refresh."
-        try:
-            edit_view = ScrimEditView(
-                panel, panel.owner_id, panel.guild_id, scrim_id
-            )
-        except Exception as error:
-            logger.exception(
-                "Scrim saved, but the edit configuration view could not rebuild",
-                exc_info=error,
-            )
-            edit_view = None
-            text += " Reopen `!setup` if the configuration menu does not refresh."
+        edit_view = success_view
+        if edit_view is None:
+            try:
+                edit_view = ScrimEditView(
+                    panel, panel.owner_id, panel.guild_id, scrim_id
+                )
+            except Exception as error:
+                logger.exception(
+                    "Scrim saved, but the edit configuration view could not rebuild",
+                    exc_info=error,
+                )
+                edit_view = None
+                text += " Reopen `!setup` if the configuration menu does not refresh."
         try:
             await interaction.edit_original_response(
                 content=text,
@@ -1065,6 +1068,39 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
         def __init__(self, grid: "ConfigurationGridView"):
             super().__init__(grid.owner_id, grid.guild_id, timeout=300)
             self.grid = grid
+            guild = bot.get_guild(grid.guild_id)
+            roles = []
+            if guild is not None:
+                roles = [
+                    role
+                    for role in guild.roles
+                    if role.is_default() or not role.managed
+                ]
+                roles.sort(
+                    key=lambda role: (not role.is_default(), -role.position)
+                )
+            role_options = [
+                discord.SelectOption(
+                    label="@everyone" if role.is_default() else role.name[:100],
+                    description=(
+                        "Allow all server members"
+                        if role.is_default()
+                        else "Allow members with this role"
+                    ),
+                    value=str(role.id),
+                    default=role.id == grid.registration_role_id,
+                )
+                for role in roles[:25]
+            ]
+            if not role_options:
+                role_options = [
+                    discord.SelectOption(
+                        label="@everyone",
+                        description="Allow all server members",
+                        value=str(grid.guild_id),
+                        default=grid.registration_role_id == grid.guild_id,
+                    )
+                ]
             channel_picker = discord.ui.ChannelSelect(
                 channel_types=[discord.ChannelType.text],
                 placeholder="Select the Registration channel",
@@ -1072,10 +1108,11 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 max_values=1,
                 row=0,
             )
-            role_picker = discord.ui.RoleSelect(
+            role_picker = discord.ui.Select(
                 placeholder="Select the Registration role",
                 min_values=1,
                 max_values=1,
+                options=role_options,
                 row=1,
             )
             mode_picker = discord.ui.Select(
@@ -1109,11 +1146,10 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
             async def role_callback(interaction: discord.Interaction) -> None:
                 if await self.interaction_check(interaction):
-                    role = role_picker.values[0]
                     await self.grid.apply_setting(
                         interaction,
                         "registration_role",
-                        str(role.id),
+                        role_picker.values[0],
                     )
 
             async def mode_callback(interaction: discord.Interaction) -> None:
@@ -1921,6 +1957,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             changes: dict[str, object] | None = None,
             notice: str | None = None,
             ephemeral_notice: str | None = None,
+            success_view: discord.ui.View | None = None,
         ) -> None:
             await interaction.response.defer()
             if changes:
@@ -1932,6 +1969,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     response_mode="deferred",
                     notice=notice,
                     ephemeral_notice=ephemeral_notice,
+                    success_view=success_view,
                 )
             else:
                 await self.panel.refresh_message()
@@ -2155,6 +2193,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     "registration_role",
                     "registration_mode",
                 }:
+                    registration_view = RegistrationSettingsView(self)
                     await self._finish_edit(
                         interaction,
                         changes={
@@ -2162,6 +2201,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                             "registration_role_id": self.registration_role_id,
                             "registration_auto_accept": self.registration_auto_accept,
                         },
+                        success_view=registration_view,
                     )
                 else:
                     field = {
@@ -2175,10 +2215,16 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     )
             else:
                 self.rebuild()
+                next_view = (
+                    RegistrationSettingsView(self)
+                    if setting
+                    in {"registration", "registration_role", "registration_mode"}
+                    else self
+                )
                 await interaction.response.edit_message(
                     content=self.content(),
                     embed=self.embed(),
-                    view=self,
+                    view=next_view,
                 )
 
         async def confirm_and_activate(
