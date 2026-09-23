@@ -1,10 +1,50 @@
 import unittest
+import tempfile
 from types import SimpleNamespace
+from pathlib import Path
 
 from setup_panel import _scrim_configuration_details
+from scrim_state import ScrimRepository
+from slot_storage import SlotStateStore
 
 
 class SetupPanelTests(unittest.TestCase):
+    def test_registration_channel_update_persists_atomic_registration_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScrimRepository(
+                SlotStateStore(Path(directory) / "state.sqlite3")
+            )
+            scrim = repository.create(
+                123,
+                "Friday Scrim",
+                101,
+                102,
+                cap_channel_id=103,
+                logs_channel_id=104,
+                history_channel_id=105,
+                registration_role_id=201,
+                registration_auto_accept=True,
+            )
+
+            repository.update_scrim(
+                scrim.id,
+                123,
+                registration_channel_id=106,
+                registration_role_id=scrim.registration_role_id,
+                registration_auto_accept=scrim.registration_auto_accept,
+            )
+
+            restored_repository = ScrimRepository(
+                SlotStateStore(Path(directory) / "state.sqlite3")
+            )
+            restored_repository.load()
+            restored = restored_repository.get(scrim.id)
+
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.registration_channel_id, 106)
+            self.assertEqual(restored.registration_role_id, 201)
+            self.assertTrue(restored.registration_auto_accept)
+
     def test_configuration_details_reads_idpw_from_supplied_repository(self):
         scrim = SimpleNamespace(
             id="scrim-1",

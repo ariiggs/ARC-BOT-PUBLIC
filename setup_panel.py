@@ -309,28 +309,12 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             "runtime_message": scrim.runtime_message,
             "runtime_staff_message": scrim.runtime_staff_message,
         }
-        values = {
-            "name": scrim.name,
-            "public_channel_id": scrim.public_channel_id,
-            "staff_channel_id": scrim.staff_channel_id,
-            "staff_role_id": scrim.staff_role_id,
-            "pending_role_id": scrim.pending_role_id,
-            "confirmed_role_id": scrim.confirmed_role_id,
-            "cap_channel_id": scrim.cap_channel_id,
-            "logs_channel_id": scrim.logs_channel_id,
-            "history_channel_id": scrim.history_channel_id,
-            "registration_channel_id": getattr(scrim, "registration_channel_id", None),
-            "registration_role_id": getattr(scrim, "registration_role_id", None),
-            "registration_auto_accept": getattr(
-                scrim, "registration_auto_accept", False
-            ),
-            "slot_start": scrim.slot_start,
-            "slot_end": scrim.slot_end,
-            "max_matches": scrim.max_matches,
-            "maps": list(scrim.maps),
-            "match_maps": list(getattr(scrim, "match_maps", scrim.maps)),
-        }
-        values.update(changes)
+        # Persist only the requested fields instead of re-submitting a full
+        # snapshot. This keeps an unrelated legacy value from blocking a
+        # targeted edit. Registration edits intentionally pass all three
+        # registration fields together from ConfigurationGridView so that
+        # their configuration remains atomic.
+        values = dict(changes)
         try:
             updated = repository.update_scrim(
                 scrim_id,

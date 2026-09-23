@@ -184,6 +184,9 @@ class Scrim:
     cap_channel_id: int | None = None
     logs_channel_id: int | None = None
     history_channel_id: int | None = None
+    registration_channel_id: int | None = None
+    registration_role_id: int | None = None
+    registration_auto_accept: bool = False
     emoji_available: str = DEFAULT_EMOJI_AVAILABLE
     emoji_reserved: str = DEFAULT_EMOJI_RESERVED
     emoji_pending: str = DEFAULT_EMOJI_PENDING
@@ -219,6 +222,9 @@ class Scrim:
             "cap_channel_id": self.cap_channel_id,
             "logs_channel_id": self.logs_channel_id,
             "history_channel_id": self.history_channel_id,
+            "registration_channel_id": self.registration_channel_id,
+            "registration_role_id": self.registration_role_id,
+            "registration_auto_accept": self.registration_auto_accept,
             "emoji_available": self.emoji_available,
             "emoji_reserved": self.emoji_reserved,
             "emoji_pending": self.emoji_pending,
@@ -520,7 +526,7 @@ class ScrimRepository:
 
     def payload(self) -> dict:
         return {
-            "version": 18,
+            "version": 19,
             "scrims": [s.payload() for s in self.scrims.values()],
             "server_configs": [
                 config.payload() for config in self.server_configs.values()
@@ -561,7 +567,7 @@ class ScrimRepository:
         try:
             version = payload.get("version")
             if type(version) is not int or version not in (
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
             ):
                 raise ValueError("Unsupported snapshot version.")
             if not isinstance(payload["scrims"], list):
@@ -695,6 +701,10 @@ class ScrimRepository:
                     values.setdefault("current_match_counter", 1)
                 if payload["version"] < 18:
                     values.setdefault("match_maps", list(values.get("maps", [])))
+                if payload["version"] < 19:
+                    values.setdefault("registration_channel_id", None)
+                    values.setdefault("registration_role_id", None)
+                    values.setdefault("registration_auto_accept", False)
                 # Match selectors now support at most 25 games. Keep older
                 # snapshots usable by trimming only the newly unsupported tail.
                 if type(values.get("max_matches")) is int and values["max_matches"] > MAX_MATCHES:
@@ -733,7 +743,9 @@ class ScrimRepository:
                     "staff_channel_id", "staff_role_id", "logs_channel_id",
                     "pending_role_id", "confirmed_role_id",
                     "cap_channel_id",
-                    "history_channel_id", "public_message_id", "staff_message_id",
+                    "history_channel_id", "registration_channel_id",
+                    "registration_role_id", "registration_auto_accept",
+                    "public_message_id", "staff_message_id",
                     "emoji_available", "emoji_reserved", "emoji_pending",
                     "emoji_confirmed", "is_open", "slot_start", "slot_end", "slots",
                     "timezone", "maps", "max_matches", "match_maps", "pw_type", "fixed_pw",
@@ -800,6 +812,15 @@ class ScrimRepository:
                         scrim.history_channel_id is not None
                         and not _positive_id(scrim.history_channel_id)
                     )
+                    or (
+                        scrim.registration_channel_id is not None
+                        and not _positive_id(scrim.registration_channel_id)
+                    )
+                    or (
+                        scrim.registration_role_id is not None
+                        and not _positive_id(scrim.registration_role_id)
+                    )
+                    or type(scrim.registration_auto_accept) is not bool
                     or (scrim.public_message_id is not None and not _positive_id(scrim.public_message_id))
                     or (scrim.staff_message_id is not None and not _positive_id(scrim.staff_message_id))
                     or any(
@@ -837,6 +858,7 @@ class ScrimRepository:
                     scrim.cap_channel_id,
                     scrim.logs_channel_id,
                     scrim.history_channel_id,
+                    scrim.registration_channel_id,
                 )
                 for channel_id in filter(None, configured_channels):
                     channel_key = (scrim.guild_id, channel_id)
@@ -994,7 +1016,7 @@ class ScrimRepository:
             except (KeyError, TypeError, ValueError) as error:
                 raise SlotStorageError("Invalid legacy snapshot; migration was stopped.") from error
             new_payload = {
-                "version": 18,
+                "version": 19,
                 "scrims": [],
                 "server_configs": [],
                 "idpw_configs": [],
@@ -1036,7 +1058,7 @@ class ScrimRepository:
         self.authorized_guild_expires_at = authorized_guild_expires_at
         self.authorized_guild_duration_days = authorized_guild_duration_days
         self.authorized_admin_ids = authorized_admin_ids
-        if payload.get("version", 0) < 18:
+        if payload.get("version", 0) < 19:
             self.store.save(self.payload())
 
     @contextmanager
@@ -1080,6 +1102,9 @@ class ScrimRepository:
                     "confirmed_role_id",
                     "logs_channel_id",
                     "history_channel_id",
+                    "registration_channel_id",
+                    "registration_role_id",
+                    "registration_auto_accept",
                     "emoji_available",
                     "emoji_reserved",
                     "emoji_pending",
@@ -1258,6 +1283,9 @@ class ScrimRepository:
         cap_channel_id: int | None = None,
         logs_channel_id: int | None = None,
         history_channel_id: int | None = None,
+        registration_channel_id: int | None = None,
+        registration_role_id: int | None = None,
+        registration_auto_accept: bool = False,
         is_open: bool = True,
         slot_start: int = DEFAULT_SLOT_START,
         slot_end: int = DEFAULT_SLOT_END,
@@ -1281,9 +1309,13 @@ class ScrimRepository:
                 cap_channel_id,
                 logs_channel_id,
                 history_channel_id,
+                registration_channel_id,
+                registration_role_id,
             )
         ):
             raise ValueError("Configured role and channel IDs must be positive integers.")
+        if type(registration_auto_accept) is not bool:
+            raise ValueError("Registration auto-acceptance must be a boolean.")
         if (
             staff_role_id is not None
             and pending_role_id is not None
@@ -1298,6 +1330,7 @@ class ScrimRepository:
                 cap_channel_id,
                 logs_channel_id,
                 history_channel_id,
+                registration_channel_id,
             )
             if value is not None
         )
@@ -1322,6 +1355,7 @@ class ScrimRepository:
                             s.cap_channel_id,
                             s.logs_channel_id,
                             s.history_channel_id,
+                            s.registration_channel_id,
                         ),
                     )
                 )
@@ -1356,6 +1390,9 @@ class ScrimRepository:
             cap_channel_id=cap_channel_id,
             logs_channel_id=logs_channel_id,
             history_channel_id=history_channel_id,
+            registration_channel_id=registration_channel_id,
+            registration_role_id=registration_role_id,
+            registration_auto_accept=registration_auto_accept,
             is_open=is_open,
             slot_start=slot_start,
             slot_end=slot_end,
@@ -1378,6 +1415,9 @@ class ScrimRepository:
         cap_channel_id: int | None = None,
         logs_channel_id: int | None = None,
         history_channel_id: int | None = None,
+        registration_channel_id: int | None = None,
+        registration_role_id: int | None = None,
+        registration_auto_accept: bool = False,
         is_open: bool = True,
         slot_start: int = DEFAULT_SLOT_START,
         slot_end: int = DEFAULT_SLOT_END,
@@ -1412,6 +1452,9 @@ class ScrimRepository:
             cap_channel_id=cap_channel_id,
             logs_channel_id=logs_channel_id,
             history_channel_id=history_channel_id,
+            registration_channel_id=registration_channel_id,
+            registration_role_id=registration_role_id,
+            registration_auto_accept=registration_auto_accept,
             is_open=is_open,
             slot_start=slot_start,
             slot_end=slot_end,
@@ -1437,6 +1480,9 @@ class ScrimRepository:
         cap_channel_id: int | None | object = _UNSET,
         logs_channel_id: int | None | object = _UNSET,
         history_channel_id: int | None | object = _UNSET,
+        registration_channel_id: int | None | object = _UNSET,
+        registration_role_id: int | None | object = _UNSET,
+        registration_auto_accept: bool | object = _UNSET,
         slot_start: int | object = _UNSET,
         slot_end: int | object = _UNSET,
         max_matches: int | object = _UNSET,
@@ -1487,6 +1533,21 @@ class ScrimRepository:
             if history_channel_id is _UNSET
             else history_channel_id
         )
+        next_registration_channel = (
+            scrim.registration_channel_id
+            if registration_channel_id is _UNSET
+            else registration_channel_id
+        )
+        next_registration_role = (
+            scrim.registration_role_id
+            if registration_role_id is _UNSET
+            else registration_role_id
+        )
+        next_registration_auto_accept = (
+            scrim.registration_auto_accept
+            if registration_auto_accept is _UNSET
+            else registration_auto_accept
+        )
         next_start = scrim.slot_start if slot_start is _UNSET else slot_start
         next_end = scrim.slot_end if slot_end is _UNSET else slot_end
         validate_slot_range(next_start, next_end)
@@ -1512,9 +1573,13 @@ class ScrimRepository:
                 next_cap,
                 next_logs,
                 next_history,
+                next_registration_channel,
+                next_registration_role,
             )
         ):
             raise ValueError("Configured role and channel IDs must be positive integers.")
+        if type(next_registration_auto_accept) is not bool:
+            raise ValueError("Registration auto-acceptance must be a boolean.")
         if (
             next_staff_role is not None
             and next_pending_role is not None
@@ -1541,6 +1606,7 @@ class ScrimRepository:
                 next_cap,
                 next_logs,
                 next_history,
+                next_registration_channel,
             )
             if value is not None
         )
@@ -1562,6 +1628,7 @@ class ScrimRepository:
                             other.cap_channel_id,
                             other.logs_channel_id,
                             other.history_channel_id,
+                            other.registration_channel_id,
                         ),
                     )
                 )
@@ -1580,6 +1647,9 @@ class ScrimRepository:
             scrim.cap_channel_id = next_cap
             scrim.logs_channel_id = next_logs
             scrim.history_channel_id = next_history
+            scrim.registration_channel_id = next_registration_channel
+            scrim.registration_role_id = next_registration_role
+            scrim.registration_auto_accept = next_registration_auto_accept
             if (next_start, next_end) != (scrim.slot_start, scrim.slot_end):
                 occupied_outside = [
                     slot.number
