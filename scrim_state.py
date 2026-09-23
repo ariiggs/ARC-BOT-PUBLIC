@@ -205,6 +205,7 @@ class Scrim:
     public_message_id: int | None = None
     staff_message_id: int | None = None
     is_open: bool = True
+    registration_open: bool = True
     slot_start: int = DEFAULT_SLOT_START
     slot_end: int = DEFAULT_SLOT_END
     slots: dict[int, Slot] = field(default_factory=empty_slots)
@@ -246,6 +247,7 @@ class Scrim:
             "public_message_id": self.public_message_id,
             "staff_message_id": self.staff_message_id,
             "is_open": self.is_open,
+            "registration_open": self.registration_open,
             "slot_start": self.slot_start,
             "slot_end": self.slot_end,
             "slots": [asdict(slot) for slot in self.slots.values()],
@@ -600,7 +602,7 @@ class ScrimRepository:
 
     def payload(self) -> dict:
         return {
-            "version": 21,
+            "version": 22,
             "scrims": [s.payload() for s in self.scrims.values()],
             "server_configs": [
                 config.payload() for config in self.server_configs.values()
@@ -641,7 +643,7 @@ class ScrimRepository:
         try:
             version = payload.get("version")
             if type(version) is not int or version not in (
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
             ):
                 raise ValueError("Unsupported snapshot version.")
             if not isinstance(payload["scrims"], list):
@@ -786,6 +788,8 @@ class ScrimRepository:
                     for request in values.get("pending_registrations", []):
                         if isinstance(request, dict):
                             request.setdefault("registration_message_id", None)
+                if payload["version"] < 22:
+                    values.setdefault("registration_open", True)
                 # Match selectors now support at most 25 games. Keep older
                 # snapshots usable by trimming only the newly unsupported tail.
                 if type(values.get("max_matches")) is int and values["max_matches"] > MAX_MATCHES:
@@ -834,7 +838,8 @@ class ScrimRepository:
                     "registration_role_id", "registration_auto_accept",
                     "public_message_id", "staff_message_id",
                     "emoji_available", "emoji_reserved", "emoji_pending",
-                    "emoji_confirmed", "is_open", "slot_start", "slot_end", "slots",
+                     "emoji_confirmed", "is_open", "registration_open",
+                     "slot_start", "slot_end", "slots",
                     "timezone", "maps", "max_matches", "match_maps", "pw_type", "fixed_pw",
                     "current_match_counter", "pending_registrations",
                 }:
@@ -1103,7 +1108,7 @@ class ScrimRepository:
             except (KeyError, TypeError, ValueError) as error:
                 raise SlotStorageError("Invalid legacy snapshot; migration was stopped.") from error
             new_payload = {
-            "version": 21,
+            "version": 22,
                 "scrims": [],
                 "server_configs": [],
                 "idpw_configs": [],
@@ -1145,7 +1150,7 @@ class ScrimRepository:
         self.authorized_guild_expires_at = authorized_guild_expires_at
         self.authorized_guild_duration_days = authorized_guild_duration_days
         self.authorized_admin_ids = authorized_admin_ids
-        if payload.get("version", 0) < 21:
+        if payload.get("version", 0) < 22:
             self.store.save(self.payload())
 
     @contextmanager

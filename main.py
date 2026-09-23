@@ -573,6 +573,82 @@ def registration_role_allows(ctx: commands.Context, scrim: Scrim) -> bool:
     }
 
 
+async def require_registration_staff_channel(
+    ctx: commands.Context,
+) -> Scrim | None:
+    if ctx.guild is None:
+        await send_private_command_feedback(
+            ctx,
+            "This command can only be used in a Discord server.",
+            silent=True,
+        )
+        return None
+    scrim = resolve_registration_scrim(ctx)
+    if scrim is None:
+        await send_private_command_feedback(
+            ctx,
+            "This command must be used in the configured registration channel.",
+            silent=True,
+        )
+        return None
+    if not member_is_staff(ctx.author, scrim):
+        await send_private_command_feedback(
+            ctx,
+            "You do not have the staff role authorized for this scrim.",
+            silent=True,
+        )
+        return None
+    return scrim
+
+
+async def set_registration_channel_open(
+    ctx: commands.Context, scrim: Scrim, is_open: bool
+) -> bool:
+    role_id = getattr(scrim, "registration_role_id", None)
+    if role_id is None or ctx.guild is None:
+        return False
+    role = (
+        ctx.guild.default_role
+        if role_id == ctx.guild.id
+        else ctx.guild.get_role(role_id)
+    )
+    if role is None:
+        try:
+            role = await ctx.guild.fetch_role(role_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Could not resolve registration role %s for scrim %s.",
+                role_id,
+                scrim.id,
+            )
+            return False
+    channel = await configured_text_channel(scrim, scrim.registration_channel_id)
+    if channel is None:
+        return False
+    try:
+        await channel.set_permissions(
+            role,
+            send_messages=is_open,
+            reason=(
+                "Registration channel opened by staff"
+                if is_open
+                else "Registration channel closed by staff"
+            ),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception(
+            "Could not update registration channel permissions for scrim %s.",
+            scrim.id,
+        )
+        return False
+    async with scrim.state_lock:
+        if not is_active(scrim):
+            return False
+        with repository.transaction():
+            scrim.registration_open = is_open
+    return True
+
+
 async def require_channel_scrim(
     ctx: commands.Context, *, staff_only: bool = False
 ) -> Scrim | None:
@@ -2195,7 +2271,26 @@ async def reset_slots(ctx: commands.Context) -> None:
 @bot.command(name="open")
 @commands.guild_only()
 async def open_scrim(ctx: commands.Context) -> None:
-    """Open manager interactions for the scrim configured in its public channel."""
+    """Open managers or registrations based on the configured command channel."""
+    registration_scrim = resolve_registration_scrim(ctx)
+    if registration_scrim is not None:
+        if await require_registration_staff_channel(ctx) is None:
+            return
+        if not await set_registration_channel_open(ctx, registration_scrim, True):
+            await send_private_command_feedback(
+                ctx,
+                "The registration channel could not be opened. "
+                "Check the configured registration role and channel permissions.",
+                silent=False,
+            )
+            return
+        await delete_command_message(ctx)
+        await send_scrim_log(
+            registration_scrim,
+            "REGISTRATIONS OPENED",
+            "The configured registration role can now send messages.",
+        )
+        return
     scrim = await require_staff_scrim(ctx, public_only=True)
     if scrim is None:
         return
@@ -2215,7 +2310,26 @@ async def open_scrim(ctx: commands.Context) -> None:
 @bot.command(name="close")
 @commands.guild_only()
 async def close_scrim(ctx: commands.Context) -> None:
-    """Close manager interactions for the scrim configured in its public channel."""
+    """Close managers or registrations based on the configured command channel."""
+    registration_scrim = resolve_registration_scrim(ctx)
+    if registration_scrim is not None:
+        if await require_registration_staff_channel(ctx) is None:
+            return
+        if not await set_registration_channel_open(ctx, registration_scrim, False):
+            await send_private_command_feedback(
+                ctx,
+                "The registration channel could not be closed. "
+                "Check the configured registration role and channel permissions.",
+                silent=False,
+            )
+            return
+        await delete_command_message(ctx)
+        await send_scrim_log(
+            registration_scrim,
+            "REGISTRATIONS CLOSED",
+            "The configured registration role can no longer send messages.",
+        )
+        return
     scrim = await require_staff_scrim(ctx, public_only=True)
     if scrim is None:
         return
@@ -4060,10 +4174,11 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
             silent=False,
         )
         return
-    if not scrim.is_open:
+    if not getattr(scrim, "registration_open", True):
         await send_private_command_feedback(
             ctx,
-            "This scrim is currently closed for registrations.",
+            "Registrations are currently closed. Please wait for staff to reopen "
+            "the registration channel.",
             silent=False,
         )
         return
