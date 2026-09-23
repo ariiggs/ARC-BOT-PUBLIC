@@ -2428,8 +2428,8 @@ HELP_CAPTAINS_TEXT = (
 )
 
 
-def build_help_copy_text() -> str:
-    """Return quoted help content staff can copy to another channel."""
+def build_help_text() -> str:
+    """Return the Discord quote-formatted help content."""
     return (
         ">>> **A.R.C. Bot - Command Center**\n\n"
         "**STAFF**\n"
@@ -2443,7 +2443,7 @@ def build_help_copy_text() -> str:
 async def help_command(ctx: commands.Context) -> None:
     await send_private_command_feedback(
         ctx,
-        build_help_copy_text(),
+        build_help_text(),
         delete_after=None,
     )
 
