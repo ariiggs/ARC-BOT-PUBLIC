@@ -7,11 +7,18 @@ from unittest.mock import AsyncMock, patch
 from main import (
     AddDraftEntry,
     AddRegistrationView,
+    SlotReviewView,
     add_team,
     apply_registration_entry,
     build_add_draft,
 )
-from scrim_state import STATUS_RESERVED, Slot
+from scrim_state import (
+    STATUS_AVAILABLE,
+    STATUS_RESERVED,
+    RegistrationRequest,
+    Slot,
+    SlotSnapshot,
+)
 
 
 class AddCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -183,6 +190,66 @@ class AddCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scrim.slots[3].status, STATUS_RESERVED)
         self.assertEqual(snapshot.status, STATUS_RESERVED)
         notify.assert_not_awaited()
+
+    async def test_validation_registration_keeps_slot_available_until_staff_approval(self):
+        scrim = self.make_scrim()
+        scrim.id = "c" * 16
+        scrim.guild_id = 123
+        scrim.registration_auto_accept = False
+        member = SimpleNamespace(id=900, guild=SimpleNamespace())
+        entry = AddDraftEntry("Alpha / ALP", "Alpha", 3, member, "ALP")
+
+        with (
+            patch("main.is_active", return_value=True),
+            patch("main.repository.transaction", return_value=nullcontext()),
+            patch("main.notify_staff_for_registration", new=AsyncMock(return_value=True)) as notify,
+            patch("main.send_scrim_log", new=AsyncMock()),
+        ):
+            snapshot, error, access_ok, board_ok = await apply_registration_entry(
+                scrim, entry
+            )
+
+        self.assertIsNone(error)
+        self.assertTrue(access_ok)
+        self.assertTrue(board_ok)
+        self.assertEqual(scrim.slots[3].status, STATUS_AVAILABLE)
+        self.assertEqual(scrim.slots[3].team_name, "")
+        self.assertEqual(len(scrim.pending_registrations), 1)
+        self.assertEqual(snapshot.status, "En attente")
+        notify.assert_awaited_once()
+
+    async def test_staff_approval_assigns_reserved_registration(self):
+        scrim = self.make_scrim()
+        scrim.id = "d" * 16
+        scrim.guild_id = 123
+        request = RegistrationRequest("e" * 16, 3, "Alpha", "ALP", 900, 0)
+        scrim.pending_registrations = {request.request_id: request}
+        member = SimpleNamespace(id=900, guild=SimpleNamespace())
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(get_member=lambda member_id: member),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            message=SimpleNamespace(delete=AsyncMock()),
+        )
+        view = SlotReviewView(
+            scrim,
+            SlotSnapshot(3, "En attente", "Alpha", "ALP", 900, 0, 900),
+            registration_request=True,
+            registration_request_id=request.request_id,
+        )
+
+        with (
+            patch("main.is_active", return_value=True),
+            patch("main.repository.transaction", return_value=nullcontext()),
+            patch("main.grant_manager_access", new=AsyncMock(return_value=True)),
+            patch("main.refresh_public_slots", new=AsyncMock(return_value=True)),
+            patch("main.send_scrim_log", new=AsyncMock()),
+        ):
+            await view.finish_review(interaction, True)
+
+        self.assertEqual(scrim.slots[3].status, STATUS_RESERVED)
+        self.assertEqual(scrim.slots[3].team_name, "Alpha")
+        self.assertEqual(scrim.pending_registrations, {})
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ from scrim_state import (
     MAX_MATCHES,
     Scrim,
     ScrimRepository,
+    RegistrationRequest,
     Slot,
     SlotSnapshot,
     timezone_for_name,
@@ -131,6 +133,13 @@ def slot_status_label(slot: Slot | SlotSnapshot) -> str:
 
 def slot_is_assignable(slot: Slot | SlotSnapshot) -> bool:
     return slot.status == STATUS_AVAILABLE
+
+
+def registration_slot_is_available(scrim: Scrim, slot: Slot | SlotSnapshot) -> bool:
+    return slot_is_assignable(slot) and not any(
+        request.slot_number == slot.number
+        for request in getattr(scrim, "pending_registrations", {}).values()
+    )
 
 
 def release_slot(slot: Slot) -> SlotSnapshot:
@@ -1333,12 +1342,37 @@ async def remove_public_controls(scrim: Scrim) -> bool:
 
 
 class SlotReviewView(DurableView):
-    def __init__(self, scrim: Scrim, slot: SlotSnapshot) -> None:
+    def __init__(
+        self,
+        scrim: Scrim,
+        slot: SlotSnapshot,
+        *,
+        registration_request: bool = False,
+        registration_request_id: str | None = None,
+    ) -> None:
         super().__init__(timeout=None)
         self.scrim = scrim
         self.slot = slot
-        self.add_item(StaffActionButton(scrim.id, slot.number, slot.assignment_id, True))
-        self.add_item(StaffActionButton(scrim.id, slot.number, slot.assignment_id, False))
+        self.registration_request = registration_request
+        self.registration_request_id = registration_request_id
+        self.add_item(
+            StaffActionButton(
+                scrim.id,
+                slot.number,
+                slot.assignment_id,
+                True,
+                registration_request=registration_request,
+            )
+        )
+        self.add_item(
+            StaffActionButton(
+                scrim.id,
+                slot.number,
+                slot.assignment_id,
+                False,
+                registration_request=registration_request,
+            )
+        )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         member = interaction.user
@@ -1357,10 +1391,40 @@ class SlotReviewView(DurableView):
     async def finish_review(self, interaction: discord.Interaction, confirm: bool) -> None:
         await interaction.response.defer(ephemeral=True)
         result: SlotSnapshot | None = None
+        registration_member_id: int | None = None
         async with self.scrim.state_lock:
             if is_active(self.scrim):
                 current = self.scrim.slots[self.slot.number]
-                if (
+                if self.registration_request:
+                    requests = getattr(self.scrim, "pending_registrations", {})
+                    request = requests.get(self.registration_request_id)
+                    if (
+                        request is not None
+                        and current.assignment_id == request.assignment_id
+                        and current.status == STATUS_AVAILABLE
+                    ):
+                        result = SlotSnapshot(
+                            number=request.slot_number,
+                            status=STATUS_PENDING,
+                            team_name=request.team_name,
+                            tag=request.tag,
+                            manager_id=request.manager_id,
+                            assignment_id=request.assignment_id,
+                            captain_1_id=request.manager_id,
+                        )
+                        with repository.transaction():
+                            requests.pop(request.request_id, None)
+                            if confirm:
+                                current.assignment_id += 1
+                                current.status = STATUS_RESERVED
+                                current.team_name = request.team_name
+                                current.tag = request.tag
+                                current.manager_id = request.manager_id
+                                current.captain_1_id = request.manager_id
+                                current.captain_2_id = None
+                                result = current.snapshot()
+                                registration_member_id = request.manager_id
+                elif (
                     current.assignment_id == self.slot.assignment_id
                     and current.team_name == self.slot.team_name
                     and current.manager_id == self.slot.manager_id
@@ -1385,20 +1449,59 @@ class SlotReviewView(DurableView):
             )
             await delete_staff_review_message(interaction)
         else:
+            access_ok = True
+            if confirm and self.registration_request:
+                guild = getattr(interaction, "guild", None) or bot.get_guild(
+                    self.scrim.guild_id
+                )
+                member = None
+                if guild is not None:
+                    get_member = getattr(guild, "get_member", None)
+                    member = (
+                        get_member(registration_member_id)
+                        if get_member is not None and registration_member_id is not None
+                        else None
+                    )
+                    if member is None:
+                        try:
+                            fetch_member = getattr(guild, "fetch_member", None)
+                            if fetch_member is not None and registration_member_id is not None:
+                                member = await fetch_member(registration_member_id)
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            member = None
+                access_ok = member is not None and await grant_manager_access(
+                    self.scrim, member
+                )
             text = (
-                f"🟢 Team **{result.team_name}** has been confirmed."
+                (
+                    f"✅ Team **{result.team_name}** has been reserved."
+                    if self.registration_request
+                    else f"🟢 Team **{result.team_name}** has been confirmed."
+                )
                 if confirm
                 else f"Team **{result.team_name}** has been released."
             )
-            if confirm and not await confirm_captain_role(
-                self.scrim, result.manager_id
+            if (
+                confirm
+                and not self.registration_request
+                and not await confirm_captain_role(
+                    self.scrim, result.manager_id
+                )
             ):
                 text += " The confirmed captain role could not be updated."
-            if not await refresh_public_slots(self.scrim):
+            if confirm and self.registration_request and not access_ok:
+                text += " Pending Captain access could not be completed."
+            if confirm and not await refresh_public_slots(self.scrim):
                 text += " The public board could not be updated."
             await send_scrim_log(
                 self.scrim,
-                "STAFF VALIDATION" if confirm else "STAFF RELEASE",
+                (
+                    "STAFF REGISTRATION APPROVAL"
+                    if self.registration_request and confirm
+                    else "STAFF VALIDATION"
+                    if confirm
+                    else "STAFF RELEASE"
+                ),
                 f"Slot {result.number:02d} · team **{result.team_name}** · "
                 f"result {slot_status_emoji(self.scrim, result)} "
                 f"{slot_status_label(result)}",
@@ -1441,9 +1544,9 @@ async def notify_staff_for_review(scrim: Scrim, slot: SlotSnapshot) -> bool:
 
 
 async def notify_staff_for_registration(
-    scrim: Scrim, slot: SlotSnapshot | None
+    scrim: Scrim, request: RegistrationRequest | None
 ) -> bool:
-    if slot is None:
+    if request is None:
         return False
     channel = await staff_channel(scrim)
     if channel is None or not is_active(scrim):
@@ -1451,10 +1554,23 @@ async def notify_staff_for_registration(
     try:
         await channel.send(
             f"📝 **Team registration request**\n"
-            f"**{discord.utils.escape_markdown(slot.team_name)}** · "
-            f"Slot {slot.number:02d}\n"
-            f"Captain: <@{slot.manager_id}>",
-            view=SlotReviewView(scrim, slot),
+            f"**{discord.utils.escape_markdown(request.team_name)}** · "
+            f"Slot {request.slot_number:02d}\n"
+            f"Captain: <@{request.manager_id}>",
+            view=SlotReviewView(
+                scrim,
+                SlotSnapshot(
+                    number=request.slot_number,
+                    status=STATUS_PENDING,
+                    team_name=request.team_name,
+                    tag=request.tag,
+                    manager_id=request.manager_id,
+                    assignment_id=request.assignment_id,
+                    captain_1_id=request.manager_id,
+                ),
+                registration_request=True,
+                registration_request_id=request.request_id,
+            ),
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return True
@@ -3653,21 +3769,48 @@ async def apply_registration_entry(
         if not is_active(scrim):
             return None, "The scrim is no longer active.", False, False
         slot = scrim.slots.get(entry.slot_number)
-        if slot is None or not slot_is_assignable(slot):
+        if slot is None or not registration_slot_is_available(scrim, slot):
             return None, "The selected slot is no longer available.", False, False
-        with repository.transaction():
-            slot.assignment_id += 1
-            slot.status = STATUS_RESERVED if auto_accept else STATUS_PENDING
-            slot.team_name = entry.team_name
-            slot.tag = entry.tag
-            slot.manager_id = entry.member.id
-            slot.captain_1_id = entry.member.id
-            slot.captain_2_id = None
-            snapshot = slot.snapshot()
+        if auto_accept:
+            with repository.transaction():
+                slot.assignment_id += 1
+                slot.status = STATUS_RESERVED
+                slot.team_name = entry.team_name
+                slot.tag = entry.tag
+                slot.manager_id = entry.member.id
+                slot.captain_1_id = entry.member.id
+                slot.captain_2_id = None
+                snapshot = slot.snapshot()
+        else:
+            request = RegistrationRequest(
+                request_id=secrets.token_hex(8),
+                slot_number=entry.slot_number,
+                team_name=entry.team_name,
+                tag=entry.tag,
+                manager_id=entry.member.id,
+                assignment_id=slot.assignment_id,
+            )
+            with repository.transaction():
+                pending_registrations = getattr(
+                    scrim, "pending_registrations", None
+                )
+                if pending_registrations is None:
+                    pending_registrations = {}
+                    scrim.pending_registrations = pending_registrations
+                pending_registrations[request.request_id] = request
+            snapshot = SlotSnapshot(
+                number=request.slot_number,
+                status=STATUS_PENDING,
+                team_name=request.team_name,
+                tag=request.tag,
+                manager_id=request.manager_id,
+                assignment_id=request.assignment_id,
+                captain_1_id=request.manager_id,
+            )
 
-    access_ok = await grant_manager_access(scrim, entry.member)
-    board_refreshed = await refresh_public_slots(scrim)
     if auto_accept:
+        access_ok = await grant_manager_access(scrim, entry.member)
+        board_refreshed = await refresh_public_slots(scrim)
         await send_scrim_log(
             scrim,
             "TEAM REGISTERED",
@@ -3675,14 +3818,14 @@ async def apply_registration_entry(
             f"captain <@{entry.member.id}>",
         )
         return snapshot, None, access_ok, board_refreshed
-    notified = await notify_staff_for_registration(scrim, snapshot)
+    notified = await notify_staff_for_registration(scrim, request)
     await send_scrim_log(
         scrim,
         "TEAM REGISTRATION REQUEST",
         f"Slot {entry.slot_number:02d} · team **{entry.team_name}** · "
         f"captain <@{entry.member.id}>",
     )
-    return snapshot, None, access_ok, board_refreshed and notified
+    return snapshot, None, True, notified
 
 
 class AddRegistrationView(DurableView):
@@ -3896,7 +4039,7 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
             (
                 slot.number
                 for slot in scrim.slots.values()
-                if slot_is_assignable(slot)
+                if registration_slot_is_available(scrim, slot)
             ),
             None,
         )
@@ -3938,7 +4081,11 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
     add_reaction = getattr(message, "add_reaction", None)
     if add_reaction is not None:
         try:
-            await add_reaction("✅")
+            await add_reaction(
+                "✅"
+                if getattr(scrim, "registration_auto_accept", False) is True
+                else "🆗"
+            )
         except discord.HTTPException:
             logger.exception("Could not acknowledge successful registration.")
 
@@ -4662,17 +4809,27 @@ async def remove_team(ctx: commands.Context, *, slot_numbers: str) -> None:
 
 class StaffActionButton(
     discord.ui.DynamicItem[discord.ui.Button],
-    template=r"slots:staff:(?P<scrim>[a-f0-9]{16}):(?P<number>[0-9]{1,2}):(?P<assignment>[0-9]+):(?P<action>confirm|release)",
+    template=r"slots:staff:(?P<scrim>[a-f0-9]{16}):(?P<number>[0-9]{1,2}):(?P<assignment>[0-9]+):(?P<action>confirm|release)(?P<registration>:reg)?",
 ):
-    def __init__(self, scrim_id: str, number: int, assignment_id: int, confirm: bool):
+    def __init__(
+        self,
+        scrim_id: str,
+        number: int,
+        assignment_id: int,
+        confirm: bool,
+        *,
+        registration_request: bool = False,
+    ):
         self.scrim_id = scrim_id
         self.number, self.assignment_id, self.confirm = number, assignment_id, confirm
+        self.registration_request = registration_request
+        suffix = ":reg" if registration_request else ""
         super().__init__(discord.ui.Button(
             label="Confirm" if confirm else "Remove",
             style=discord.ButtonStyle.success if confirm else discord.ButtonStyle.danger,
             emoji="✅" if confirm else "❌",
             custom_id=f"slots:staff:{scrim_id}:{number}:{assignment_id}:"
-                      f"{'confirm' if confirm else 'release'}",
+                      f"{'confirm' if confirm else 'release'}{suffix}",
         ))
 
     @classmethod
@@ -4680,6 +4837,7 @@ class StaffActionButton(
         return cls(
             match["scrim"], int(match["number"]), int(match["assignment"]),
             match["action"] == "confirm",
+            registration_request=match["registration"] == ":reg",
         )
 
     async def callback(self, interaction):
@@ -4687,16 +4845,48 @@ class StaffActionButton(
         if scrim is None or self.number not in scrim.slots:
             await interaction.response.send_message("Unknown scrim or slot.", ephemeral=True)
             return
-        snapshot = scrim.slots[self.number].snapshot()
-        view = SlotReviewView(scrim, snapshot)
-        view.slot = SlotSnapshot(
-            number=snapshot.number,
-            status=snapshot.status,
-            team_name=snapshot.team_name,
-            tag=snapshot.tag,
-            manager_id=snapshot.manager_id,
-            assignment_id=self.assignment_id,
-        )
+        if self.registration_request:
+            request = next(
+                (
+                    request
+                    for request in getattr(scrim, "pending_registrations", {}).values()
+                    if request.slot_number == self.number
+                    and request.assignment_id == self.assignment_id
+                ),
+                None,
+            )
+            if request is None:
+                await interaction.response.send_message(
+                    "This registration request is no longer active.",
+                    ephemeral=True,
+                )
+                return
+            snapshot = SlotSnapshot(
+                number=request.slot_number,
+                status=STATUS_PENDING,
+                team_name=request.team_name,
+                tag=request.tag,
+                manager_id=request.manager_id,
+                assignment_id=request.assignment_id,
+                captain_1_id=request.manager_id,
+            )
+            view = SlotReviewView(
+                scrim,
+                snapshot,
+                registration_request=True,
+                registration_request_id=request.request_id,
+            )
+        else:
+            snapshot = scrim.slots[self.number].snapshot()
+            view = SlotReviewView(scrim, snapshot)
+            view.slot = SlotSnapshot(
+                number=snapshot.number,
+                status=snapshot.status,
+                team_name=snapshot.team_name,
+                tag=snapshot.tag,
+                manager_id=snapshot.manager_id,
+                assignment_id=self.assignment_id,
+            )
         try:
             if await view.interaction_check(interaction):
                 await view.finish_review(interaction, self.confirm)

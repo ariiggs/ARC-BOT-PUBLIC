@@ -117,6 +117,16 @@ class SlotSnapshot:
     captain_2_id: int | None = None
 
 
+@dataclass(frozen=True)
+class RegistrationRequest:
+    request_id: str
+    slot_number: int
+    team_name: str
+    tag: str
+    manager_id: int
+    assignment_id: int
+
+
 @dataclass
 class Slot:
     number: int
@@ -204,6 +214,9 @@ class Scrim:
     pw_type: str = "fixed"
     fixed_pw: str = ""
     current_match_counter: int = 1
+    pending_registrations: dict[str, RegistrationRequest] = field(
+        default_factory=dict
+    )
     # These references are process-local; only durable values are serialized.
     runtime_message: object | None = field(default=None, repr=False)
     runtime_staff_message: object | None = field(default=None, repr=False)
@@ -242,6 +255,9 @@ class Scrim:
             "pw_type": self.pw_type,
             "fixed_pw": self.fixed_pw,
             "current_match_counter": self.current_match_counter,
+            "pending_registrations": [
+                asdict(request) for request in self.pending_registrations.values()
+            ],
         }
 
 
@@ -388,6 +404,58 @@ def _read_slots(
     return {slot.number: slot for slot in result}
 
 
+def _read_registration_requests(
+    entries,
+    slots: dict[int, Slot],
+    slot_start: int,
+    slot_end: int,
+) -> dict[str, RegistrationRequest]:
+    if not isinstance(entries, list):
+        raise ValueError("Invalid registration request list.")
+    result: dict[str, RegistrationRequest] = {}
+    requested_slots: set[int] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {
+            "request_id",
+            "slot_number",
+            "team_name",
+            "tag",
+            "manager_id",
+            "assignment_id",
+        }:
+            raise ValueError("Invalid registration request fields.")
+        request = RegistrationRequest(**entry)
+        if (
+            not isinstance(request.request_id, str)
+            or not re.fullmatch(r"[a-f0-9]{16}", request.request_id)
+            or request.request_id in result
+            or type(request.slot_number) is not int
+            or not slot_start <= request.slot_number <= slot_end
+            or request.slot_number in requested_slots
+            or not isinstance(request.team_name, str)
+            or not request.team_name.strip()
+            or len(request.team_name) > 100
+            or any(character in request.team_name for character in ("\r", "\n"))
+            or not isinstance(request.tag, str)
+            or not request.tag.strip()
+            or len(request.tag) > 32
+            or any(character in request.tag for character in ("\r", "\n"))
+            or not _positive_id(request.manager_id)
+            or type(request.assignment_id) is not int
+            or request.assignment_id < 0
+        ):
+            raise ValueError("Invalid registration request.")
+        slot = slots[request.slot_number]
+        if (
+            slot.status != STATUS_AVAILABLE
+            or slot.assignment_id != request.assignment_id
+        ):
+            raise ValueError("Registration request does not match its slot.")
+        requested_slots.add(request.slot_number)
+        result[request.request_id] = request
+    return result
+
+
 def _legacy_payload(payload) -> dict:
     if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
         raise ValueError("Invalid legacy snapshot.")
@@ -526,7 +594,7 @@ class ScrimRepository:
 
     def payload(self) -> dict:
         return {
-            "version": 19,
+            "version": 20,
             "scrims": [s.payload() for s in self.scrims.values()],
             "server_configs": [
                 config.payload() for config in self.server_configs.values()
@@ -567,7 +635,7 @@ class ScrimRepository:
         try:
             version = payload.get("version")
             if type(version) is not int or version not in (
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
             ):
                 raise ValueError("Unsupported snapshot version.")
             if not isinstance(payload["scrims"], list):
@@ -706,6 +774,8 @@ class ScrimRepository:
                     values.setdefault("registration_role_id", None)
                     if type(values.get("registration_auto_accept")) is not bool:
                         values["registration_auto_accept"] = False
+                if payload["version"] < 20:
+                    values.setdefault("pending_registrations", [])
                 # Match selectors now support at most 25 games. Keep older
                 # snapshots usable by trimming only the newly unsupported tail.
                 if type(values.get("max_matches")) is int and values["max_matches"] > MAX_MATCHES:
@@ -738,6 +808,12 @@ class ScrimRepository:
                     values["slot_start"],
                     values["slot_end"],
                 )
+                values["pending_registrations"] = _read_registration_requests(
+                    values["pending_registrations"],
+                    values["slots"],
+                    values["slot_start"],
+                    values["slot_end"],
+                )
                 # Runtime-only fields must never be read from disk.
                 if set(values) != {
                     "id", "guild_id", "name", "public_channel_id",
@@ -750,7 +826,7 @@ class ScrimRepository:
                     "emoji_available", "emoji_reserved", "emoji_pending",
                     "emoji_confirmed", "is_open", "slot_start", "slot_end", "slots",
                     "timezone", "maps", "max_matches", "match_maps", "pw_type", "fixed_pw",
-                    "current_match_counter",
+                    "current_match_counter", "pending_registrations",
                 }:
                     raise ValueError("Invalid scrim fields.")
                 scrim = Scrim(**values)
@@ -1017,7 +1093,7 @@ class ScrimRepository:
             except (KeyError, TypeError, ValueError) as error:
                 raise SlotStorageError("Invalid legacy snapshot; migration was stopped.") from error
             new_payload = {
-                "version": 19,
+            "version": 20,
                 "scrims": [],
                 "server_configs": [],
                 "idpw_configs": [],
@@ -1059,7 +1135,7 @@ class ScrimRepository:
         self.authorized_guild_expires_at = authorized_guild_expires_at
         self.authorized_guild_duration_days = authorized_guild_duration_days
         self.authorized_admin_ids = authorized_admin_ids
-        if payload.get("version", 0) < 19:
+        if payload.get("version", 0) < 20:
             self.store.save(self.payload())
 
     @contextmanager
@@ -1115,6 +1191,7 @@ class ScrimRepository:
                     "is_open",
                     "slot_start",
                     "slot_end",
+                    "pending_registrations",
                 ):
                     setattr(target, name, getattr(saved, name))
                 target.slots = {
@@ -1123,6 +1200,7 @@ class ScrimRepository:
                 }
                 for number, slot in saved.slots.items():
                     target.slots[number].__dict__.update(vars(slot))
+                target.pending_registrations = saved.pending_registrations.copy()
                 target.deleted = False
             self.scrims = objects
             self.legacy = legacy

@@ -62,7 +62,7 @@ class V15UpdateTests(unittest.TestCase):
             self.assertEqual(restored.pw_type, "fixed")
             self.assertEqual(restored.fixed_pw, "")
             self.assertEqual(restored.current_match_counter, 1)
-            self.assertEqual(migrated.payload()["version"], 19)
+        self.assertEqual(migrated.payload()["version"], 20)
 
     def test_help_text_contains_both_categories_and_fits_discord_message_limit(self):
         help_text = build_help_text()
