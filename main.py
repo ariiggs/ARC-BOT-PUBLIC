@@ -2428,39 +2428,14 @@ HELP_CAPTAINS_TEXT = (
 )
 
 
-def build_help_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="A.R.C. Bot - Command Center",
-        description=(
-            "Manage scrims, match access, registrations, and captain approvals "
-            "from Discord."
-        ),
-        color=discord.Color.blurple(),
-    )
-    embed.add_field(
-        name="🛠️ Staff",
-        value=HELP_STAFF_TEXT,
-        inline=False,
-    )
-    embed.add_field(
-        name="🎖️ Captains",
-        value=HELP_CAPTAINS_TEXT,
-        inline=False,
-    )
-    embed.set_footer(text="Use !help <command> for Discord's command-specific details.")
-    return embed
-
-
 def build_help_copy_text() -> str:
-    """Return the plain-text help content staff can copy to another channel."""
+    """Return quoted help content staff can copy to another channel."""
     return (
-        "```text\n"
-        "A.R.C. Bot - Command Center\n\n"
-        "STAFF\n"
+        ">>> **A.R.C. Bot - Command Center**\n\n"
+        "**STAFF**\n"
         f"{HELP_STAFF_TEXT}\n\n"
-        "CAPTAINS\n"
+        "**CAPTAINS**\n"
         f"{HELP_CAPTAINS_TEXT}\n"
-        "```"
     )
 
 
@@ -2470,7 +2445,6 @@ async def help_command(ctx: commands.Context) -> None:
         ctx,
         build_help_copy_text(),
         delete_after=None,
-        embed=build_help_embed(),
     )
 
 
