@@ -2409,22 +2409,19 @@ def build_help_embed() -> discord.Embed:
         color=discord.Color.blurple(),
     )
     embed.add_field(
-        name="🛠️ Staff & Setup",
+        name="🛠️ Staff",
         value=(
             "`!setup` — initialize scrims and configure roles, channels, maps, and ID/PW.\n"
             "`!set <@Role>` — define the global Staff role for admin commands.\n"
             "`!say <message>` — publish an announcement as the bot for Staff.\n"
             "`!export` — generate a complete registration list usable anywhere.\n"
-            "`!add Team / TAG / @Captain` — staff-only team registration.\n"
-            "`!reset` — archive the last slot state in History, then clear registrations."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="🎮 Match Management",
-        value=(
-            "`!slots [Scrim Name]` — display real-time registration status; one scrim "
-            "is selected automatically and multiple scrims use a dropdown.\n"
+            "`!add Team / TAG / @Captain` — staff-only team registration. "
+            "Send multiple lines to bulk-add teams, one team per line; "
+            "a preview is shown before applying the batch.\n"
+            "`!reset` — archive the last slot state in History, then clear registrations.\n"
+            "`!confirm <slot> [slot ...]` — confirm one or more pending slots.\n"
+            "`!remove <slot> [slot ...]` — release one or more registered slots.\n"
+            "`!open` / `!close` — enable or disable manager board actions.\n"
             "`!update [Scrim Name]` — publish or refresh the selected slot board.\n"
             "`!idpw <room_id> / <minutes>` — send room details and schedule alerts.\n"
             "`!idpwg[1-25] <room_id> / <minutes>` — fixed-password match access.\n"
@@ -2433,22 +2430,15 @@ def build_help_embed() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name="👤 Players",
+        name="🎖️ Captains",
         value=(
-            "`!register Team Name / Tag [/ @Manager]` — public registration; "
-            "the manager mention is optional.\n"
+            "`!register Team Name / Tag [/ @Manager]` — register a team in the "
+            "configured public registration channel; the manager mention is optional.\n"
+            "`!slots [Scrim Name]` — display real-time registration status; one scrim "
+            "is selected automatically and multiple scrims use a dropdown.\n"
             "`!remind` — remind reserved managers to confirm or cancel.\n"
             "`✅ Confirm` / `❌ Cancel` — manager actions on the public board.\n"
             "`!cap add`, `!cap transfer`, `!cap remove` — manage team captains."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="✅ Staff Decisions",
-        value=(
-            "`!confirm <slot> [slot ...]` — confirm one or more pending slots.\n"
-            "`!remove <slot> [slot ...]` — release one or more registered slots.\n"
-            "`!open` / `!close` — enable or disable manager board actions."
         ),
         inline=False,
     )
