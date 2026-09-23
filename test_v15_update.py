@@ -75,9 +75,13 @@ class V15UpdateTests(unittest.TestCase):
         self.assertIn("!add Team / TAG / @Captain", staff)
         self.assertIn("multiple lines to bulk-add teams", staff)
         self.assertIn("!say <message>", staff)
+        self.assertIn("!slots", staff)
+        self.assertIn("!remind", staff)
         self.assertIn("!register Team Name / Tag [/ @Manager]", captains)
         self.assertIn("!cap add", captains)
-        self.assertIn("!slots", captains)
+        self.assertIn("Confirm", captains)
+        self.assertNotIn("`!slots", captains)
+        self.assertNotIn("`!remind", captains)
 
     def test_help_copy_text_contains_both_categories_and_fits_discord_message_limit(self):
         copy_text = build_help_copy_text()
