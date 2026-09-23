@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from main import bot, build_help_copy_text, build_help_embed
+from main import bot, build_help_copy_text
 from scrim_state import DEFAULT_MATCH_MAPS, ScrimRepository
 from slot_storage import SlotStateStore
 
@@ -64,37 +64,16 @@ class V15UpdateTests(unittest.TestCase):
             self.assertEqual(restored.current_match_counter, 1)
             self.assertEqual(migrated.payload()["version"], 19)
 
-    def test_help_embed_has_requested_categories_and_commands(self):
-        embed = build_help_embed()
-
-        self.assertEqual(embed.title, "A.R.C. Bot - Command Center")
-        field_names = [field.name for field in embed.fields]
-        self.assertEqual(field_names, ["🛠️ Staff", "🎖️ Captains"])
-        staff = embed.fields[0].value
-        captains = embed.fields[1].value
-        self.assertIn("!add Team / TAG / @Captain", staff)
-        self.assertIn("multiple lines for bulk teams", staff)
-        self.assertIn("!say <message>", staff)
-        self.assertIn("!slots", staff)
-        self.assertIn("!remind", staff)
-        self.assertLessEqual(len(staff), 1024)
-        self.assertLessEqual(len(captains), 1024)
-        self.assertIn("!register Team Name / Tag [/ @Manager]", captains)
-        self.assertIn("only members with the configured registration role", captains)
-        self.assertNotIn("captains and members", captains)
-        self.assertIn("!cap add", captains)
-        self.assertIn("Confirm", captains)
-        self.assertNotIn("`!slots", captains)
-        self.assertNotIn("`!remind", captains)
-
-    def test_help_copy_text_contains_both_categories_and_fits_discord_message_limit(self):
+    def test_help_text_contains_both_categories_and_fits_discord_message_limit(self):
         copy_text = build_help_copy_text()
 
+        self.assertTrue(copy_text.startswith(">>> "))
         self.assertIn("STAFF", copy_text)
         self.assertIn("CAPTAINS", copy_text)
         self.assertIn("multiple lines for bulk teams", copy_text)
         self.assertIn("!register Team Name / Tag [/ @Manager]", copy_text)
         self.assertIn("only members with the configured registration role", copy_text)
+        self.assertNotIn("```", copy_text)
         self.assertLessEqual(len(copy_text), 2000)
 
     def test_specific_match_commands_are_registered(self):
