@@ -2399,6 +2399,35 @@ def _register_specific_idpw_commands() -> None:
 _register_specific_idpw_commands()
 
 
+HELP_STAFF_TEXT = (
+    "`!setup` — initialize scrims and configure roles, channels, maps, and ID/PW.\n"
+    "`!set <@Role>` — define the global Staff role for admin commands.\n"
+    "`!say <message>` — publish an announcement as the bot for Staff.\n"
+    "`!export` — generate a complete registration list usable anywhere.\n"
+    "`!add Team / TAG / @Captain` — staff-only team registration. "
+    "Send multiple lines to bulk-add teams, one team per line; "
+    "a preview is shown before applying the batch.\n"
+    "`!reset` — archive the last slot state in History, then clear registrations.\n"
+    "`!confirm <slot> [slot ...]` — confirm one or more pending slots.\n"
+    "`!remove <slot> [slot ...]` — release one or more registered slots.\n"
+    "`!open` / `!close` — enable or disable manager board actions.\n"
+    "`!update [Scrim Name]` — publish or refresh the selected slot board.\n"
+    "`!idpw <room_id> / <minutes>` — send room details and schedule alerts.\n"
+    "`!idpwg[1-25] <room_id> / <minutes>` — fixed-password match access.\n"
+    "`!idpwg[1-25] <room_id> / <password> / <minutes>` — dynamic-password access."
+)
+
+HELP_CAPTAINS_TEXT = (
+    "`!register Team Name / Tag [/ @Manager]` — register a team in the "
+    "configured public registration channel; the manager mention is optional.\n"
+    "`!slots [Scrim Name]` — display real-time registration status; one scrim "
+    "is selected automatically and multiple scrims use a dropdown.\n"
+    "`!remind` — remind reserved managers to confirm or cancel.\n"
+    "`✅ Confirm` / `❌ Cancel` — manager actions on the public board.\n"
+    "`!cap add`, `!cap transfer`, `!cap remove` — manage team captains."
+)
+
+
 def build_help_embed() -> discord.Embed:
     embed = discord.Embed(
         title="A.R.C. Bot - Command Center",
@@ -2410,47 +2439,37 @@ def build_help_embed() -> discord.Embed:
     )
     embed.add_field(
         name="🛠️ Staff",
-        value=(
-            "`!setup` — initialize scrims and configure roles, channels, maps, and ID/PW.\n"
-            "`!set <@Role>` — define the global Staff role for admin commands.\n"
-            "`!say <message>` — publish an announcement as the bot for Staff.\n"
-            "`!export` — generate a complete registration list usable anywhere.\n"
-            "`!add Team / TAG / @Captain` — staff-only team registration. "
-            "Send multiple lines to bulk-add teams, one team per line; "
-            "a preview is shown before applying the batch.\n"
-            "`!reset` — archive the last slot state in History, then clear registrations.\n"
-            "`!confirm <slot> [slot ...]` — confirm one or more pending slots.\n"
-            "`!remove <slot> [slot ...]` — release one or more registered slots.\n"
-            "`!open` / `!close` — enable or disable manager board actions.\n"
-            "`!update [Scrim Name]` — publish or refresh the selected slot board.\n"
-            "`!idpw <room_id> / <minutes>` — send room details and schedule alerts.\n"
-            "`!idpwg[1-25] <room_id> / <minutes>` — fixed-password match access.\n"
-            "`!idpwg[1-25] <room_id> / <password> / <minutes>` — dynamic-password access."
-        ),
+        value=HELP_STAFF_TEXT,
         inline=False,
     )
     embed.add_field(
         name="🎖️ Captains",
-        value=(
-            "`!register Team Name / Tag [/ @Manager]` — register a team in the "
-            "configured public registration channel; the manager mention is optional.\n"
-            "`!slots [Scrim Name]` — display real-time registration status; one scrim "
-            "is selected automatically and multiple scrims use a dropdown.\n"
-            "`!remind` — remind reserved managers to confirm or cancel.\n"
-            "`✅ Confirm` / `❌ Cancel` — manager actions on the public board.\n"
-            "`!cap add`, `!cap transfer`, `!cap remove` — manage team captains."
-        ),
+        value=HELP_CAPTAINS_TEXT,
         inline=False,
     )
     embed.set_footer(text="Use !help <command> for Discord's command-specific details.")
     return embed
 
 
+def build_help_copy_text() -> str:
+    """Return the plain-text help content staff can copy to another channel."""
+    return (
+        "```text\n"
+        "A.R.C. Bot - Command Center\n\n"
+        "STAFF\n"
+        f"{HELP_STAFF_TEXT}\n\n"
+        "CAPTAINS\n"
+        f"{HELP_CAPTAINS_TEXT}\n"
+        "```"
+    )
+
+
 @bot.command(name="help")
 async def help_command(ctx: commands.Context) -> None:
     await send_private_command_feedback(
         ctx,
-        "",
+        build_help_copy_text(),
+        delete_after=None,
         embed=build_help_embed(),
     )
 
