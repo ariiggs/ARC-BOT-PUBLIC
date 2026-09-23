@@ -73,10 +73,12 @@ class V15UpdateTests(unittest.TestCase):
         staff = embed.fields[0].value
         captains = embed.fields[1].value
         self.assertIn("!add Team / TAG / @Captain", staff)
-        self.assertIn("multiple lines to bulk-add teams", staff)
+        self.assertIn("multiple lines for bulk teams", staff)
         self.assertIn("!say <message>", staff)
         self.assertIn("!slots", staff)
         self.assertIn("!remind", staff)
+        self.assertLessEqual(len(staff), 1024)
+        self.assertLessEqual(len(captains), 1024)
         self.assertIn("!register Team Name / Tag [/ @Manager]", captains)
         self.assertIn("only members with the configured registration role", captains)
         self.assertNotIn("captains and members", captains)
@@ -90,7 +92,7 @@ class V15UpdateTests(unittest.TestCase):
 
         self.assertIn("STAFF", copy_text)
         self.assertIn("CAPTAINS", copy_text)
-        self.assertIn("multiple lines to bulk-add teams", copy_text)
+        self.assertIn("multiple lines for bulk teams", copy_text)
         self.assertIn("!register Team Name / Tag [/ @Manager]", copy_text)
         self.assertIn("only members with the configured registration role", copy_text)
         self.assertLessEqual(len(copy_text), 2000)
