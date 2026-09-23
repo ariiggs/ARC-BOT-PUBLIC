@@ -2907,8 +2907,10 @@ def build_slot_status_embed(scrim: Scrim) -> discord.Embed:
             f"{counts[STATUS_AVAILABLE]}\n"
             f"{scrim.emoji_reserved} **Reserved:** "
             f"{counts[STATUS_RESERVED]}\n"
+            f"{scrim.emoji_pending} **Pending:** "
+            f"{counts[STATUS_PENDING]}\n"
             f"{scrim.emoji_confirmed} **Confirmed:** "
-            f"{counts[STATUS_CONFIRMED] + counts[STATUS_PENDING]}"
+            f"{counts[STATUS_CONFIRMED]}"
         ),
         color=discord.Color.blurple(),
     )
@@ -3646,6 +3648,7 @@ async def apply_registration_entry(
     entry: AddDraftEntry,
 ) -> tuple[SlotSnapshot | None, str | None, bool, bool]:
     snapshot: SlotSnapshot | None = None
+    auto_accept = getattr(scrim, "registration_auto_accept", False) is True
     async with scrim.state_lock:
         if not is_active(scrim):
             return None, "The scrim is no longer active.", False, False
@@ -3654,11 +3657,7 @@ async def apply_registration_entry(
             return None, "The selected slot is no longer available.", False, False
         with repository.transaction():
             slot.assignment_id += 1
-            slot.status = (
-                STATUS_RESERVED
-                if getattr(scrim, "registration_auto_accept", False)
-                else STATUS_PENDING
-            )
+            slot.status = STATUS_RESERVED if auto_accept else STATUS_PENDING
             slot.team_name = entry.team_name
             slot.tag = entry.tag
             slot.manager_id = entry.member.id
@@ -3668,7 +3667,7 @@ async def apply_registration_entry(
 
     access_ok = await grant_manager_access(scrim, entry.member)
     board_refreshed = await refresh_public_slots(scrim)
-    if getattr(scrim, "registration_auto_accept", False):
+    if auto_accept:
         await send_scrim_log(
             scrim,
             "TEAM REGISTERED",

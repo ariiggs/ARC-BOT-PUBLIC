@@ -4,7 +4,13 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from main import AddDraftEntry, AddRegistrationView, add_team, build_add_draft
+from main import (
+    AddDraftEntry,
+    AddRegistrationView,
+    add_team,
+    apply_registration_entry,
+    build_add_draft,
+)
 from scrim_state import STATUS_RESERVED, Slot
 
 
@@ -150,6 +156,33 @@ class AddCommandTests(unittest.IsolatedAsyncioTestCase):
         ctx.send.assert_awaited_once()
         self.assertIs(view.message, ctx.send.return_value)
         delete.assert_awaited_once_with(ctx)
+
+    async def test_auto_accept_registration_creates_reserved_slot(self):
+        scrim = self.make_scrim()
+        scrim.id = "b" * 16
+        scrim.guild_id = 123
+        scrim.registration_auto_accept = True
+        member = SimpleNamespace(id=900, guild=SimpleNamespace())
+        entry = AddDraftEntry("Alpha / ALP", "Alpha", 3, member, "ALP")
+
+        with (
+            patch("main.is_active", return_value=True),
+            patch("main.repository.transaction", return_value=nullcontext()),
+            patch("main.grant_manager_access", new=AsyncMock(return_value=True)),
+            patch("main.send_scrim_log", new=AsyncMock()),
+            patch("main.refresh_public_slots", new=AsyncMock(return_value=True)),
+            patch("main.notify_staff_for_registration", new=AsyncMock()) as notify,
+        ):
+            snapshot, error, access_ok, board_ok = await apply_registration_entry(
+                scrim, entry
+            )
+
+        self.assertIsNone(error)
+        self.assertTrue(access_ok)
+        self.assertTrue(board_ok)
+        self.assertEqual(scrim.slots[3].status, STATUS_RESERVED)
+        self.assertEqual(snapshot.status, STATUS_RESERVED)
+        notify.assert_not_awaited()
 
 
 if __name__ == "__main__":
