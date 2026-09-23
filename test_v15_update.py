@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from main import bot, build_help_copy_text
+from main import bot, build_help_text
 from scrim_state import DEFAULT_MATCH_MAPS, ScrimRepository
 from slot_storage import SlotStateStore
 
@@ -65,16 +65,16 @@ class V15UpdateTests(unittest.TestCase):
             self.assertEqual(migrated.payload()["version"], 19)
 
     def test_help_text_contains_both_categories_and_fits_discord_message_limit(self):
-        copy_text = build_help_copy_text()
+        help_text = build_help_text()
 
-        self.assertTrue(copy_text.startswith(">>> "))
-        self.assertIn("STAFF", copy_text)
-        self.assertIn("CAPTAINS", copy_text)
-        self.assertIn("multiple lines for bulk teams", copy_text)
-        self.assertIn("!register Team Name / Tag [/ @Manager]", copy_text)
-        self.assertIn("only members with the configured registration role", copy_text)
-        self.assertNotIn("```", copy_text)
-        self.assertLessEqual(len(copy_text), 2000)
+        self.assertTrue(help_text.startswith(">>> "))
+        self.assertIn("STAFF", help_text)
+        self.assertIn("CAPTAINS", help_text)
+        self.assertIn("multiple lines for bulk teams", help_text)
+        self.assertIn("!register Team Name / Tag [/ @Manager]", help_text)
+        self.assertIn("only members with the configured registration role", help_text)
+        self.assertNotIn("```", help_text)
+        self.assertLessEqual(len(help_text), 2000)
 
     def test_specific_match_commands_are_registered(self):
         self.assertIsNotNone(bot.get_command("idpwg1"))
