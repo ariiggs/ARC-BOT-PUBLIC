@@ -338,20 +338,27 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 **values,
             )
         except (SlotStorageError, ValueError) as error:
-            text = (
-                "The change could not be saved. "
-                f"{error}"
-            )
-            if response_mode == "modal":
+            text = f"The change could not be saved. {error}"
+            try:
                 await interaction.edit_original_response(
                     content=text,
-                    view=ScrimEditView(panel, panel.owner_id, panel.guild_id, scrim_id),
+                    view=None,
                 )
-            else:
+            except discord.HTTPException:
+                logger.exception("Could not report a scrim save validation error")
+            return
+        except Exception as error:
+            logger.exception("Could not save scrim configuration", exc_info=error)
+            try:
                 await interaction.edit_original_response(
-                    content=text,
-                    view=ScrimEditView(panel, panel.owner_id, panel.guild_id, scrim_id),
+                    content=(
+                        "The change could not be saved. "
+                        "Please try again."
+                    ),
+                    view=None,
                 )
+            except discord.HTTPException:
+                logger.exception("Could not report a scrim save error")
             return
 
         public_changed = old["public_channel_id"] != updated.public_channel_id
@@ -394,7 +401,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 logger.exception("Could not refresh the edited scrim", exc_info=error)
                 board_refreshed = False
 
-        await panel.refresh_message()
+        try:
+            await panel.refresh_message()
+        except Exception as error:
+            logger.exception(
+                "Scrim saved, but the setup dashboard could not refresh",
+                exc_info=error,
+            )
+            board_refreshed = False
+
         def format_value(field: str, value: object) -> str:
             if field.endswith("channel_id"):
                 return f"<#{value}>"
@@ -403,11 +418,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             return _safe_name(str(value))
 
         changed_fields = ", ".join(changes)
-        details = "Changed: " + ", ".join(
-            f"{field}: {format_value(field, old[field])} → "
-            f"{format_value(field, changes[field])}"
-            for field in changes
-        ) + "."
+        try:
+            details = "Changed: " + ", ".join(
+                f"{field}: {format_value(field, old[field])} → "
+                f"{format_value(field, changes[field])}"
+                for field in changes
+            ) + "."
+        except Exception as error:
+            logger.exception("Could not format the scrim change audit details", exc_info=error)
+            details = f"Changed: {changed_fields}."
         if not board_refreshed:
             details += " The slot boards could not be refreshed."
         if log_action is not None:
@@ -422,19 +441,28 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
         )
         if not board_refreshed:
             text += " The saved configuration is active, but the slot boards need a refresh."
-        edit_view = ScrimEditView(
-            panel, panel.owner_id, panel.guild_id, scrim_id
-        )
-        if response_mode == "modal":
+        try:
+            edit_view = ScrimEditView(
+                panel, panel.owner_id, panel.guild_id, scrim_id
+            )
+        except Exception as error:
+            logger.exception(
+                "Scrim saved, but the edit configuration view could not rebuild",
+                exc_info=error,
+            )
+            edit_view = None
+            text += " Reopen `!setup` if the configuration menu does not refresh."
+        try:
             await interaction.edit_original_response(
                 content=text,
                 view=edit_view,
             )
-        else:
-            await interaction.edit_original_response(
-                content=text,
-                view=edit_view,
-            )
+        except discord.HTTPException:
+            logger.exception("Could not report the saved scrim configuration")
+            try:
+                await interaction.followup.send(text, ephemeral=True)
+            except discord.HTTPException:
+                logger.exception("Could not send the saved scrim configuration follow-up")
         if ephemeral_notice:
             await interaction.followup.send(ephemeral_notice, ephemeral=True)
 
