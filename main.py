@@ -2422,8 +2422,8 @@ HELP_STAFF_TEXT = (
 
 HELP_CAPTAINS_TEXT = (
     "`!register Team Name / Tag [/ @Manager]` — register a team in the "
-    "configured public registration channel; captains and members with the "
-    "configured registration role may use it, and the manager mention is optional.\n"
+    "configured public registration channel; only members with the configured "
+    "registration role may use it, and the manager mention is optional.\n"
     "`!cap add`, `!cap transfer`, `!cap remove` — manage captains for your assigned team.\n"
     "`✅ Confirm` / `❌ Cancel` — clickable slot actions for the assigned captain."
 )
