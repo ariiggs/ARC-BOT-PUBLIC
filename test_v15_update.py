@@ -78,6 +78,8 @@ class V15UpdateTests(unittest.TestCase):
         self.assertIn("!slots", staff)
         self.assertIn("!remind", staff)
         self.assertIn("!register Team Name / Tag [/ @Manager]", captains)
+        self.assertIn("only members with the configured registration role", captains)
+        self.assertNotIn("captains and members", captains)
         self.assertIn("!cap add", captains)
         self.assertIn("Confirm", captains)
         self.assertNotIn("`!slots", captains)
@@ -90,6 +92,7 @@ class V15UpdateTests(unittest.TestCase):
         self.assertIn("CAPTAINS", copy_text)
         self.assertIn("multiple lines to bulk-add teams", copy_text)
         self.assertIn("!register Team Name / Tag [/ @Manager]", copy_text)
+        self.assertIn("only members with the configured registration role", copy_text)
         self.assertLessEqual(len(copy_text), 2000)
 
     def test_specific_match_commands_are_registered(self):
