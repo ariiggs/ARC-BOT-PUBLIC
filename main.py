@@ -1392,6 +1392,7 @@ class SlotReviewView(DurableView):
         await interaction.response.defer(ephemeral=True)
         result: SlotSnapshot | None = None
         registration_member_id: int | None = None
+        approved_registration: RegistrationRequest | None = None
         async with self.scrim.state_lock:
             if is_active(self.scrim):
                 current = self.scrim.slots[self.slot.number]
@@ -1415,6 +1416,7 @@ class SlotReviewView(DurableView):
                         with repository.transaction():
                             requests.pop(request.request_id, None)
                             if confirm:
+                                approved_registration = request
                                 current.assignment_id += 1
                                 current.status = STATUS_RESERVED
                                 current.team_name = request.team_name
@@ -1491,6 +1493,11 @@ class SlotReviewView(DurableView):
                 text += " The confirmed captain role could not be updated."
             if confirm and self.registration_request and not access_ok:
                 text += " Pending Captain access could not be completed."
+            if confirm and self.registration_request:
+                if not await update_registration_reaction(
+                    self.scrim, approved_registration
+                ):
+                    text += " The registration message reaction could not be updated."
             if confirm and not await refresh_public_slots(self.scrim):
                 text += " The public board could not be updated."
             await send_scrim_log(
@@ -1522,6 +1529,33 @@ async def delete_staff_review_message(interaction: discord.Interaction) -> bool:
         return False
     except discord.HTTPException:
         logger.exception("Could not delete the processed staff review message.")
+        return False
+
+
+async def update_registration_reaction(
+    scrim: Scrim, request: RegistrationRequest | None
+) -> bool:
+    if request is None or request.registration_message_id is None:
+        return False
+    registration_channel_id = getattr(scrim, "registration_channel_id", None)
+    if registration_channel_id is None:
+        return False
+    try:
+        channel = await configured_text_channel(
+            scrim, registration_channel_id
+        )
+        if channel is None:
+            return False
+        message = await channel.fetch_message(request.registration_message_id)
+        await message.add_reaction("✅")
+        bot_user = getattr(bot, "user", None)
+        if bot_user is not None:
+            await message.remove_reaction("🆗", bot_user)
+        return True
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException, AttributeError):
+        logger.exception(
+            "Could not update the registration reaction (%s).", scrim.id
+        )
         return False
 
 
@@ -3762,6 +3796,8 @@ def parse_registration_arguments(arguments: str) -> tuple[str, str, str | None]:
 async def apply_registration_entry(
     scrim: Scrim,
     entry: AddDraftEntry,
+    *,
+    registration_message_id: int | None = None,
 ) -> tuple[SlotSnapshot | None, str | None, bool, bool]:
     snapshot: SlotSnapshot | None = None
     auto_accept = getattr(scrim, "registration_auto_accept", False) is True
@@ -3789,6 +3825,7 @@ async def apply_registration_entry(
                 tag=entry.tag,
                 manager_id=entry.member.id,
                 assignment_id=slot.assignment_id,
+                registration_message_id=registration_message_id,
             )
             with repository.transaction():
                 pending_registrations = getattr(
@@ -4059,7 +4096,9 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
         tag=tag,
     )
     snapshot, error, access_ok, board_refreshed = await apply_registration_entry(
-        scrim, entry
+        scrim,
+        entry,
+        registration_message_id=getattr(getattr(ctx, "message", None), "id", None),
     )
     if error or snapshot is None:
         await send_private_command_feedback(

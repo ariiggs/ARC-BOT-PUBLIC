@@ -195,7 +195,7 @@ class CustomEmojiTests(unittest.TestCase):
                     "logs_channel_id",
                 },
             )
-        self.assertEqual(migrated.payload()["version"], 20)
+        self.assertEqual(migrated.payload()["version"], 21)
 
 
 if __name__ == "__main__":

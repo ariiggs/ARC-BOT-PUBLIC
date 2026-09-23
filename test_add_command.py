@@ -11,6 +11,7 @@ from main import (
     add_team,
     apply_registration_entry,
     build_add_draft,
+    update_registration_reaction,
 )
 from scrim_state import (
     STATUS_AVAILABLE,
@@ -222,7 +223,7 @@ class AddCommandTests(unittest.IsolatedAsyncioTestCase):
         scrim = self.make_scrim()
         scrim.id = "d" * 16
         scrim.guild_id = 123
-        request = RegistrationRequest("e" * 16, 3, "Alpha", "ALP", 900, 0)
+        request = RegistrationRequest("e" * 16, 3, "Alpha", "ALP", 900, 0, 321)
         scrim.pending_registrations = {request.request_id: request}
         member = SimpleNamespace(id=900, guild=SimpleNamespace())
         interaction = SimpleNamespace(
@@ -244,12 +245,33 @@ class AddCommandTests(unittest.IsolatedAsyncioTestCase):
             patch("main.grant_manager_access", new=AsyncMock(return_value=True)),
             patch("main.refresh_public_slots", new=AsyncMock(return_value=True)),
             patch("main.send_scrim_log", new=AsyncMock()),
+            patch("main.update_registration_reaction", new=AsyncMock(return_value=True)) as update_reaction,
         ):
             await view.finish_review(interaction, True)
 
-        self.assertEqual(scrim.slots[3].status, STATUS_RESERVED)
+        self.assertEqual(scrim.slots[3].status, "En attente du manager")
         self.assertEqual(scrim.slots[3].team_name, "Alpha")
         self.assertEqual(scrim.pending_registrations, {})
+        update_reaction.assert_awaited_once_with(scrim, request)
+
+    async def test_approved_registration_replaces_ok_reaction_with_checkmark(self):
+        scrim = SimpleNamespace(id="e" * 16, registration_channel_id=777)
+        request = RegistrationRequest("f" * 16, 3, "Alpha", "ALP", 900, 0, 321)
+        message = SimpleNamespace(
+            add_reaction=AsyncMock(),
+            remove_reaction=AsyncMock(),
+        )
+        channel = SimpleNamespace(fetch_message=AsyncMock(return_value=message))
+        bot_user = SimpleNamespace(id=1)
+
+        with (
+            patch("main.configured_text_channel", new=AsyncMock(return_value=channel)),
+            patch("main.bot", SimpleNamespace(user=bot_user)),
+        ):
+            self.assertTrue(await update_registration_reaction(scrim, request))
+
+        message.add_reaction.assert_awaited_once_with("✅")
+        message.remove_reaction.assert_awaited_once_with("🆗", bot_user)
 
 
 if __name__ == "__main__":
