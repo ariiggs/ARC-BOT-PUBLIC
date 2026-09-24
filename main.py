@@ -67,6 +67,7 @@ LEADERBOARD_FONT_VARIATIONS = {
     700: "Bold",
     800: "ExtraBold",
 }
+LEADERBOARD_BODY_FONT_WEIGHT = 400
 LEADERBOARD_BACKGROUND_UPLOAD_DIR = (
     Path(__file__).parent / "data" / "leaderboard-backgrounds"
 )
@@ -5965,7 +5966,7 @@ def _build_configured_leaderboard_image(
                 max_height=LEADERBOARD_ROW_HEIGHT - 8,
                 max_size=row_font,
                 min_size=13,
-                weight=700,
+                weight=LEADERBOARD_BODY_FONT_WEIGHT,
             )
             text_y = y + LEADERBOARD_ROW_HEIGHT // 2
             draw.text(
@@ -5991,7 +5992,10 @@ def _build_configured_leaderboard_image(
                 draw.text(
                     (value_x, text_y),
                     str(value),
-                    font=_load_font(row_font, weight=700),
+                    font=_load_font(
+                        row_font,
+                        weight=LEADERBOARD_BODY_FONT_WEIGHT,
+                    ),
                     fill=text,
                     anchor="rm",
                 )

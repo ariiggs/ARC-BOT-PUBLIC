@@ -50,6 +50,29 @@ class LeaderboardConfigurationTests(unittest.TestCase):
                 font = _load_font(24, weight=weight)
                 self.assertEqual(font.getname(), ("Montserrat", expected_style))
 
+    def test_leaderboard_teams_and_scores_use_regular_weight(self):
+        scrim = SimpleNamespace(
+            leaderboard_team_count=16,
+            leaderboard_orientation="vertical",
+            leaderboard_header_height=180,
+            leaderboard_footer_height=120,
+            timezone="UTC",
+        )
+        with patch("main._load_font", wraps=_load_font) as font_loader:
+            build_leaderboard_image(
+                scrim,
+                [LeaderboardRow(1, "Alpha", 1, 2, 16, 18)],
+                background_path=LEADERBOARD_BACKGROUND,
+            )
+
+        used_weights = {
+            call.kwargs.get("weight", 400)
+            for call in font_loader.call_args_list
+        }
+        self.assertIn(400, used_weights)
+        self.assertIn(800, used_weights)
+        self.assertNotIn(700, used_weights)
+
     def test_results_publication_uses_template_and_missing_rank_defaults(self):
         scrim = SimpleNamespace(
             id="a" * 16,
