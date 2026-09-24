@@ -71,12 +71,10 @@ class V15UpdateTests(unittest.TestCase):
 
         self.assertTrue(help_text.startswith(">>> "))
         self.assertIn("!setup", help_text)
-        self.assertIn("!setres", help_text)
         self.assertIn("!register Team / TAG [/ @Manager]", help_text)
         self.assertIn("!cap add|transfer|remove @User", help_text)
         self.assertIn(f"!resg1-{MAX_MATCHES} slot kills placement", help_text)
         self.assertIn(f"!resg1-{MAX_MATCHES} slot kills placement", HELP_COPY_TEXT)
-        self.assertIn("!setres", HELP_COPY_TEXT)
         self.assertNotIn("```", help_text)
         self.assertLessEqual(len(help_text), 1000)
 

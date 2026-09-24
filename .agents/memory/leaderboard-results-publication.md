@@ -1,23 +1,21 @@
 ---
 name: Leaderboard result publication
-description: Approved separation between designer-provided leaderboard artwork and bot-generated content.
+description: Runtime text-only leaderboard rendering and the separate dimensioned blueprint download.
 ---
 
-The bot uses pre-rendered leaderboard artwork for the dark table, column
-headings, row dividers, ranks, and date badge. At runtime, draw only the date,
-team names, wins, kills, placement points, and total points. Do not generate a
-scrim title or footer. Preserve a custom background outside the fixed table and
-date-badge overlays.
+The runtime renderer fits the selected background to the configured canvas and
+adds text only: date, sequential ranks, team names, wins, kills, placement
+points, and total points. Do not composite table or date-badge artwork, draw
+headings or row dividers, or add a scrim title or footer. Render every
+configured rank even when there is no corresponding team row; leave that
+team's name and scores blank. In horizontal layouts, continue rank numbering
+across the second column.
 
-Leaderboard body rows are 48px high in both orientations. Horizontal mode
-shows two teams side by side per row; vertical mode shows one team per row.
-Use Montserrat Regular for generated values and fixed column headings/ranks.
-The configured team count defines visible rank capacity even when fewer teams
-are registered: retain every rank, including 24, while leaving missing teams'
-names and scores blank. The configurable text color applies only to generated
-values; the dark artwork, labels, and ranks stay fixed. Blueprints should show
-the same dark static artwork with date, team names, and scores blank. Put
-dimensions and annotations outside the exact-size design canvas.
+Leaderboard body rows are 48px high in both orientations; the first text row
+center is y=318. Horizontal mode places consecutive ranks in two columns and
+vertical mode uses one column. Use Montserrat Regular for generated text. The
+configured text color applies to all generated values and ranks; no background
+color or artwork is added to improve contrast.
 
 Background images, their preview metadata, and generated text colors are
 scoped independently by orientation and team count. A profile without saved
@@ -29,20 +27,26 @@ and team count. The first data row starts at the same y-position in all layouts
 (row top y=294; generated text center y=318), including both horizontal columns.
 Normalize legacy custom heights to these fixed dimensions.
 
-**Why:** The table is fixed artwork so runtime image generation cannot alter its
-layout or text contrast; only result content changes between publications. The
-configured display capacity may exceed registered slots, so static rank labels
-must remain without inventing a team or changing the registration range. Empty
-blueprints need to show the actual dark treatment and geometry without sample
-result data. Orientation and team-count layouts are independent configurations,
-so sharing one pair's settings with another would unexpectedly change its output.
-Fixed framing prevents orientation changes or legacy per-scrim values from
+Dimensioned references exist for every supported orientation/team-count profile.
+Offer the active profile's native-size reference from both the blueprint panel
+and the wrong-dimension recovery flow, alongside its exact-size blank canvas.
+Clearly label the reference as informational, not an upload background; do not
+use it in result rendering.
+
+**Why:** Static table artwork previously added non-text elements over selected
+backgrounds, contrary to the text-only publication requirement. The rank
+capacity can exceed registered teams, so ranks must remain visible without
+inventing data. Dimensioned references contain measurements and sample content,
+so keep them separate from upload-ready backgrounds and results. Their native
+dimensions must track the same orientation/team-count layout rules as blank
+canvases. Orientation and team-count layouts are independent configurations,
+and fixed framing prevents orientation changes or legacy per-scrim values from
 shifting the first row and header/footer bands.
 
-**How to apply:** Keep both bot copies, static template assets, and all
-vertical/horizontal previews aligned. When changing leaderboard layouts, update
-the templates as well as the empty blueprints; keep annotations outside the
-native canvas and leave every dynamic content cell empty. Keep saved backgrounds,
-preview links, and text-color overrides keyed by orientation and team count.
-Do not reintroduce configurable per-scrim header/footer heights; use the fixed
-bands for rendering, blueprints, and background validation.
+**How to apply:** Keep both bot copies aligned. Add no table/date artwork or
+decorative shapes to results; preserve the selected background and overlay only
+the requested text. Keep each blank profile canvas and its matching dimensioned
+reference as separate downloads. Keep backgrounds, preview links, text colors,
+and dimensioned references keyed by orientation and team count. Use the fixed
+180px header and 120px footer bands; do not reintroduce per-scrim height
+settings.

@@ -48,17 +48,17 @@ class SlotsCommandTests(unittest.IsolatedAsyncioTestCase):
     def manager_config(self):
         return SimpleNamespace(manager_role_id=77, staff_role_id=77)
 
-    def test_embed_merges_pending_into_confirmed(self):
+    def test_embed_keeps_pending_separate_from_confirmed(self):
         embed = build_slot_status_embed(self.make_scrim())
 
         self.assertEqual(embed.title, "📊 Slot Status - Friday Scrim")
         self.assertIn("**Total Slots:** 4", embed.description)
         self.assertIn("⚪ **Free:** 1", embed.description)
         self.assertIn("🔵 **Reserved:** 1", embed.description)
-        self.assertIn("🟢 **Confirmed:** 2", embed.description)
-        self.assertNotIn("Pending", embed.description)
+        self.assertIn("🟠 **Pending:** 1", embed.description)
+        self.assertIn("🟢 **Confirmed:** 1", embed.description)
 
-    async def test_category_match_renders_the_matching_scrim(self):
+    async def test_category_match_outside_scrim_channel_shows_selector(self):
         ctx = self.make_context(category_id=555)
         scrim = self.make_scrim()
 
@@ -70,11 +70,11 @@ class SlotsCommandTests(unittest.IsolatedAsyncioTestCase):
         ):
             await show_slots(ctx)
 
-        embed = ctx.send.call_args.kwargs["embed"]
-        self.assertEqual(embed.title, "📊 Slot Status - Friday Scrim")
+        view = ctx.send.call_args.kwargs["view"]
+        self.assertIsInstance(view, SlotsScrimSelectView)
         delete_command.assert_awaited_once_with(ctx)
 
-    async def test_one_scrim_outside_category_uses_smart_fallback(self):
+    async def test_one_scrim_outside_category_shows_selector(self):
         ctx = self.make_context(category_id=999)
         scrim = self.make_scrim()
 
@@ -86,7 +86,10 @@ class SlotsCommandTests(unittest.IsolatedAsyncioTestCase):
         ):
             await show_slots(ctx)
 
-        self.assertEqual(ctx.send.call_args.kwargs["embed"].title, "📊 Slot Status - Friday Scrim")
+        self.assertIsInstance(
+            ctx.send.call_args.kwargs["view"],
+            SlotsScrimSelectView,
+        )
 
     async def test_multiple_scrims_outside_category_show_selector(self):
         ctx = self.make_context(category_id=999)

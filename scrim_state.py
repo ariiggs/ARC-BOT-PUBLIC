@@ -1698,6 +1698,7 @@ class ScrimRepository:
                     "placement_points_string",
                     "leaderboard_layout",
                     "leaderboard_background",
+                    "leaderboard_accent_color",
                     "leaderboard_team_count",
                     "leaderboard_orientation",
                     "leaderboard_header_height",

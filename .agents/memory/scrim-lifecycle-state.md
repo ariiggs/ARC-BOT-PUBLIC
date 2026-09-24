@@ -61,3 +61,36 @@ is enabled or the bot is updated.
 **How to apply:** Route snapshots and new events through the configured global
 logs channel first, fall back to the scrim channel when needed, and split long
 audit details into Discord-sized messages.
+
+Registration requests use a durable request record while Staff Validation is
+active; the real slot stays Available until staff approval creates a Reserved
+assignment. Auto-accept creates Reserved immediately.
+
+**Why:** An unapproved registration must not occupy or populate a real slot,
+and review buttons must survive restarts without losing the requested team.
+
+**How to apply:** Exclude pending request slot numbers from registration
+selection, validate the captured assignment generation on approval/rejection,
+change the original 🆗 registration reaction to ✅ after approval, and treat
+only literal `True` registration mode as Auto-accept.
+
+Reset cleanup must preserve pinned messages and treat the registration channel
+as optional; when it is not configured, reset only the staff and public
+channels.
+
+**Why:** Registration is an optional feature, and pinned operational guidance
+must survive routine resets.
+
+**How to apply:** Filter the configured channel IDs before resolving or
+purging them, and pass a pinned-message check to the channel purge operation.
+
+Public manager activation and registration-channel activation are independent
+durable states; route `!open` and `!close` by the channel where the command is
+used.
+
+**Why:** Staff may need to accept registrations while keeping manager slot
+buttons inactive, or manage the public board without reopening registrations.
+
+**How to apply:** Public-channel commands toggle scrim manager controls; a
+configured registration-channel command toggles that channel role's
+`send_messages` permission and the separate registration state.

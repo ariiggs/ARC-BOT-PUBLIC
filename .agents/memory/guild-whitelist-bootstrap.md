@@ -3,8 +3,8 @@ name: Guild whitelist bootstrap
 description: Operational constraint for authorizing Discord guilds before normal bot access.
 ---
 
-The guild whitelist starts empty by design. The bot owner or a persisted bot admin must authorize a guild ID before normal commands are available; `!auth add` always takes a numeric duration, where `0` means unlimited and positive values expire after that many days. An unauthorized newly joined guild is notified and left immediately.
+The guild whitelist starts empty by design. Only the bot owner can add or change access through `!auth` → a tier → Add; the modal collects the guild ID and duration. Bot admins can remove access from the selected tier. Gold enables horizontal leaderboards. Store the tier separately from `ServerConfig`; authorizing a guild must not create a role-less setup record. An unauthorized newly joined guild is notified and left immediately.
 
 **Why:** Strict join-time rejection prevents an unauthorized server from using the bot, but it also means authorization cannot depend on running a normal server command after the bot joins.
 
-**How to apply:** The bot owner manages persisted bot admins with `!admin add/remove/list`; the owner and those admins can use `!auth add <Guild_ID> <Days>` from an owner-accessible context such as an existing authorized server or DM, using `0` for unlimited access, then invite the bot to the target guild.
+**How to apply:** Keep tier selection ahead of guild-ID entry, accept non-negative day counts or Unlimited, show remaining time and expired entries in the selected tier panel, and keep tier state independent from staff-role setup. The owner can authorize the target guild before inviting the bot.

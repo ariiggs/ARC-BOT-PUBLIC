@@ -59,11 +59,8 @@ SUPPORT_SERVER_URL = "https://discord.gg/S8uaGEJGv8"
 LEADERBOARD_BACKGROUND = (
     Path(__file__).parent / "assets" / "leaderboard-background.png"
 )
-LEADERBOARD_TABLE_TEMPLATE_DIR = (
-    Path(__file__).parent / "assets" / "leaderboard-templates"
-)
-LEADERBOARD_DATE_BADGE_TEMPLATE = (
-    LEADERBOARD_TABLE_TEMPLATE_DIR / "date-badge.png"
+LEADERBOARD_BLUEPRINT_DIR = (
+    Path(__file__).parent / "assets" / "leaderboard-blueprints"
 )
 LEADERBOARD_FONT_PATH = (
     Path(__file__).parent / "assets" / "fonts" / "Montserrat[wght].ttf"
@@ -4018,7 +4015,7 @@ class LeaderboardBlueprintOfferView(LeaderboardPanelView):
     def rebuild(self) -> None:
         self.clear_items()
         yes_button = discord.ui.Button(
-            label="Yes, send blueprint",
+            label="Yes, send both blueprints",
             style=discord.ButtonStyle.success,
             row=0,
         )
@@ -4033,16 +4030,29 @@ class LeaderboardBlueprintOfferView(LeaderboardPanelView):
                 return
             try:
                 blueprint, filename = _build_empty_leaderboard_blueprint(scrim)
+                dimensioned_blueprint, dimensioned_filename = (
+                    _load_dimensioned_leaderboard_blueprint(scrim)
+                )
             except (OSError, ValueError, RuntimeError) as error:
                 await interaction.response.send_message(
-                    f"Could not generate the matching blueprint: {error}",
+                    f"Could not prepare the leaderboard blueprints: {error}",
                     ephemeral=True,
                 )
                 return
             self.stop()
             await interaction.response.send_message(
-                "Here is the upload-ready canvas for the current leaderboard profile.",
-                file=discord.File(blueprint, filename=filename),
+                (
+                    "Attached are the exact-size blank canvas for this profile "
+                    f"and the {leaderboard_blueprint_reference_label(scrim)}. "
+                    "The reference is not an upload background."
+                ),
+                files=[
+                    discord.File(blueprint, filename=filename),
+                    discord.File(
+                        dimensioned_blueprint,
+                        filename=dimensioned_filename,
+                    ),
+                ],
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -4543,7 +4553,8 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
                         f"Normalized image size: **{error.actual[0]} × "
                         f"{error.actual[1]} px**. Required for this profile: "
                         f"**{error.required[0]} × {error.required[1]} px**. "
-                        "Would you like the matching upload blueprint?"
+                        "Would you like the matching blank canvas and the "
+                        f"{leaderboard_blueprint_reference_label(scrim)}?"
                     ),
                     view=view,
                     ephemeral=True,
@@ -4684,14 +4695,14 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
             await interaction.edit_original_response(
                 content=(
                     "**Edit Leaderboard**\n"
-                    "The built-in background is restored. Changes are saved automatically."
+                    "The default background is restored. Changes are saved automatically."
                 ),
                 embed=updated_view.embed(),
                 view=updated_view,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             await interaction.followup.send(
-                "Restored the built-in leaderboard background.",
+                "Restored the default leaderboard background.",
                 ephemeral=True,
             )
 
@@ -4747,15 +4758,28 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
                 return
             try:
                 blueprint, filename = _build_empty_leaderboard_blueprint(scrim)
+                dimensioned_blueprint, dimensioned_filename = (
+                    _load_dimensioned_leaderboard_blueprint(scrim)
+                )
             except (OSError, ValueError, RuntimeError) as error:
                 await interaction.response.send_message(
-                    f"Could not generate the matching blueprint: {error}",
+                    f"Could not prepare the leaderboard blueprints: {error}",
                     ephemeral=True,
                 )
                 return
             await interaction.response.send_message(
-                "Upload this exact-size canvas for the current profile.",
-                file=discord.File(blueprint, filename=filename),
+                (
+                    "Attached are the exact-size blank canvas for this profile "
+                    f"and the {leaderboard_blueprint_reference_label(scrim)}. "
+                    "The reference is not an upload background."
+                ),
+                files=[
+                    discord.File(blueprint, filename=filename),
+                    discord.File(
+                        dimensioned_blueprint,
+                        filename=dimensioned_filename,
+                    ),
+                ],
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -5379,11 +5403,9 @@ async def _restore_default_leaderboard_background(
     scrim: Scrim,
     channel: object,
 ) -> str:
-    """Remove a scrim's custom image and point its preview back to the built-in image."""
+    """Remove a custom image and point its preview to the default background."""
     if not hasattr(channel, "send"):
         raise ValueError("The current channel cannot host the background image.")
-    if not LEADERBOARD_BACKGROUND.is_file():
-        raise ValueError("The built-in leaderboard background is missing.")
 
     orientation, team_count = _leaderboard_scrim_profile(scrim)
     profile_suffix = _leaderboard_profile_suffix(orientation, team_count)
@@ -5413,16 +5435,15 @@ async def _restore_default_leaderboard_background(
         preview = None
         moved_custom = False
         try:
+            default_buffer, _ = _build_empty_leaderboard_blueprint(scrim)
             preview_file = discord.File(
-                LEADERBOARD_BACKGROUND,
-                filename=(
-                    f"leaderboard-background-{scrim.id}-{profile_suffix}.png"
-                ),
+                default_buffer,
+                filename=f"leaderboard-background-{scrim.id}-{profile_suffix}.png",
             )
             try:
                 preview = await channel.send(
                     content=(
-                        "Restored built-in leaderboard background for "
+                        "Restored default leaderboard background for "
                         f"**{discord.utils.escape_markdown(scrim.name)}** "
                         f"({orientation}, {team_count} teams)"
                     ),
@@ -5431,6 +5452,7 @@ async def _restore_default_leaderboard_background(
                 )
             finally:
                 preview_file.close()
+                default_buffer.close()
             if not preview.attachments:
                 raise RuntimeError(
                     "Discord did not return the restored background link."
@@ -6651,42 +6673,15 @@ def leaderboard_canvas_dimensions(
 
 
 def _build_empty_leaderboard_blueprint(scrim: Scrim) -> tuple[io.BytesIO, str]:
-    """Create an upload-ready empty canvas for the scrim's current profile."""
+    """Create a blank background canvas at the scrim profile's exact size."""
     orientation, team_count = _leaderboard_scrim_profile(scrim)
     width, height = leaderboard_canvas_dimensions(
         team_count,
         orientation,
     )
-    header_height = DEFAULT_LEADERBOARD_HEADER_HEIGHT
-    with Image.open(LEADERBOARD_BACKGROUND) as background:
-        output = ImageOps.fit(
-            background.convert("RGB"),
-            (width, height),
-            method=Image.Resampling.LANCZOS,
-        ).convert("RGBA")
-
-    table_path = (
-        LEADERBOARD_TABLE_TEMPLATE_DIR
-        / f"table-{team_count}-{orientation}.png"
-    )
-    with Image.open(table_path) as table_template:
-        table_top = (
-            LEADERBOARD_OUTER_MARGIN
-            + header_height
-            + LEADERBOARD_SECTION_GAP
-        )
-        output.alpha_composite(
-            table_template.convert("RGBA"),
-            dest=(0, table_top),
-        )
-
-    with Image.open(LEADERBOARD_DATE_BADGE_TEMPLATE) as badge_template:
-        badge = badge_template.convert("RGBA")
-    badge_center_y = LEADERBOARD_OUTER_MARGIN + header_height // 2
-    badge_left = width - LEADERBOARD_OUTER_MARGIN - badge.width
-    output.alpha_composite(
-        badge,
-        dest=(badge_left, badge_center_y - badge.height // 2),
+    output = _load_leaderboard_background_canvas(
+        LEADERBOARD_BACKGROUND,
+        (width, height),
     )
 
     buffer = io.BytesIO()
@@ -6697,6 +6692,65 @@ def _build_empty_leaderboard_blueprint(scrim: Scrim) -> tuple[io.BytesIO, str]:
         f"{width}x{height}.png"
     )
     return buffer, filename
+
+
+def _generate_default_leaderboard_background(
+    size: tuple[int, int],
+) -> Image.Image:
+    """Create a solid, high-contrast canvas when no bundled image exists."""
+    return Image.new("RGBA", size, (13, 18, 26, 255))
+
+
+def _load_leaderboard_background_canvas(
+    background_path: Path,
+    size: tuple[int, int],
+) -> Image.Image:
+    """Fit a background asset or generate the default if that asset is absent."""
+    if background_path.is_file():
+        with Image.open(background_path) as background:
+            return ImageOps.fit(
+                background.convert("RGB"),
+                size,
+                method=Image.Resampling.LANCZOS,
+            ).convert("RGBA")
+    if background_path == LEADERBOARD_BACKGROUND:
+        return _generate_default_leaderboard_background(size)
+    raise FileNotFoundError(
+        f"Configured leaderboard background is missing: {background_path}"
+    )
+
+
+def leaderboard_blueprint_reference_label(scrim: Scrim) -> str:
+    orientation, team_count = _leaderboard_scrim_profile(scrim)
+    width, height = leaderboard_canvas_dimensions(team_count, orientation)
+    return (
+        f"dimensioned {team_count}-team {orientation.title()} reference "
+        f"({width} × {height} px)"
+    )
+
+
+def _load_dimensioned_leaderboard_blueprint(
+    scrim: Scrim,
+) -> tuple[io.BytesIO, str]:
+    """Load the dimensioned reference matching the active leaderboard profile."""
+    orientation, team_count = _leaderboard_scrim_profile(scrim)
+    expected_size = leaderboard_canvas_dimensions(team_count, orientation)
+    path = LEADERBOARD_BLUEPRINT_DIR / (
+        f"{orientation}-{team_count}-complete-dimensions.png"
+    )
+    with Image.open(path) as blueprint:
+        if blueprint.size != expected_size:
+            raise ValueError(
+                f"The dimensioned {team_count}-team {orientation} reference "
+                f"must be {expected_size[0]} × {expected_size[1]} px."
+            )
+        blueprint.load()
+    buffer = io.BytesIO(path.read_bytes())
+    buffer.seek(0)
+    return (
+        buffer,
+        f"leaderboard-blueprint-{orientation}-{team_count}-dimensions.png",
+    )
 
 
 def _build_configured_leaderboard_image(
@@ -6726,12 +6780,10 @@ def _build_configured_leaderboard_image(
         orientation,
     )
     footer_height = DEFAULT_LEADERBOARD_FOOTER_HEIGHT
-    with Image.open(background_path) as source_background:
-        output = ImageOps.fit(
-            source_background.convert("RGB"),
-            (width, height),
-            method=Image.Resampling.LANCZOS,
-        ).convert("RGBA")
+    output = _load_leaderboard_background_canvas(
+        background_path,
+        (width, height),
+    )
     margin = LEADERBOARD_OUTER_MARGIN
     text = _leaderboard_accent_rgb(
         DEFAULT_LEADERBOARD_ACCENT_COLOR
@@ -6744,33 +6796,14 @@ def _build_configured_leaderboard_image(
     )
 
     table_top = margin + header_height + LEADERBOARD_SECTION_GAP
-    table_template_path = (
-        LEADERBOARD_TABLE_TEMPLATE_DIR
-        / f"table-{team_limit}-{orientation}.png"
-    )
-    with Image.open(table_template_path) as table_template:
-        output.alpha_composite(
-            table_template.convert("RGBA"),
-            dest=(0, table_top),
-        )
-
-    with Image.open(LEADERBOARD_DATE_BADGE_TEMPLATE) as date_badge:
-        date_badge = date_badge.convert("RGBA")
-        date_width, date_height = date_badge.size
-        date_center_y = margin + header_height // 2
-        date_left = width - margin - date_width
-        output.alpha_composite(
-            date_badge,
-            dest=(date_left, date_center_y - date_height // 2),
-        )
-
     draw = ImageDraw.Draw(output, "RGBA")
     date_label = datetime.now(
         timezone_for_name(getattr(scrim, "timezone", "UTC"))
     ).strftime("%d %b %Y").upper()
     date_font = _load_font(18, weight=400)
+    date_center_y = margin + header_height // 2
     draw.text(
-        (width - margin - date_width // 2, date_center_y),
+        (width - margin - 75, date_center_y),
         date_label,
         font=date_font,
         fill=text,
@@ -6785,7 +6818,7 @@ def _build_configured_leaderboard_image(
     per_column_capacity = (
         (team_limit + 1) // 2 if columns == 2 else team_limit
     )
-    split_index = per_column_capacity if columns == 2 else len(rows)
+    split_index = per_column_capacity
     row_font = 21 if columns == 1 else 18
     row_top = table_top + LEADERBOARD_TABLE_HEADER_HEIGHT
 
@@ -6807,6 +6840,18 @@ def _build_configured_leaderboard_image(
         total_x = x + column_width - 20
         for row_index in range(per_column_capacity):
             y = row_top + row_index * LEADERBOARD_ROW_HEIGHT
+            text_y = y + LEADERBOARD_ROW_HEIGHT // 2
+            rank = column_index * per_column_capacity + row_index + 1
+            draw.text(
+                (x + 34, text_y),
+                f"{rank:02d}",
+                font=_load_font(
+                    row_font,
+                    weight=LEADERBOARD_BODY_FONT_WEIGHT,
+                ),
+                fill=text,
+                anchor="mm",
+            )
             if row_index >= len(column_rows):
                 continue
             row = column_rows[row_index]
@@ -6819,7 +6864,6 @@ def _build_configured_leaderboard_image(
                 min_size=13,
                 weight=LEADERBOARD_BODY_FONT_WEIGHT,
             )
-            text_y = y + LEADERBOARD_ROW_HEIGHT // 2
             draw.text(
                 (team_x, text_y),
                 row.team_name,

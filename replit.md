@@ -41,6 +41,7 @@ _Describe the high-level user-facing capabilities of this app once they exist._
 ## User preferences
 
 - All bot-authored text visible to managers must be in English, including the public board, private interactions, errors, and public command replies. Keep manager-facing slot rows concise: do not append “Awaiting manager”. Staff-only messages and internal logs may remain French.
+- New staff panels should follow the visual style and navigation conventions of `!setup`, while remaining separate commands when requested.
 
 ## Gotchas
 

@@ -22,17 +22,18 @@ from main import (
     ResultsMessageModal,
     _current_leaderboard_background_path,
     _build_empty_leaderboard_blueprint,
+    _load_leaderboard_background_canvas,
+    _load_dimensioned_leaderboard_blueprint,
     _restore_default_leaderboard_background,
     _read_leaderboard_background_metadata,
     _record_match_scores,
     _store_leaderboard_background,
     _write_leaderboard_background_metadata,
     LEADERBOARD_BACKGROUND,
-    LEADERBOARD_DATE_BADGE_TEMPLATE,
+    LEADERBOARD_BLUEPRINT_DIR,
     LEADERBOARD_OUTER_MARGIN,
     LEADERBOARD_SECTION_GAP,
     LEADERBOARD_TABLE_HEADER_HEIGHT,
-    LEADERBOARD_TABLE_TEMPLATE_DIR,
     HEX_COLOR_GENERATOR_URL,
     LEADERBOARD_ROW_HEIGHT,
     _load_font,
@@ -729,6 +730,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     getattr(scrim, "leaderboard_footer_height", DEFAULT_LEADERBOARD_FOOTER_HEIGHT),
                 ),
             )
+            self.assertEqual(blueprint.getpixel((0, 0)), (13, 18, 26))
         self.assertIn(
             f"{scrim.leaderboard_team_count}-{scrim.leaderboard_orientation}",
             filename,
@@ -740,7 +742,118 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [child.label for child in offer.children],
-            ["Yes, send blueprint", "No"],
+            ["Yes, send both blueprints", "No"],
+        )
+
+    def test_dimensioned_vertical_16_blueprint_is_the_approved_asset(self):
+        scrim = self.make_scrim()
+        scrim.leaderboard_team_count = 16
+        scrim.leaderboard_orientation = "vertical"
+        buffer, filename = _load_dimensioned_leaderboard_blueprint(scrim)
+        self.assertEqual(
+            filename,
+            "leaderboard-blueprint-vertical-16-dimensions.png",
+        )
+        self.assertEqual(
+            buffer.getvalue(),
+            (
+                LEADERBOARD_BLUEPRINT_DIR
+                / "vertical-16-complete-dimensions.png"
+            ).read_bytes(),
+        )
+        with Image.open(buffer) as reference:
+            self.assertEqual(reference.size, (1080, 1232))
+
+    def test_dimensioned_blueprints_exist_for_every_profile(self):
+        for orientation in ("vertical", "horizontal"):
+            for team_count in (16, 18, 20, 22, 24):
+                with self.subTest(orientation=orientation, team_count=team_count):
+                    scrim = self.make_scrim()
+                    scrim.leaderboard_orientation = orientation
+                    scrim.leaderboard_team_count = team_count
+                    buffer, filename = _load_dimensioned_leaderboard_blueprint(
+                        scrim
+                    )
+                    self.assertEqual(
+                        filename,
+                        f"leaderboard-blueprint-{orientation}-{team_count}-dimensions.png",
+                    )
+                    expected_size = leaderboard_canvas_dimensions(
+                        team_count,
+                        orientation,
+                    )
+                    with Image.open(buffer) as reference:
+                        self.assertEqual(reference.size, expected_size)
+
+    async def test_wrong_dimension_offer_sends_both_blueprints(self):
+        scrim = self.make_scrim()
+        scrim.deleted = False
+        offer = LeaderboardBlueprintOfferView(
+            owner_id=456,
+            guild_id=scrim.guild_id,
+            scrim_id=scrim.id,
+        )
+        interaction = SimpleNamespace(
+            response=SimpleNamespace(send_message=AsyncMock())
+        )
+
+        with patch("main.repository.get", return_value=scrim):
+            await offer.children[0].callback(interaction)
+
+        sent = interaction.response.send_message.await_args
+        self.assertIn(
+            "dimensioned 24-team Vertical reference (1080 × 1616 px)",
+            sent.args[0],
+        )
+        self.assertIn("not an upload background", sent.args[0])
+        self.assertEqual(
+            [attachment.filename for attachment in sent.kwargs["files"]],
+            [
+                "leaderboard-blueprint-24-vertical-1080x1616.png",
+                "leaderboard-blueprint-vertical-24-dimensions.png",
+            ],
+        )
+
+    async def test_leaderboard_panel_blueprint_button_sends_both_files(self):
+        scrim = self.make_scrim()
+        scrim.deleted = False
+        panel = LeaderboardScrimEditView(
+            owner_id=456,
+            guild_id=scrim.guild_id,
+            scrim_id=scrim.id,
+            background_url="",
+        )
+        blueprint_button = next(
+            child for child in panel.children if child.label == "Blueprint"
+        )
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(
+                guild_permissions=SimpleNamespace(administrator=True),
+                roles=(),
+            ),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        with (
+            patch("main.repository.get", return_value=scrim),
+            patch(
+                "main.repository.get_server_license_type",
+                return_value="Gold",
+            ),
+        ):
+            await blueprint_button.callback(interaction)
+
+        sent = interaction.response.send_message.await_args
+        self.assertIn(
+            "dimensioned 24-team Vertical reference (1080 × 1616 px)",
+            sent.args[0],
+        )
+        self.assertEqual(
+            [attachment.filename for attachment in sent.kwargs["files"]],
+            [
+                "leaderboard-blueprint-24-vertical-1080x1616.png",
+                "leaderboard-blueprint-vertical-24-dimensions.png",
+            ],
         )
 
     def test_text_color_overrides_are_scoped_to_orientation_and_team_count(self):
@@ -1254,71 +1367,160 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 leaderboard_canvas_dimensions(24, "vertical", 180, 120),
             )
 
-    def test_renderer_generates_only_date_team_and_score_text(self):
-        rows = [
-            LeaderboardRow(number, f"Team {number:02d}", 0, 0, 0, 0)
-            for number in range(1, 24)
-        ]
+    def test_renderer_generates_only_date_ranks_team_and_scores(self):
         original_text = ImageDraw.ImageDraw.text
 
         for orientation in ("vertical", "horizontal"):
-            with self.subTest(orientation=orientation):
-                scrim = self.make_scrim()
-                scrim.leaderboard_team_count = 24
-                scrim.leaderboard_orientation = orientation
-                rendered_text = []
-
-                def record_text(drawer, xy, text, *args, **kwargs):
-                    rendered_text.append(str(text))
-                    return original_text(drawer, xy, text, *args, **kwargs)
-
-                with (
-                    patch.object(
-                        ImageDraw.ImageDraw,
-                        "text",
-                        new=record_text,
-                    ),
-                    patch.object(
-                        ImageDraw.ImageDraw,
-                        "rounded_rectangle",
-                        side_effect=AssertionError(
-                            "Runtime renderer must not draw background shapes."
-                        ),
-                    ),
-                    patch.object(
-                        ImageDraw.ImageDraw,
-                        "rectangle",
-                        side_effect=AssertionError(
-                            "Runtime renderer must not draw background shapes."
-                        ),
-                    ),
-                    patch.object(
-                        ImageDraw.ImageDraw,
-                        "line",
-                        side_effect=AssertionError(
-                            "Runtime renderer must not draw background shapes."
-                        ),
-                    ),
-                    patch(
-                        "main.repository.get_server_license_type",
-                        return_value="Gold",
-                    ),
+            for team_count in LEADERBOARD_TEAM_COUNTS:
+                with self.subTest(
+                    orientation=orientation,
+                    team_count=team_count,
                 ):
-                    build_leaderboard_image(scrim, rows)
+                    scrim = self.make_scrim()
+                    scrim.leaderboard_team_count = team_count
+                    scrim.leaderboard_orientation = orientation
+                    rows = [
+                        LeaderboardRow(
+                            number,
+                            f"Team {number:02d}",
+                            0,
+                            0,
+                            0,
+                            0,
+                        )
+                        for number in range(1, team_count)
+                    ]
+                    text_calls = []
 
-                self.assertRegex(rendered_text[0], r"^\d{2} [A-Z]{3} \d{4}$")
-                self.assertEqual(rendered_text[1:6], ["Team 01", "0", "0", "0", "0"])
-                self.assertNotIn("#", rendered_text[1:])
-                self.assertNotIn("TEAM", rendered_text[1:])
-                self.assertNotIn("24", rendered_text[1:])
+                    def record_text(drawer, xy, text, *args, **kwargs):
+                        text_calls.append((str(text), xy))
+                        return original_text(drawer, xy, text, *args, **kwargs)
+
+                    with (
+                        patch.object(
+                            ImageDraw.ImageDraw,
+                            "text",
+                            new=record_text,
+                        ),
+                        patch.object(
+                            ImageDraw.ImageDraw,
+                            "rounded_rectangle",
+                            side_effect=AssertionError(
+                                "Runtime renderer must not draw background shapes."
+                            ),
+                        ),
+                        patch.object(
+                            ImageDraw.ImageDraw,
+                            "rectangle",
+                            side_effect=AssertionError(
+                                "Runtime renderer must not draw background shapes."
+                            ),
+                        ),
+                        patch.object(
+                            ImageDraw.ImageDraw,
+                            "line",
+                            side_effect=AssertionError(
+                                "Runtime renderer must not draw background shapes."
+                            ),
+                        ),
+                        patch.object(
+                            Image.Image,
+                            "alpha_composite",
+                            side_effect=AssertionError(
+                                "Runtime renderer must not composite artwork."
+                            ),
+                        ),
+                        patch(
+                            "main.repository.get_server_license_type",
+                            return_value="Gold",
+                        ),
+                    ):
+                        build_leaderboard_image(scrim, rows)
+
+                    rendered_text = [text for text, _ in text_calls]
+                    self.assertRegex(
+                        rendered_text[0],
+                        r"^\d{2} [A-Z]{3} \d{4}$",
+                    )
+                    columns = 2 if orientation == "horizontal" else 1
+                    per_column_capacity = (
+                        (team_count + 1) // 2
+                        if columns == 2
+                        else team_count
+                    )
+                    column_gap = 24 if columns == 2 else 0
+                    column_width = (
+                        1920
+                        - 2 * LEADERBOARD_OUTER_MARGIN
+                        - column_gap * (columns - 1)
+                    ) // columns
+                    rank_x_positions = {
+                        LEADERBOARD_OUTER_MARGIN
+                        + column * (column_width + column_gap)
+                        + 34
+                        for column in range(columns)
+                    }
+                    ranks = [
+                        text
+                        for text, xy in text_calls
+                        if xy[0] in rank_x_positions
+                    ]
+                    self.assertEqual(
+                        ranks,
+                        [
+                            f"{rank:02d}"
+                            for rank in range(1, team_count + 1)
+                        ],
+                    )
+                    self.assertIn("Team 01", rendered_text)
+                    self.assertEqual(rendered_text.count("Team 01"), 1)
+                    self.assertNotIn("TEAM", rendered_text)
+                    self.assertNotIn("WIN", rendered_text)
+                    self.assertNotIn("KILL", rendered_text)
+                    self.assertNotIn("PLACE", rendered_text)
+                    self.assertNotIn("TOTAL", rendered_text)
+
+    def test_renderer_preserves_background_away_from_all_text_fields(self):
+        for orientation in ("vertical", "horizontal"):
+            for team_count in LEADERBOARD_TEAM_COUNTS:
+                with self.subTest(
+                    orientation=orientation,
+                    team_count=team_count,
+                ):
+                    scrim = self.make_scrim()
+                    scrim.leaderboard_team_count = team_count
+                    scrim.leaderboard_orientation = orientation
+                    dimensions = leaderboard_canvas_dimensions(
+                        team_count,
+                        orientation,
+                    )
+                    with tempfile.TemporaryDirectory() as directory:
+                        background_path = Path(directory) / "solid-background.png"
+                        background = Image.new("RGB", dimensions, (25, 80, 140))
+                        background.save(background_path)
+                        expected = background.copy()
+                        with patch(
+                            "main.repository.get_server_license_type",
+                            return_value="Gold",
+                        ):
+                            rendered_buffer = build_leaderboard_image(
+                                scrim,
+                                [LeaderboardRow(1, "Alpha", 1, 2, 16, 18)],
+                                background_path=background_path,
+                            )
+                        with Image.open(rendered_buffer) as rendered:
+                            self.assertEqual(
+                                rendered.crop((250, 0, 500, dimensions[1])).tobytes(),
+                                expected.crop((250, 0, 500, dimensions[1])).tobytes(),
+                            )
 
     def test_leaderboard_text_color_changes_generated_text_only(self):
         scrim = self.make_scrim()
         rows = [LeaderboardRow(1, "Alpha", 1, 2, 16, 18)]
         with tempfile.TemporaryDirectory() as directory:
             background_dir = Path(directory)
-            (background_dir / f"{scrim.id}-vertical-24.png").write_bytes(
-                LEADERBOARD_BACKGROUND.read_bytes()
+            Image.new("RGB", (320, 180), (25, 80, 140)).save(
+                background_dir / f"{scrim.id}-vertical-24.png"
             )
             with patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", background_dir):
                 blue = build_leaderboard_image(scrim, rows)
@@ -1396,58 +1598,20 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(team_positions["horizontal"]["Team 01"], 318)
         self.assertEqual(team_positions["horizontal"]["Team 09"], 318)
 
-    def test_static_dark_templates_include_all_configured_ranks(self):
-        for orientation in ("vertical", "horizontal"):
-            for team_count in LEADERBOARD_TEAM_COUNTS:
-                with self.subTest(orientation=orientation, team_count=team_count):
-                    capacity = (
-                        (team_count + 1) // 2
-                        if orientation == "horizontal"
-                        else team_count
-                    )
-                    template_path = (
-                        LEADERBOARD_TABLE_TEMPLATE_DIR
-                        / f"table-{team_count}-{orientation}.png"
-                    )
-                    with Image.open(template_path) as template:
-                        self.assertEqual(template.mode, "RGBA")
-                        self.assertEqual(
-                            template.size,
-                            (
-                                1920 if orientation == "horizontal" else 1080,
-                                LEADERBOARD_TABLE_HEADER_HEIGHT
-                                + capacity * LEADERBOARD_ROW_HEIGHT,
-                            ),
-                        )
-                        self.assertEqual(
-                            template.getpixel((100, 10)),
-                            (13, 39, 57, 255),
-                        )
-
-        with Image.open(
-            LEADERBOARD_TABLE_TEMPLATE_DIR / "table-24-vertical.png"
-        ) as template:
-            rank_24_top = (
-                LEADERBOARD_TABLE_HEADER_HEIGHT + 23 * LEADERBOARD_ROW_HEIGHT
+    def test_generated_default_background_does_not_need_static_assets(self):
+        missing_background = Path("/missing/leaderboard-background.png")
+        with patch("main.LEADERBOARD_BACKGROUND", missing_background):
+            background = _load_leaderboard_background_canvas(
+                missing_background,
+                (320, 180),
             )
-            rank_pixels = template.crop(
-                (45, rank_24_top, 85, rank_24_top + LEADERBOARD_ROW_HEIGHT)
-            )
-            muted_rank_pixels = sum(
-                pixel[:3] == (143, 177, 202)
-                for pixel in rank_pixels.get_flattened_data()
-            )
-            self.assertGreater(muted_rank_pixels, 0)
-        with Image.open(LEADERBOARD_DATE_BADGE_TEMPLATE) as badge:
-            self.assertEqual(badge.mode, "RGBA")
-            self.assertGreater(badge.width, 40)
-            self.assertEqual(badge.height, 40)
+        self.assertEqual(background.mode, "RGBA")
+        self.assertEqual(background.size, (320, 180))
+        self.assertEqual(background.getpixel((0, 0)), (13, 18, 26, 255))
 
     def test_clean_leaderboard_background_is_the_default(self):
-        from main import LEADERBOARD_BACKGROUND
-
-        self.assertTrue(LEADERBOARD_BACKGROUND.is_file())
         self.assertEqual(LEADERBOARD_BACKGROUND.name, "leaderboard-background.png")
+        self.assertFalse(LEADERBOARD_BACKGROUND.is_file())
 
     def test_scrim_name_is_not_generated_on_the_default_background(self):
         scrim = self.make_scrim()
@@ -1464,7 +1628,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             custom_background = Path(directory) / "custom-background.png"
-            custom_background.write_bytes(LEADERBOARD_BACKGROUND.read_bytes())
+            Image.new("RGB", (320, 180), (18, 30, 44)).save(custom_background)
             with_name = build_leaderboard_image(
                 scrim,
                 [],
@@ -1503,6 +1667,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
     def test_image_overlays_dynamic_results_and_date_but_leaves_header_footer(self):
         scrim = self.make_scrim()
+        scrim.leaderboard_accent_color = "#123456"
         with tempfile.TemporaryDirectory() as directory:
             background_path = Path(directory) / "white.png"
             Image.new("RGB", (128, 128), (255, 255, 255)).save(background_path)

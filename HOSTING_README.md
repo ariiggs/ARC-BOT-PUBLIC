@@ -56,6 +56,34 @@ Le rôle du bot doit être placé au-dessus des rôles qu'il doit gérer.
    - le salon public dédié aux commandes `!cap`.
 6. Utiliser **Show/refresh slots** ou `!slots` pour publier le board.
 
+## Connexion à Interactive
+
+Le bridge Interactive s'exécute dans le même processus que le bot. Il est
+désactivé par défaut et ne démarre que lorsque ces variables sont configurées
+sur l'hébergement :
+
+```text
+ARC_BETA_WEB_BRIDGE_PORT=<port TCP public exposé par l'hébergement>
+ARC_BETA_WEB_BRIDGE_SECRET=<secret partagé avec l'API Replit>
+INTERACTIVE_URL=<URL publique de la page Interactive>
+```
+
+`ARC_BETA_WEB_BRIDGE_SECRET` doit rester une variable secrète et ne doit
+jamais être commitée dans GitHub ou ajoutée à `main.py`. Le bot doit être
+redémarré après l'ajout ou le changement de ces variables.
+
+Dans l'API Replit, configurer les mêmes valeurs de connexion :
+
+```text
+BETA_WEB_BRIDGE_URL=https://<domaine-bot-hosting>:<port>
+BETA_WEB_BRIDGE_SECRET=<la même valeur secrète>
+```
+
+Après le redémarrage du bot et de l'API, un membre Staff peut utiliser
+`!interactive` dans Discord. Le bouton ouvre la page et les changements
+effectués dans celle-ci sont validés et enregistrés par le processus ARC Beta
+avant que les boards Discord soient rafraîchis.
+
 Les commandes `!admin` sont masquées et réservées au propriétaire du bot :
 
 ```text

@@ -2,9 +2,16 @@
 - [Two-stage captain roles](two-stage-captain-roles.md) — legacy per-scrim manager roles migrate to Pending; Confirmed stays unset until explicitly configured.
 - [Scrim lifecycle state](scrim-lifecycle-state.md) — keep cancellation, opening, and archive state durable so Discord boards can recover safely.
 - [Discord command privacy](discord-command-privacy.md) — DM legacy prefix-command feedback and remove public invocations when possible.
-- [Guild whitelist bootstrap](guild-whitelist-bootstrap.md) — whitelist access is empty by default; authorize target IDs before inviting or through the bot owner’s DM.
+- [Guild whitelist bootstrap](guild-whitelist-bootstrap.md) — owner selects Standard/Gold by DM before the guild ID; tier state stays separate from staff setup.
 - [Captain and co-captain slots](captain-co-captain-slots.md) — preserve manager compatibility while enforcing one primary captain plus one co-captain per slot.
 - [V1.5 storage migration](v15-storage-migration.md) — migrate scrim configuration through the atomic versioned JSON snapshot, not a duplicate SQL table.
 - [Match map rotation](match-map-rotation.md) — each configured game has exactly one unique map; reducing games keeps the next match counter valid.
 - [Setup navigation states](setup-panel-navigation.md) — keep dashboard, scrim selector, and selected-scrim actions as separate staff-bound views.
+- [Global staff authorization](global-staff-authorization.md) — configure the Staff role once with !set; never duplicate it inside each scrim.
+- [GitHub mirror repositories](github-mirror-repositories.md) — sync the root bot to the private beta repo and the `A.R.C. Public/` copy to the public repo.
+- [GitHub source publication](github-source-publication.md) — publish current runtime files from the live workspace; stale or truncated transfer data can create conflict-marker syntax errors.
+- [GitHub terminal authentication](github-terminal-authentication.md) — Replit's GitHub integration does not authenticate shell Git; use the secure CLI/secret path before fetch or push.
+- [Cap Transfer authorization](cap-transfer-authorization.md) — Cap Transfer is optional; configured !cap commands require Pending or Confirmed, with staff/admin continuity.
+- [Leaderboard result publication](leaderboard-results-publication.md) — preserve selected backgrounds with text-only results; keep the dimensioned review reference separate.
 - [Library preview source retention](library-preview-source-retention.md) — keep review outputs at registered paths; removing the source can leave Library previews unavailable.
+- [Generated leaderboard default](generated-leaderboard-default.md) — keep the blueprint-only asset set; render a solid fallback when the optional default background is absent.

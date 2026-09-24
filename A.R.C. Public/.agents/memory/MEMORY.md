@@ -7,3 +7,4 @@
 - [V1.5 storage migration](v15-storage-migration.md) — migrate scrim configuration through the atomic versioned JSON snapshot, not a duplicate SQL table.
 - [Match map rotation](match-map-rotation.md) — each configured game has exactly one unique map; reducing games keeps the next match counter valid.
 - [Setup navigation states](setup-panel-navigation.md) — keep dashboard, scrim selector, and selected-scrim actions as separate staff-bound views.
+- [Library preview source retention](library-preview-source-retention.md) — keep review outputs at registered paths; removing the source can leave Library previews unavailable.
