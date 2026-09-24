@@ -774,20 +774,40 @@ class ScrimRepository:
     def list_authorized_guild_ids(self) -> list[int]:
         return [guild_id for guild_id, _, _ in self.list_authorizations()]
 
-    def list_authorizations(self) -> list[tuple[int, datetime | None, int]]:
+    def list_authorizations(
+        self,
+        *,
+        include_expired: bool = False,
+        license_type: str | None = None,
+    ) -> list[tuple[int, datetime | None, int]]:
+        if license_type is not None and license_type not in LICENSE_TYPES:
+            raise ValueError("Choose a Standard or Gold license.")
         now = datetime.now(timezone.utc)
-        return [
-            (
-                guild_id,
-                self.authorized_guild_expires_at.get(guild_id),
-                self.authorized_guild_duration_days.get(guild_id, 0),
-            )
-            for guild_id in sorted(self.authorized_guild_ids)
+        authorizations = []
+        for guild_id in sorted(self.authorized_guild_ids):
+            expires_at = self.authorized_guild_expires_at.get(guild_id)
+            stored_license_type = self.authorized_guild_license_types.get(guild_id)
+            if stored_license_type is None:
+                config = self.server_configs.get(guild_id)
+                stored_license_type = (
+                    config.license_type if config is not None else DEFAULT_LICENSE_TYPE
+                )
+            if license_type is not None and stored_license_type != license_type:
+                continue
             if (
-                self.authorized_guild_expires_at.get(guild_id) is None
-                or self.authorized_guild_expires_at[guild_id] > now
+                not include_expired
+                and expires_at is not None
+                and expires_at <= now
+            ):
+                continue
+            authorizations.append(
+                (
+                    guild_id,
+                    expires_at,
+                    self.authorized_guild_duration_days.get(guild_id, 0),
+                )
             )
-        ]
+        return authorizations
 
     def authorize_guild(
         self,

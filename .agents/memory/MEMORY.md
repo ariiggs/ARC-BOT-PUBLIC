@@ -7,9 +7,3 @@
 - [V1.5 storage migration](v15-storage-migration.md) — migrate scrim configuration through the atomic versioned JSON snapshot, not a duplicate SQL table.
 - [Match map rotation](match-map-rotation.md) — each configured game has exactly one unique map; reducing games keeps the next match counter valid.
 - [Setup navigation states](setup-panel-navigation.md) — keep dashboard, scrim selector, and selected-scrim actions as separate staff-bound views.
-- [Global staff authorization](global-staff-authorization.md) — configure the Staff role once with !set; never duplicate it inside each scrim.
-- [GitHub mirror repositories](github-mirror-repositories.md) — sync the root bot to the private beta repo and the `A.R.C. Public/` copy to the public repo.
-- [GitHub source publication](github-source-publication.md) — publish current runtime files from the live workspace; stale or truncated transfer data can create conflict-marker syntax errors.
-- [GitHub terminal authentication](github-terminal-authentication.md) — Replit's GitHub integration does not authenticate shell Git; use the secure CLI/secret path before fetch or push.
-- [Cap Transfer authorization](cap-transfer-authorization.md) — Cap Transfer is optional; configured !cap commands require Pending or Confirmed, with staff/admin continuity.
-- [Leaderboard result publication](leaderboard-results-publication.md) — designer artwork owns title/footer; background and text color are isolated by orientation and team count.

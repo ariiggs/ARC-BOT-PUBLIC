@@ -36,6 +36,7 @@ from scrim_state import (
     LEADERBOARD_LAYOUTS,
     LEADERBOARD_ORIENTATIONS,
     LEADERBOARD_TEAM_COUNTS,
+    LICENSE_TYPES,
     MatchScore,
     MAX_MATCHES,
     Scrim,
@@ -4561,10 +4562,19 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
             label="Orientation",
             emoji="↔️",
             style=discord.ButtonStyle.primary,
+            disabled=(
+                repository.get_server_license_type(self.guild_id) != "Gold"
+            ),
             row=0,
         )
 
         async def orientation_callback(interaction: discord.Interaction) -> None:
+            if repository.get_server_license_type(self.guild_id) != "Gold":
+                await interaction.response.send_message(
+                    "The Orientation control is available only to Gold guilds.",
+                    ephemeral=True,
+                )
+                return
             view = LeaderboardOrientationView(
                 owner_id=self.owner_id,
                 guild_id=self.guild_id,
@@ -5681,142 +5691,384 @@ async def admin_list(ctx: commands.Context) -> None:
     await send_private_command_feedback(ctx, message, silent=False)
 
 
-@bot.group(name="auth", invoke_without_command=True, hidden=True)
-@auth_admin_required()
-async def auth_command(ctx: commands.Context) -> None:
-    await send_private_command_feedback(
-        ctx,
-        "Use `!auth add <Days|unlimited>` to start the owner-only tier and guild-ID prompts, "
-        "`!auth remove <Guild_ID>`, or `!auth list`.",
-        silent=False,
+def build_auth_panel_embed() -> discord.Embed:
+    return discord.Embed(
+        title="💎 A.R.C. Authorization Manager",
+        description="Choose a version to view and manage its guild authorizations.",
+        color=discord.Color.blurple(),
     )
 
 
-@auth_command.command(name="add")
-@commands.is_owner()
-async def auth_add(ctx: commands.Context, duration: str) -> None:
-    normalized_duration = duration.strip().casefold()
-    if normalized_duration in {"0", "unlimited", "illimité", "illimite"}:
-        duration_days = 0
-    else:
-        try:
-            duration_days = int(normalized_duration)
-        except ValueError:
-            await send_private_command_feedback(
-                ctx,
-                "Duration must be a non-negative number of days or `unlimited`.",
-                silent=False,
+def authorization_time_left_text(
+    expires_at: datetime | None, duration_days: int
+) -> str:
+    if expires_at is None:
+        return "Unlimited" if duration_days == 0 else "Expiry unavailable"
+    expires_at = expires_at.astimezone(timezone.utc)
+    if expires_at <= datetime.now(timezone.utc):
+        return f"Expired on {expires_at.strftime('%Y-%m-%d %H:%M UTC')}"
+    return subscription_remaining_text(expires_at)
+
+
+async def build_auth_tier_embed(license_type: str) -> discord.Embed:
+    if license_type not in LICENSE_TYPES:
+        raise ValueError("Choose a Standard or Gold version.")
+    authorizations = repository.list_authorizations(
+        include_expired=True,
+        license_type=license_type,
+    )
+    embed = discord.Embed(
+        title=f"💎 {license_type} Version — Guild Authorizations",
+        color=(
+            discord.Color.gold()
+            if license_type == "Gold"
+            else discord.Color.green()
+        ),
+    )
+    if not authorizations:
+        embed.description = f"No guilds are assigned to the {license_type} version."
+        return embed
+
+    visible_authorizations = authorizations[:25]
+    names = await asyncio.gather(
+        *(
+            authorized_guild_name(guild_id)
+            for guild_id, _, _ in visible_authorizations
+        )
+    )
+    for (guild_id, expires_at, duration_days), name in zip(
+        visible_authorizations, names
+    ):
+        safe_name = discord.utils.escape_mentions(
+            discord.utils.escape_markdown(name or "Name unavailable")
+        )
+        embed.add_field(
+            name=f"Guild: {safe_name} (`{guild_id}`)"[:256],
+            value=f"**Time left:** {authorization_time_left_text(expires_at, duration_days)}",
+            inline=False,
+        )
+    if len(authorizations) > len(visible_authorizations):
+        embed.set_footer(
+            text=(
+                f"{len(authorizations) - len(visible_authorizations)} more guilds "
+                "are not shown. Remove accepts a guild ID."
+            )
+        )
+    return embed
+
+
+def parse_auth_duration(value: str) -> int:
+    normalized = value.strip().casefold()
+    if normalized in {"0", "unlimited", "illimité", "illimite"}:
+        return 0
+    try:
+        duration_days = int(normalized)
+    except ValueError as error:
+        raise ValueError(
+            "Duration must be a non-negative number of days or `unlimited`."
+        ) from error
+    if duration_days < 0:
+        raise ValueError(
+            "Duration must be a non-negative number of days or `unlimited`."
+        )
+    return duration_days
+
+
+class AuthAdminPanelView(DurableView):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.selected_tier: str | None = None
+        self.message: discord.Message | None = None
+        self.rebuild()
+
+    async def user_is_authorized(
+        self,
+        user: discord.abc.User,
+        *,
+        owner_only: bool = False,
+    ) -> bool:
+        if getattr(user, "id", None) != self.owner_id:
+            return False
+        is_owner = await bot.is_owner(user)
+        if owner_only:
+            return is_owner
+        return is_owner or repository.is_admin_authorized(user.id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This authorization panel belongs to another administrator.",
+                ephemeral=True,
+            )
+            return False
+        if not await self.user_is_authorized(interaction.user):
+            await interaction.response.send_message(
+                "You are no longer authorized to use this panel.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    def _add_button(
+        self,
+        label: str,
+        style: discord.ButtonStyle,
+        callback,
+    ) -> None:
+        button = discord.ui.Button(label=label, style=style)
+        button.callback = callback
+        self.add_item(button)
+
+    def rebuild(self) -> None:
+        self.clear_items()
+        if self.selected_tier is None:
+            for tier in LICENSE_TYPES:
+                async def select_tier(
+                    interaction: discord.Interaction,
+                    selected_tier: str = tier,
+                ) -> None:
+                    await self.show_tier(interaction, selected_tier)
+
+                self._add_button(
+                    tier,
+                    discord.ButtonStyle.primary,
+                    select_tier,
+                )
+
+            async def close_panel(interaction: discord.Interaction) -> None:
+                await interaction.response.edit_message(
+                    content="Authorization panel closed.",
+                    embed=None,
+                    view=None,
+                )
+
+            self._add_button(
+                "Close",
+                discord.ButtonStyle.secondary,
+                close_panel,
             )
             return
 
-    try:
-        dm_channel = await ctx.author.create_dm()
-    except discord.HTTPException:
-        await send_private_command_feedback(
-            ctx,
-            "I could not open a DM for the authorization prompts.",
-            silent=False,
-        )
-        return
+        selected_tier = self.selected_tier
 
-    await delete_command_message(ctx)
-    prompt_check = lambda message: (
-        message.author.id == ctx.author.id
-        and message.channel.id == dm_channel.id
-    )
-    try:
-        await dm_channel.send(
-            "Choose the authorization tier first. Reply `Standard` or `Gold` "
-            "within 3 minutes.",
+        async def add_guild(interaction: discord.Interaction) -> None:
+            if not await self.user_is_authorized(
+                interaction.user,
+                owner_only=True,
+            ):
+                await interaction.response.send_message(
+                    "Only the bot owner can add or change a guild authorization.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_modal(
+                AuthAddGuildModal(self, selected_tier)
+            )
+
+        async def remove_guild(interaction: discord.Interaction) -> None:
+            await interaction.response.send_modal(
+                AuthRemoveGuildModal(self, selected_tier)
+            )
+
+        async def return_to_versions(interaction: discord.Interaction) -> None:
+            self.selected_tier = None
+            self.rebuild()
+            await interaction.response.edit_message(
+                content="",
+                embed=build_auth_panel_embed(),
+                view=self,
+            )
+
+        self._add_button("Add", discord.ButtonStyle.success, add_guild)
+        self._add_button("Remove", discord.ButtonStyle.danger, remove_guild)
+        self._add_button("Return", discord.ButtonStyle.secondary, return_to_versions)
+
+    async def show_tier(
+        self,
+        interaction: discord.Interaction,
+        license_type: str,
+    ) -> None:
+        self.selected_tier = license_type
+        self.rebuild()
+        await interaction.response.defer()
+        embed = await build_auth_tier_embed(license_type)
+        await interaction.edit_original_response(
+            content="",
+            embed=embed,
+            view=self,
             allowed_mentions=discord.AllowedMentions.none(),
         )
-        tier_message = await bot.wait_for(
-            "message",
-            check=prompt_check,
-            timeout=180,
-        )
-    except asyncio.TimeoutError:
-        await dm_channel.send("Authorization setup timed out. Run the command again.")
-        return
-    except discord.HTTPException:
-        logger.exception("Could not send the authorization tier prompt.")
-        return
 
-    license_type = tier_message.content.strip().casefold()
-    if license_type not in {"standard", "gold"}:
-        await dm_channel.send(
-            "Choose exactly `Standard` or `Gold`. Run the command again to retry."
-        )
-        return
-    license_type = license_type.title()
+    async def refresh_panel(self) -> None:
+        if self.message is None or self.selected_tier is None:
+            return
+        try:
+            await self.message.edit(
+                content="",
+                embed=await build_auth_tier_embed(self.selected_tier),
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not refresh the authorization panel.")
 
-    try:
-        await dm_channel.send(
-            f"Now send the guild ID. Tier: **{license_type}**. "
-            f"Duration: {'unlimited' if duration_days == 0 else f'{duration_days} day(s)'}.",
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        guild_message = await bot.wait_for(
-            "message",
-            check=prompt_check,
-            timeout=180,
-        )
-    except asyncio.TimeoutError:
-        await dm_channel.send("Authorization setup timed out. Run the command again.")
-        return
-    except discord.HTTPException:
-        logger.exception("Could not send the authorization guild-ID prompt.")
-        return
+    async def on_timeout(self) -> None:
+        disable_view_items(self)
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
-    try:
-        guild_id = int(guild_message.content.strip())
-        replaced = repository.is_guild_authorized(guild_id)
-        repository.authorize_guild(
-            guild_id,
-            duration_days,
-            license_type=license_type,
+
+class AuthAddGuildModal(discord.ui.Modal):
+    def __init__(self, panel: AuthAdminPanelView, license_type: str):
+        super().__init__(title=f"Add {license_type} authorization", timeout=300)
+        self.panel = panel
+        self.license_type = license_type
+        self.guild_id_input = discord.ui.TextInput(
+            label="Guild ID",
+            placeholder="Enter the Discord server ID",
+            required=True,
+            max_length=20,
         )
-    except (ValueError, TypeError) as error:
-        await dm_channel.send(
-            f"Could not authorize that guild: {error}. Run the command again."
+        self.duration_input = discord.ui.TextInput(
+            label="Days or unlimited",
+            placeholder="For example: 30 or unlimited",
+            default="unlimited",
+            required=True,
+            max_length=24,
         )
-        return
-    try:
-        duration_label = (
+        self.add_item(self.guild_id_input)
+        self.add_item(self.duration_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await self.panel.user_is_authorized(
+            interaction.user,
+            owner_only=True,
+        ):
+            await interaction.response.send_message(
+                "Only the bot owner can add or change a guild authorization.",
+                ephemeral=True,
+            )
+            return
+        try:
+            guild_id = int(str(self.guild_id_input.value).strip())
+            duration_days = parse_auth_duration(str(self.duration_input.value))
+            already_authorized = guild_id in repository.authorized_guild_ids
+            repository.authorize_guild(
+                guild_id,
+                duration_days,
+                license_type=self.license_type,
+            )
+        except (TypeError, ValueError) as error:
+            await interaction.response.send_message(
+                f"Could not authorize that guild: {error}",
+                ephemeral=True,
+            )
+            return
+        except SlotStorageError:
+            logger.exception("Could not save guild authorization.")
+            await interaction.response.send_message(
+                "The authorization could not be saved. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        duration_text = (
             "with unlimited access"
             if duration_days == 0
             else f"for {duration_days} day(s)"
         )
-        status = (
-            f"Guild `{guild_id}` authorization was replaced {duration_label}."
-            if replaced
-            else f"Guild `{guild_id}` is now authorized {duration_label}."
-        )
-        await dm_channel.send(
-            f"{status} Plan: **{license_type}**.",
+        status = "updated" if already_authorized else "added"
+        await interaction.response.defer(ephemeral=True)
+        await self.panel.refresh_panel()
+        await interaction.followup.send(
+            f"Guild `{guild_id}` authorization {status} as **{self.license_type}** "
+            f"{duration_text}.",
+            ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
-    except discord.HTTPException:
-        logger.exception(
-            "Guild %s was authorized but the confirmation DM could not be sent.",
-            guild_id,
+
+
+class AuthRemoveGuildModal(discord.ui.Modal):
+    def __init__(self, panel: AuthAdminPanelView, license_type: str):
+        super().__init__(title=f"Remove {license_type} authorization", timeout=300)
+        self.panel = panel
+        self.license_type = license_type
+        self.guild_id_input = discord.ui.TextInput(
+            label="Guild ID",
+            placeholder=f"Enter a {license_type} guild ID",
+            required=True,
+            max_length=20,
+        )
+        self.add_item(self.guild_id_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await self.panel.user_is_authorized(interaction.user):
+            await interaction.response.send_message(
+                "You are no longer authorized to use this panel.",
+                ephemeral=True,
+            )
+            return
+        try:
+            guild_id = int(str(self.guild_id_input.value).strip())
+            tier_authorizations = repository.list_authorizations(
+                include_expired=True,
+                license_type=self.license_type,
+            )
+        except (TypeError, ValueError) as error:
+            await interaction.response.send_message(
+                f"Could not remove that guild: {error}",
+                ephemeral=True,
+            )
+            return
+        if guild_id not in {item[0] for item in tier_authorizations}:
+            await interaction.response.send_message(
+                f"Guild `{guild_id}` is not assigned to the "
+                f"**{self.license_type}** version.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        try:
+            repository.revoke_guild(guild_id)
+        except (TypeError, ValueError) as error:
+            await interaction.response.send_message(
+                f"Could not remove that guild: {error}",
+                ephemeral=True,
+            )
+            return
+        except SlotStorageError:
+            logger.exception("Could not save guild revocation.")
+            await interaction.response.send_message(
+                "The authorization could not be removed. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await self.panel.refresh_panel()
+        await interaction.followup.send(
+            f"Guild `{guild_id}` was removed from the **{self.license_type}** version.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
 
-@auth_command.command(name="remove")
+@bot.command(name="auth", hidden=True)
 @auth_admin_required()
-async def auth_remove(ctx: commands.Context, guild_id: int) -> None:
-    try:
-        removed = repository.revoke_guild(guild_id)
-    except ValueError as error:
-        await send_private_command_feedback(ctx, str(error), silent=False)
-        return
-    message = (
-        f"Guild `{guild_id}` has been revoked."
-        if removed
-        else f"Guild `{guild_id}` was not authorized."
+async def auth_command(ctx: commands.Context) -> None:
+    view = AuthAdminPanelView(owner_id=ctx.author.id)
+    view.message = await send_private_command_feedback(
+        ctx,
+        "",
+        embed=build_auth_panel_embed(),
+        view=view,
+        delete_after=300,
+        silent=False,
     )
-    await send_private_command_feedback(ctx, message, silent=False)
 
 
 async def authorized_guild_name(guild_id: int) -> str | None:
@@ -5828,86 +6080,6 @@ async def authorized_guild_name(guild_id: int) -> str | None:
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
         return None
     return guild.name
-
-
-def build_auth_list_embed(
-    authorizations: list[tuple[int, datetime | None, int]],
-    names: dict[int, str | None],
-    license_types: dict[int, str] | None = None,
-) -> discord.Embed:
-    """Render the bot-admin subscription list using the !sub embed style."""
-    if not authorizations:
-        embed = discord.Embed(
-            title="💎 **A.R.C. Subscription Status**",
-            color=discord.Color.red(),
-        )
-        embed.add_field(name="Status", value="🔴 Expired", inline=False)
-        embed.add_field(name="Time Remaining", value="No active subscriptions.", inline=False)
-        return embed
-
-    has_unlimited = any(
-        duration_days == 0 and expires_at is None
-        for _, expires_at, duration_days in authorizations
-    )
-    embed = discord.Embed(
-        title="💎 **A.R.C. Subscription Status**",
-        color=discord.Color.gold() if has_unlimited else discord.Color.green(),
-    )
-    license_types = license_types or {}
-    for guild_id, expires_at, duration_days in authorizations[:25]:
-        name = names.get(guild_id) or "Name unavailable"
-        license_type = license_types.get(
-            guild_id,
-            repository.get_server_license_type(guild_id),
-        )
-        safe_name = discord.utils.escape_mentions(
-            discord.utils.escape_markdown(name)
-        )
-        if duration_days == 0 and expires_at is None:
-            status = "🟢 Active"
-            remaining = "♾️ Lifetime / Unlimited"
-        elif expires_at is not None and expires_at > datetime.now(timezone.utc):
-            status = "🟢 Active"
-            remaining = subscription_remaining_text(expires_at)
-        elif expires_at is not None:
-            status = "🔴 Expired"
-            remaining = f"Expired on {expires_at.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-        else:
-            status = "🔴 Expired"
-            remaining = "Expired"
-        embed.add_field(
-            name=f"{safe_name} (`{guild_id}`)",
-            value=(
-                f"**Plan:** {license_type}\n"
-                f"**Status:** {status}\n"
-                f"**Time Remaining:** {remaining}"
-            ),
-            inline=False,
-        )
-    if len(authorizations) > 25:
-        embed.set_footer(text=f"{len(authorizations) - 25} additional subscriptions not shown.")
-    return embed
-
-
-@auth_command.command(name="list")
-@auth_admin_required()
-async def auth_list(ctx: commands.Context) -> None:
-    authorizations = repository.list_authorizations()
-    names = {
-        guild_id: await authorized_guild_name(guild_id)
-        for guild_id, _, _ in authorizations
-    }
-    license_types = {
-        guild_id: repository.get_server_license_type(guild_id)
-        for guild_id, _, _ in authorizations
-    }
-    await send_private_command_feedback(
-        ctx,
-        "",
-        embed=build_auth_list_embed(authorizations, names, license_types),
-        view=SubscriptionStatusView(),
-        delete_after=60,
-    )
 
 
 @bot.event

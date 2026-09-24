@@ -32,12 +32,11 @@ from scrim_state import (
     DEFAULT_LEADERBOARD_HEADER_HEIGHT,
     DEFAULT_LEADERBOARD_ORIENTATION,
     DEFAULT_LEADERBOARD_TEAM_COUNT,
-    LEADERBOARD_FOOTER_HEIGHTS,
-    LEADERBOARD_HEADER_HEIGHTS,
     OPERATIONAL_MESSAGE_KEYS,
     LEADERBOARD_LAYOUTS,
     LEADERBOARD_ORIENTATIONS,
     LEADERBOARD_TEAM_COUNTS,
+    LICENSE_TYPES,
     MatchScore,
     MAX_MATCHES,
     Scrim,
@@ -85,12 +84,24 @@ LEADERBOARD_OUTER_MARGIN = 28
 LEADERBOARD_SECTION_GAP = 22
 LEADERBOARD_TABLE_HEADER_HEIGHT = 64
 LEADERBOARD_ROW_HEIGHT = 48
-LEADERBOARD_ACCENT_COLOR_OPTIONS = (
-    ("Neon Blue", "#00AEFF"),
-    ("Gold", "#FFD700"),
-    ("Red", "#FF4655"),
-    ("White", "#FFFFFF"),
-)
+
+
+class LeaderboardBackgroundDimensionsError(ValueError):
+    """Raised when an upload does not match the active leaderboard canvas."""
+
+    def __init__(
+        self,
+        actual: tuple[int, int],
+        required: tuple[int, int],
+    ) -> None:
+        self.actual = actual
+        self.required = required
+        super().__init__(
+            f"Image dimensions are {actual[0]}×{actual[1]}; "
+            f"this profile requires {required[0]}×{required[1]}."
+        )
+
+
 HEX_COLOR_GENERATOR_URL = "https://htmlcolorcodes.com/color-picker/"
 
 
@@ -108,9 +119,8 @@ def _leaderboard_accent_rgb(color_hex: str) -> tuple[int, int, int]:
 
 def _leaderboard_accent_label(color_hex: str) -> str:
     normalized = color_hex.upper()
-    for name, option_hex in LEADERBOARD_ACCENT_COLOR_OPTIONS:
-        if normalized == option_hex:
-            return f"{name} (`{normalized}`)"
+    if normalized == DEFAULT_LEADERBOARD_ACCENT_COLOR:
+        return f"White (`{normalized}`)"
     return f"Custom HEX (`{normalized}`)"
 
 state_store = SlotStateStore(
@@ -3988,6 +3998,76 @@ class LeaderboardPanelView(discord.ui.View):
             await interaction.response.send_message(message, ephemeral=True)
 
 
+class LeaderboardBlueprintOfferView(LeaderboardPanelView):
+    """Offer the exact upload canvas after a dimension mismatch."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        scrim_id: str,
+    ) -> None:
+        super().__init__(
+            owner_id=owner_id,
+            guild_id=guild_id,
+            scrim_id=scrim_id,
+        )
+        self.rebuild()
+
+    def rebuild(self) -> None:
+        self.clear_items()
+        yes_button = discord.ui.Button(
+            label="Yes, send blueprint",
+            style=discord.ButtonStyle.success,
+            row=0,
+        )
+
+        async def yes_callback(interaction: discord.Interaction) -> None:
+            scrim = repository.get(self.scrim_id)
+            if scrim is None or scrim.guild_id != self.guild_id:
+                await interaction.response.send_message(
+                    "This scrim is no longer available.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                blueprint, filename = _build_empty_leaderboard_blueprint(scrim)
+            except (OSError, ValueError, RuntimeError) as error:
+                await interaction.response.send_message(
+                    f"Could not generate the matching blueprint: {error}",
+                    ephemeral=True,
+                )
+                return
+            self.stop()
+            await interaction.response.send_message(
+                "Here is the upload-ready canvas for the current leaderboard profile.",
+                file=discord.File(blueprint, filename=filename),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        yes_button.callback = yes_callback
+        self.add_item(yes_button)
+
+        no_button = discord.ui.Button(
+            label="No",
+            style=discord.ButtonStyle.secondary,
+            row=0,
+        )
+
+        async def no_callback(interaction: discord.Interaction) -> None:
+            self.stop()
+            await interaction.response.edit_message(
+                content="No blueprint sent.",
+                embed=None,
+                view=None,
+            )
+
+        no_button.callback = no_callback
+        self.add_item(no_button)
+
+
 class LeaderboardSettingsView(LeaderboardPanelView):
     """Dashboard for the separate !setres staff panel."""
 
@@ -4258,8 +4338,7 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
                 title="Scrim no longer exists",
                 color=discord.Color.red(),
             )
-        config = repository.get_server_config(self.guild_id)
-        is_gold = getattr(config, "license_type", "Standard") == "Gold"
+        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
         orientation = scrim.leaderboard_orientation
         if orientation == "horizontal" and not is_gold:
             orientation = "vertical"
@@ -4453,6 +4532,23 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
                     "Background saved.",
                     ephemeral=True,
                 )
+            except LeaderboardBackgroundDimensionsError as error:
+                view = LeaderboardBlueprintOfferView(
+                    owner_id=self.owner_id,
+                    guild_id=self.guild_id,
+                    scrim_id=self.scrim_id,
+                )
+                await interaction.followup.send(
+                    (
+                        f"Normalized image size: **{error.actual[0]} × "
+                        f"{error.actual[1]} px**. Required for this profile: "
+                        f"**{error.required[0]} × {error.required[1]} px**. "
+                        "Would you like the matching upload blueprint?"
+                    ),
+                    view=view,
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
             except (OSError, ValueError, discord.HTTPException) as error:
                 await interaction.followup.send(
                     f"Could not save that background: {error}",
@@ -4466,10 +4562,19 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
             label="Orientation",
             emoji="↔️",
             style=discord.ButtonStyle.primary,
+            disabled=(
+                repository.get_server_license_type(self.guild_id) != "Gold"
+            ),
             row=0,
         )
 
         async def orientation_callback(interaction: discord.Interaction) -> None:
+            if repository.get_server_license_type(self.guild_id) != "Gold":
+                await interaction.response.send_message(
+                    "The Orientation control is available only to Gold guilds.",
+                    ephemeral=True,
+                )
+                return
             view = LeaderboardOrientationView(
                 owner_id=self.owner_id,
                 guild_id=self.guild_id,
@@ -4485,10 +4590,25 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         orientation_button.callback = orientation_callback
         self.add_item(orientation_button)
 
+        scrim = repository.get(self.scrim_id)
+        has_custom_background = _leaderboard_background_path(
+            self.scrim_id,
+            getattr(
+                scrim,
+                "leaderboard_orientation",
+                DEFAULT_LEADERBOARD_ORIENTATION,
+            ),
+            getattr(
+                scrim,
+                "leaderboard_team_count",
+                DEFAULT_LEADERBOARD_TEAM_COUNT,
+            ),
+        ).is_file()
         accent_button = discord.ui.Button(
             label="Text Color",
             emoji="🎨",
             style=discord.ButtonStyle.primary,
+            disabled=not has_custom_background,
             row=1,
         )
 
@@ -4508,20 +4628,6 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         accent_button.callback = accent_callback
         self.add_item(accent_button)
 
-        scrim = repository.get(self.scrim_id)
-        has_custom_background = _leaderboard_background_path(
-            self.scrim_id,
-            getattr(
-                scrim,
-                "leaderboard_orientation",
-                DEFAULT_LEADERBOARD_ORIENTATION,
-            ),
-            getattr(
-                scrim,
-                "leaderboard_team_count",
-                DEFAULT_LEADERBOARD_TEAM_COUNT,
-            ),
-        ).is_file()
         restore_background_button = discord.ui.Button(
             label="Restore Default Background",
             emoji="↩️",
@@ -4619,6 +4725,45 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         self.add_item(back_button)
 
 
+        blueprint_button = discord.ui.Button(
+            label="Blueprint",
+            emoji="📐",
+            style=discord.ButtonStyle.secondary,
+            row=2,
+        )
+
+        async def blueprint_callback(interaction: discord.Interaction) -> None:
+            scrim = repository.get(self.scrim_id)
+            if (
+                scrim is None
+                or scrim.guild_id != self.guild_id
+                or not is_active(scrim)
+                or not member_can_configure_scrim(interaction.user, scrim)
+            ):
+                await interaction.response.send_message(
+                    "You no longer have access to this leaderboard panel.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                blueprint, filename = _build_empty_leaderboard_blueprint(scrim)
+            except (OSError, ValueError, RuntimeError) as error:
+                await interaction.response.send_message(
+                    f"Could not generate the matching blueprint: {error}",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                "Upload this exact-size canvas for the current profile.",
+                file=discord.File(blueprint, filename=filename),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        blueprint_button.callback = blueprint_callback
+        self.add_item(blueprint_button)
+
+
 class LeaderboardAccentColorView(LeaderboardPanelView):
     """Choose the generated date, team, and score text color for one profile."""
 
@@ -4664,8 +4809,8 @@ class LeaderboardAccentColorView(LeaderboardPanelView):
                 f"Current color: **{_leaderboard_accent_label(accent_color)}**\n"
                 "This color applies only to generated dates, team names, and "
                 "scores. Table styling stays fixed.\n"
-                "Choose a preset below, or select **Custom HEX** and enter a "
-                "code in `#RRGGBB` format.\n"
+                "Enter a custom color in `#RRGGBB` format. Generated text "
+                "defaults to white.\n"
                 f"[Open a HEX color generator]({HEX_COLOR_GENERATOR_URL})"
             ),
             color=discord.Color.blurple(),
@@ -4673,58 +4818,36 @@ class LeaderboardAccentColorView(LeaderboardPanelView):
 
     def rebuild(self) -> None:
         self.clear_items()
-        scrim = repository.get(self.scrim_id)
-        current = getattr(
-            scrim,
-            "leaderboard_accent_color",
-            DEFAULT_LEADERBOARD_ACCENT_COLOR,
-        ).upper()
-        options = [
-            discord.SelectOption(
-                label=name,
-                value=color_hex,
-                description=color_hex,
-                default=current == color_hex,
-            )
-            for name, color_hex in LEADERBOARD_ACCENT_COLOR_OPTIONS
-        ]
-        options.append(
-            discord.SelectOption(
-                label="Custom HEX",
-                value="custom",
-                description="Enter a custom #RRGGBB color",
-            )
-        )
-        selector = discord.ui.Select(
-            placeholder="Choose a text color",
-            min_values=1,
-            max_values=1,
-            options=options,
+        custom_button = discord.ui.Button(
+            label="Custom HEX",
+            emoji="🎨",
+            style=discord.ButtonStyle.primary,
             row=0,
         )
 
-        async def select_callback(interaction: discord.Interaction) -> None:
-            selected = selector.values[0]
-            if selected == "custom":
-                await interaction.response.send_modal(
-                    LeaderboardAccentColorModal(
-                        color_view=self,
-                        prompt_message=interaction.message,
-                    )
+        async def custom_callback(interaction: discord.Interaction) -> None:
+            await interaction.response.send_modal(
+                LeaderboardAccentColorModal(
+                    color_view=self,
+                    prompt_message=interaction.message,
                 )
-                return
-            if selected not in {
-                color_hex for _, color_hex in LEADERBOARD_ACCENT_COLOR_OPTIONS
-            }:
-                await interaction.response.send_message(
-                    "That text color is not available.",
-                    ephemeral=True,
-                )
-                return
-            await self.save_color(interaction, selected)
+            )
 
-        selector.callback = select_callback
-        self.add_item(selector)
+        custom_button.callback = custom_callback
+        self.add_item(custom_button)
+
+        reset_button = discord.ui.Button(
+            label="Reset to White",
+            emoji="↩️",
+            style=discord.ButtonStyle.secondary,
+            row=0,
+        )
+
+        async def reset_callback(interaction: discord.Interaction) -> None:
+            await self.save_color(interaction, DEFAULT_LEADERBOARD_ACCENT_COLOR)
+
+        reset_button.callback = reset_callback
+        self.add_item(reset_button)
 
         back_button = discord.ui.Button(
             label="Back to Leaderboard",
@@ -4768,6 +4891,16 @@ class LeaderboardAccentColorView(LeaderboardPanelView):
         ):
             await interaction.response.send_message(
                 "You no longer have access to this leaderboard panel.",
+                ephemeral=True,
+            )
+            return
+        if not _leaderboard_background_path(
+            scrim.id,
+            scrim.leaderboard_orientation,
+            scrim.leaderboard_team_count,
+        ).is_file():
+            await interaction.response.send_message(
+                "Upload a custom background before changing generated text color.",
                 ephemeral=True,
             )
             return
@@ -5019,8 +5152,7 @@ class LeaderboardOrientationView(LeaderboardPanelView):
 
     def embed(self) -> discord.Embed:
         scrim = repository.get(self.scrim_id)
-        config = repository.get_server_config(self.guild_id)
-        is_gold = getattr(config, "license_type", "Standard") == "Gold"
+        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
         current = (
             scrim.leaderboard_orientation
             if scrim is not None
@@ -5040,8 +5172,7 @@ class LeaderboardOrientationView(LeaderboardPanelView):
     def rebuild(self) -> None:
         self.clear_items()
         scrim = repository.get(self.scrim_id)
-        config = repository.get_server_config(self.guild_id)
-        is_gold = getattr(config, "license_type", "Standard") == "Gold"
+        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
         current = (
             scrim.leaderboard_orientation
             if scrim is not None
@@ -5132,6 +5263,11 @@ async def _store_leaderboard_background(
 ) -> str:
     if not hasattr(channel, "send"):
         raise ValueError("The current channel cannot host the background image.")
+    orientation, team_count = _leaderboard_scrim_profile(scrim)
+    required_dimensions = leaderboard_canvas_dimensions(
+        team_count,
+        orientation,
+    )
     try:
         with Image.open(io.BytesIO(payload)) as source:
             image_format = source.format
@@ -5147,12 +5283,17 @@ async def _store_leaderboard_background(
                 raise ValueError(
                     "Image dimensions must be at least 64×64 and no larger than 40 megapixels."
                 )
-            image = ImageOps.exif_transpose(source).convert("RGB")
-            image.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
+            normalized = ImageOps.exif_transpose(source)
+            actual_dimensions = normalized.size
+            if actual_dimensions != required_dimensions:
+                raise LeaderboardBackgroundDimensionsError(
+                    actual_dimensions,
+                    required_dimensions,
+                )
+            image = normalized.convert("RGB")
     except (Image.DecompressionBombError, OSError) as error:
         raise ValueError("That file is not a supported image.") from error
 
-    orientation, team_count = _leaderboard_scrim_profile(scrim)
     profile_suffix = _leaderboard_profile_suffix(orientation, team_count)
     lock = _leaderboard_background_lock(scrim.id)
     async with lock:
@@ -5550,67 +5691,384 @@ async def admin_list(ctx: commands.Context) -> None:
     await send_private_command_feedback(ctx, message, silent=False)
 
 
-@bot.group(name="auth", invoke_without_command=True, hidden=True)
-@auth_admin_required()
-async def auth_command(ctx: commands.Context) -> None:
-    await send_private_command_feedback(
-        ctx,
-        "Use `!auth add <Guild_ID> <Days|unlimited>`, "
-        "`!auth remove <Guild_ID>`, or `!auth list`.",
-        silent=False,
+def build_auth_panel_embed() -> discord.Embed:
+    return discord.Embed(
+        title="💎 A.R.C. Authorization Manager",
+        description="Choose a version to view and manage its guild authorizations.",
+        color=discord.Color.blurple(),
     )
 
 
-@auth_command.command(name="add")
-@auth_admin_required()
-async def auth_add(
-    ctx: commands.Context, guild_id: int, duration: str
-) -> None:
-    normalized_duration = duration.strip().casefold()
-    if normalized_duration in {"0", "unlimited", "illimité", "illimite"}:
-        duration_days = 0
-    else:
-        try:
-            duration_days = int(normalized_duration)
-        except ValueError:
-            await send_private_command_feedback(
-                ctx,
-                "Duration must be a non-negative number of days or `unlimited`.",
-                silent=False,
+def authorization_time_left_text(
+    expires_at: datetime | None, duration_days: int
+) -> str:
+    if expires_at is None:
+        return "Unlimited" if duration_days == 0 else "Expiry unavailable"
+    expires_at = expires_at.astimezone(timezone.utc)
+    if expires_at <= datetime.now(timezone.utc):
+        return f"Expired on {expires_at.strftime('%Y-%m-%d %H:%M UTC')}"
+    return subscription_remaining_text(expires_at)
+
+
+async def build_auth_tier_embed(license_type: str) -> discord.Embed:
+    if license_type not in LICENSE_TYPES:
+        raise ValueError("Choose a Standard or Gold version.")
+    authorizations = repository.list_authorizations(
+        include_expired=True,
+        license_type=license_type,
+    )
+    embed = discord.Embed(
+        title=f"💎 {license_type} Version — Guild Authorizations",
+        color=(
+            discord.Color.gold()
+            if license_type == "Gold"
+            else discord.Color.green()
+        ),
+    )
+    if not authorizations:
+        embed.description = f"No guilds are assigned to the {license_type} version."
+        return embed
+
+    visible_authorizations = authorizations[:25]
+    names = await asyncio.gather(
+        *(
+            authorized_guild_name(guild_id)
+            for guild_id, _, _ in visible_authorizations
+        )
+    )
+    for (guild_id, expires_at, duration_days), name in zip(
+        visible_authorizations, names
+    ):
+        safe_name = discord.utils.escape_mentions(
+            discord.utils.escape_markdown(name or "Name unavailable")
+        )
+        embed.add_field(
+            name=f"Guild: {safe_name} (`{guild_id}`)"[:256],
+            value=f"**Time left:** {authorization_time_left_text(expires_at, duration_days)}",
+            inline=False,
+        )
+    if len(authorizations) > len(visible_authorizations):
+        embed.set_footer(
+            text=(
+                f"{len(authorizations) - len(visible_authorizations)} more guilds "
+                "are not shown. Remove accepts a guild ID."
+            )
+        )
+    return embed
+
+
+def parse_auth_duration(value: str) -> int:
+    normalized = value.strip().casefold()
+    if normalized in {"0", "unlimited", "illimité", "illimite"}:
+        return 0
+    try:
+        duration_days = int(normalized)
+    except ValueError as error:
+        raise ValueError(
+            "Duration must be a non-negative number of days or `unlimited`."
+        ) from error
+    if duration_days < 0:
+        raise ValueError(
+            "Duration must be a non-negative number of days or `unlimited`."
+        )
+    return duration_days
+
+
+class AuthAdminPanelView(DurableView):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.selected_tier: str | None = None
+        self.message: discord.Message | None = None
+        self.rebuild()
+
+    async def user_is_authorized(
+        self,
+        user: discord.abc.User,
+        *,
+        owner_only: bool = False,
+    ) -> bool:
+        if getattr(user, "id", None) != self.owner_id:
+            return False
+        is_owner = await bot.is_owner(user)
+        if owner_only:
+            return is_owner
+        return is_owner or repository.is_admin_authorized(user.id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This authorization panel belongs to another administrator.",
+                ephemeral=True,
+            )
+            return False
+        if not await self.user_is_authorized(interaction.user):
+            await interaction.response.send_message(
+                "You are no longer authorized to use this panel.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    def _add_button(
+        self,
+        label: str,
+        style: discord.ButtonStyle,
+        callback,
+    ) -> None:
+        button = discord.ui.Button(label=label, style=style)
+        button.callback = callback
+        self.add_item(button)
+
+    def rebuild(self) -> None:
+        self.clear_items()
+        if self.selected_tier is None:
+            for tier in LICENSE_TYPES:
+                async def select_tier(
+                    interaction: discord.Interaction,
+                    selected_tier: str = tier,
+                ) -> None:
+                    await self.show_tier(interaction, selected_tier)
+
+                self._add_button(
+                    tier,
+                    discord.ButtonStyle.primary,
+                    select_tier,
+                )
+
+            async def close_panel(interaction: discord.Interaction) -> None:
+                await interaction.response.edit_message(
+                    content="Authorization panel closed.",
+                    embed=None,
+                    view=None,
+                )
+
+            self._add_button(
+                "Close",
+                discord.ButtonStyle.secondary,
+                close_panel,
             )
             return
-    try:
-        replaced = repository.is_guild_authorized(guild_id)
-        repository.authorize_guild(guild_id, duration_days)
-    except ValueError as error:
-        await send_private_command_feedback(ctx, str(error), silent=False)
-        return
-    if duration_days == 0:
-        duration_label = "with unlimited access"
-    else:
-        duration_label = f"for {duration_days} day(s)"
-    message = (
-        f"Guild `{guild_id}` authorization was replaced {duration_label}."
-        if replaced
-        else f"Guild `{guild_id}` is now authorized {duration_label}."
-    )
-    await send_private_command_feedback(ctx, message, silent=False)
+
+        selected_tier = self.selected_tier
+
+        async def add_guild(interaction: discord.Interaction) -> None:
+            if not await self.user_is_authorized(
+                interaction.user,
+                owner_only=True,
+            ):
+                await interaction.response.send_message(
+                    "Only the bot owner can add or change a guild authorization.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_modal(
+                AuthAddGuildModal(self, selected_tier)
+            )
+
+        async def remove_guild(interaction: discord.Interaction) -> None:
+            await interaction.response.send_modal(
+                AuthRemoveGuildModal(self, selected_tier)
+            )
+
+        async def return_to_versions(interaction: discord.Interaction) -> None:
+            self.selected_tier = None
+            self.rebuild()
+            await interaction.response.edit_message(
+                content="",
+                embed=build_auth_panel_embed(),
+                view=self,
+            )
+
+        self._add_button("Add", discord.ButtonStyle.success, add_guild)
+        self._add_button("Remove", discord.ButtonStyle.danger, remove_guild)
+        self._add_button("Return", discord.ButtonStyle.secondary, return_to_versions)
+
+    async def show_tier(
+        self,
+        interaction: discord.Interaction,
+        license_type: str,
+    ) -> None:
+        self.selected_tier = license_type
+        self.rebuild()
+        await interaction.response.defer()
+        embed = await build_auth_tier_embed(license_type)
+        await interaction.edit_original_response(
+            content="",
+            embed=embed,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def refresh_panel(self) -> None:
+        if self.message is None or self.selected_tier is None:
+            return
+        try:
+            await self.message.edit(
+                content="",
+                embed=await build_auth_tier_embed(self.selected_tier),
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not refresh the authorization panel.")
+
+    async def on_timeout(self) -> None:
+        disable_view_items(self)
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
 
-@auth_command.command(name="remove")
+class AuthAddGuildModal(discord.ui.Modal):
+    def __init__(self, panel: AuthAdminPanelView, license_type: str):
+        super().__init__(title=f"Add {license_type} authorization", timeout=300)
+        self.panel = panel
+        self.license_type = license_type
+        self.guild_id_input = discord.ui.TextInput(
+            label="Guild ID",
+            placeholder="Enter the Discord server ID",
+            required=True,
+            max_length=20,
+        )
+        self.duration_input = discord.ui.TextInput(
+            label="Days or unlimited",
+            placeholder="For example: 30 or unlimited",
+            default="unlimited",
+            required=True,
+            max_length=24,
+        )
+        self.add_item(self.guild_id_input)
+        self.add_item(self.duration_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await self.panel.user_is_authorized(
+            interaction.user,
+            owner_only=True,
+        ):
+            await interaction.response.send_message(
+                "Only the bot owner can add or change a guild authorization.",
+                ephemeral=True,
+            )
+            return
+        try:
+            guild_id = int(str(self.guild_id_input.value).strip())
+            duration_days = parse_auth_duration(str(self.duration_input.value))
+            already_authorized = guild_id in repository.authorized_guild_ids
+            repository.authorize_guild(
+                guild_id,
+                duration_days,
+                license_type=self.license_type,
+            )
+        except (TypeError, ValueError) as error:
+            await interaction.response.send_message(
+                f"Could not authorize that guild: {error}",
+                ephemeral=True,
+            )
+            return
+        except SlotStorageError:
+            logger.exception("Could not save guild authorization.")
+            await interaction.response.send_message(
+                "The authorization could not be saved. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        duration_text = (
+            "with unlimited access"
+            if duration_days == 0
+            else f"for {duration_days} day(s)"
+        )
+        status = "updated" if already_authorized else "added"
+        await interaction.response.defer(ephemeral=True)
+        await self.panel.refresh_panel()
+        await interaction.followup.send(
+            f"Guild `{guild_id}` authorization {status} as **{self.license_type}** "
+            f"{duration_text}.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class AuthRemoveGuildModal(discord.ui.Modal):
+    def __init__(self, panel: AuthAdminPanelView, license_type: str):
+        super().__init__(title=f"Remove {license_type} authorization", timeout=300)
+        self.panel = panel
+        self.license_type = license_type
+        self.guild_id_input = discord.ui.TextInput(
+            label="Guild ID",
+            placeholder=f"Enter a {license_type} guild ID",
+            required=True,
+            max_length=20,
+        )
+        self.add_item(self.guild_id_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await self.panel.user_is_authorized(interaction.user):
+            await interaction.response.send_message(
+                "You are no longer authorized to use this panel.",
+                ephemeral=True,
+            )
+            return
+        try:
+            guild_id = int(str(self.guild_id_input.value).strip())
+            tier_authorizations = repository.list_authorizations(
+                include_expired=True,
+                license_type=self.license_type,
+            )
+        except (TypeError, ValueError) as error:
+            await interaction.response.send_message(
+                f"Could not remove that guild: {error}",
+                ephemeral=True,
+            )
+            return
+        if guild_id not in {item[0] for item in tier_authorizations}:
+            await interaction.response.send_message(
+                f"Guild `{guild_id}` is not assigned to the "
+                f"**{self.license_type}** version.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        try:
+            repository.revoke_guild(guild_id)
+        except (TypeError, ValueError) as error:
+            await interaction.response.send_message(
+                f"Could not remove that guild: {error}",
+                ephemeral=True,
+            )
+            return
+        except SlotStorageError:
+            logger.exception("Could not save guild revocation.")
+            await interaction.response.send_message(
+                "The authorization could not be removed. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await self.panel.refresh_panel()
+        await interaction.followup.send(
+            f"Guild `{guild_id}` was removed from the **{self.license_type}** version.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+@bot.command(name="auth", hidden=True)
 @auth_admin_required()
-async def auth_remove(ctx: commands.Context, guild_id: int) -> None:
-    try:
-        removed = repository.revoke_guild(guild_id)
-    except ValueError as error:
-        await send_private_command_feedback(ctx, str(error), silent=False)
-        return
-    message = (
-        f"Guild `{guild_id}` has been revoked."
-        if removed
-        else f"Guild `{guild_id}` was not authorized."
+async def auth_command(ctx: commands.Context) -> None:
+    view = AuthAdminPanelView(owner_id=ctx.author.id)
+    view.message = await send_private_command_feedback(
+        ctx,
+        "",
+        embed=build_auth_panel_embed(),
+        view=view,
+        delete_after=300,
+        silent=False,
     )
-    await send_private_command_feedback(ctx, message, silent=False)
 
 
 async def authorized_guild_name(guild_id: int) -> str | None:
@@ -5622,72 +6080,6 @@ async def authorized_guild_name(guild_id: int) -> str | None:
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
         return None
     return guild.name
-
-
-def build_auth_list_embed(
-    authorizations: list[tuple[int, datetime | None, int]],
-    names: dict[int, str | None],
-) -> discord.Embed:
-    """Render the bot-admin subscription list using the !sub embed style."""
-    if not authorizations:
-        embed = discord.Embed(
-            title="💎 **A.R.C. Subscription Status**",
-            color=discord.Color.red(),
-        )
-        embed.add_field(name="Status", value="🔴 Expired", inline=False)
-        embed.add_field(name="Time Remaining", value="No active subscriptions.", inline=False)
-        return embed
-
-    has_unlimited = any(
-        duration_days == 0 and expires_at is None
-        for _, expires_at, duration_days in authorizations
-    )
-    embed = discord.Embed(
-        title="💎 **A.R.C. Subscription Status**",
-        color=discord.Color.gold() if has_unlimited else discord.Color.green(),
-    )
-    for guild_id, expires_at, duration_days in authorizations[:25]:
-        name = names.get(guild_id) or "Name unavailable"
-        safe_name = discord.utils.escape_mentions(
-            discord.utils.escape_markdown(name)
-        )
-        if duration_days == 0 and expires_at is None:
-            status = "🟢 Active"
-            remaining = "♾️ Lifetime / Unlimited"
-        elif expires_at is not None and expires_at > datetime.now(timezone.utc):
-            status = "🟢 Active"
-            remaining = subscription_remaining_text(expires_at)
-        elif expires_at is not None:
-            status = "🔴 Expired"
-            remaining = f"Expired on {expires_at.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-        else:
-            status = "🔴 Expired"
-            remaining = "Expired"
-        embed.add_field(
-            name=f"{safe_name} (`{guild_id}`)",
-            value=f"**Status:** {status}\n**Time Remaining:** {remaining}",
-            inline=False,
-        )
-    if len(authorizations) > 25:
-        embed.set_footer(text=f"{len(authorizations) - 25} additional subscriptions not shown.")
-    return embed
-
-
-@auth_command.command(name="list")
-@auth_admin_required()
-async def auth_list(ctx: commands.Context) -> None:
-    authorizations = repository.list_authorizations()
-    names = {
-        guild_id: await authorized_guild_name(guild_id)
-        for guild_id, _, _ in authorizations
-    }
-    await send_private_command_feedback(
-        ctx,
-        "",
-        embed=build_auth_list_embed(authorizations, names),
-        view=SubscriptionStatusView(),
-        delete_after=60,
-    )
 
 
 @bot.event
@@ -6216,18 +6608,26 @@ def _fit_font(
 def leaderboard_canvas_dimensions(
     team_count: int,
     orientation: str,
-    header_height: int,
-    footer_height: int,
+    header_height: int | None = None,
+    footer_height: int | None = None,
 ) -> tuple[int, int]:
-    """Return the exact canvas size for a configured leaderboard."""
+    """Return canvas dimensions with the fixed header and footer bands."""
     if team_count not in LEADERBOARD_TEAM_COUNTS:
         raise ValueError("Choose 16, 18, 20, 22, or 24 teams.")
     if orientation not in LEADERBOARD_ORIENTATIONS:
         raise ValueError("Choose a vertical or horizontal layout.")
-    if header_height not in LEADERBOARD_HEADER_HEIGHTS:
-        raise ValueError("Choose a supported header height.")
-    if footer_height not in LEADERBOARD_FOOTER_HEIGHTS:
-        raise ValueError("Choose a supported footer height.")
+    if header_height not in (None, DEFAULT_LEADERBOARD_HEADER_HEIGHT):
+        raise ValueError(
+            f"Leaderboard header height is fixed at "
+            f"{DEFAULT_LEADERBOARD_HEADER_HEIGHT}px."
+        )
+    if footer_height not in (None, DEFAULT_LEADERBOARD_FOOTER_HEIGHT):
+        raise ValueError(
+            f"Leaderboard footer height is fixed at "
+            f"{DEFAULT_LEADERBOARD_FOOTER_HEIGHT}px."
+        )
+    header_height = DEFAULT_LEADERBOARD_HEADER_HEIGHT
+    footer_height = DEFAULT_LEADERBOARD_FOOTER_HEIGHT
     width = (
         LEADERBOARD_VERTICAL_WIDTH
         if orientation == "vertical"
@@ -6250,6 +6650,55 @@ def leaderboard_canvas_dimensions(
     return width, height
 
 
+def _build_empty_leaderboard_blueprint(scrim: Scrim) -> tuple[io.BytesIO, str]:
+    """Create an upload-ready empty canvas for the scrim's current profile."""
+    orientation, team_count = _leaderboard_scrim_profile(scrim)
+    width, height = leaderboard_canvas_dimensions(
+        team_count,
+        orientation,
+    )
+    header_height = DEFAULT_LEADERBOARD_HEADER_HEIGHT
+    with Image.open(LEADERBOARD_BACKGROUND) as background:
+        output = ImageOps.fit(
+            background.convert("RGB"),
+            (width, height),
+            method=Image.Resampling.LANCZOS,
+        ).convert("RGBA")
+
+    table_path = (
+        LEADERBOARD_TABLE_TEMPLATE_DIR
+        / f"table-{team_count}-{orientation}.png"
+    )
+    with Image.open(table_path) as table_template:
+        table_top = (
+            LEADERBOARD_OUTER_MARGIN
+            + header_height
+            + LEADERBOARD_SECTION_GAP
+        )
+        output.alpha_composite(
+            table_template.convert("RGBA"),
+            dest=(0, table_top),
+        )
+
+    with Image.open(LEADERBOARD_DATE_BADGE_TEMPLATE) as badge_template:
+        badge = badge_template.convert("RGBA")
+    badge_center_y = LEADERBOARD_OUTER_MARGIN + header_height // 2
+    badge_left = width - LEADERBOARD_OUTER_MARGIN - badge.width
+    output.alpha_composite(
+        badge,
+        dest=(badge_left, badge_center_y - badge.height // 2),
+    )
+
+    buffer = io.BytesIO()
+    output.convert("RGB").save(buffer, format="PNG", optimize=True)
+    buffer.seek(0)
+    filename = (
+        f"leaderboard-blueprint-{team_count}-{orientation}-"
+        f"{width}x{height}.png"
+    )
+    return buffer, filename
+
+
 def _build_configured_leaderboard_image(
     scrim: Scrim,
     rows: list[LeaderboardRow],
@@ -6266,28 +6715,17 @@ def _build_configured_leaderboard_image(
         "leaderboard_orientation",
         DEFAULT_LEADERBOARD_ORIENTATION,
     )
-    header_height = getattr(
-        scrim,
-        "leaderboard_header_height",
-        DEFAULT_LEADERBOARD_HEADER_HEIGHT,
-    )
-    footer_height = getattr(
-        scrim,
-        "leaderboard_footer_height",
-        DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
-    )
+    header_height = DEFAULT_LEADERBOARD_HEADER_HEIGHT
     if orientation == "horizontal":
-        config = repository.get_server_config(scrim.guild_id)
-        if getattr(config, "license_type", "Standard") != "Gold":
+        if repository.get_server_license_type(scrim.guild_id) != "Gold":
             orientation = "vertical"
 
     rows = rows[:team_limit]
     width, height = leaderboard_canvas_dimensions(
         team_limit,
         orientation,
-        header_height,
-        footer_height,
     )
+    footer_height = DEFAULT_LEADERBOARD_FOOTER_HEIGHT
     with Image.open(background_path) as source_background:
         output = ImageOps.fit(
             source_background.convert("RGB"),
@@ -6296,7 +6734,9 @@ def _build_configured_leaderboard_image(
         ).convert("RGBA")
     margin = LEADERBOARD_OUTER_MARGIN
     text = _leaderboard_accent_rgb(
-        getattr(
+        DEFAULT_LEADERBOARD_ACCENT_COLOR
+        if background_path == LEADERBOARD_BACKGROUND
+        else getattr(
             scrim,
             "leaderboard_accent_color",
             DEFAULT_LEADERBOARD_ACCENT_COLOR,

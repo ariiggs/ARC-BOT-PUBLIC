@@ -29,6 +29,8 @@ from main import (
 )
 from scrim_state import (
     DEFAULT_LEADERBOARD_ACCENT_COLOR,
+    DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
+    DEFAULT_LEADERBOARD_HEADER_HEIGHT,
     MatchScore,
     STATUS_CONFIRMED,
     LEADERBOARD_ORIENTATIONS,
@@ -197,7 +199,7 @@ class LeaderboardConfigurationTests(unittest.TestCase):
                 loaded.leaderboard_accent_colors,
                 {"vertical:18": "#A12BC3"},
             )
-            self.assertEqual(restored.payload()["version"], 29)
+            self.assertEqual(restored.payload()["version"], 31)
 
     def test_msg_panel_includes_results_template_editor(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -270,7 +272,7 @@ class LeaderboardConfigurationTests(unittest.TestCase):
         self.assertEqual(rows[0].slot_number, 17)
         self.assertNotIn(16, [row.slot_number for row in rows])
 
-    def test_settings_persist_and_dimensions_include_spacing_choices(self):
+    def test_settings_keep_fixed_header_footer_and_canvas_dimensions(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SlotStateStore(Path(directory) / "state.sqlite3")
             repository = ScrimRepository(store)
@@ -281,9 +283,19 @@ class LeaderboardConfigurationTests(unittest.TestCase):
                 123,
                 leaderboard_team_count=18,
                 leaderboard_orientation="vertical",
-                leaderboard_header_height=220,
-                leaderboard_footer_height=200,
             )
+            with self.assertRaisesRegex(ValueError, "fixed"):
+                repository.update_leaderboard_settings(
+                    scrim.id,
+                    123,
+                    leaderboard_header_height=220,
+                )
+            with self.assertRaisesRegex(ValueError, "fixed"):
+                repository.update_leaderboard_settings(
+                    scrim.id,
+                    123,
+                    leaderboard_footer_height=200,
+                )
 
             restored = ScrimRepository(store)
             restored.load()
@@ -291,17 +303,94 @@ class LeaderboardConfigurationTests(unittest.TestCase):
 
         self.assertEqual(settings.leaderboard_team_count, 18)
         self.assertEqual(settings.leaderboard_orientation, "vertical")
-        self.assertEqual(settings.leaderboard_header_height, 220)
-        self.assertEqual(settings.leaderboard_footer_height, 200)
         self.assertEqual(
-            leaderboard_canvas_dimensions(16, "vertical", 180, 120),
+            settings.leaderboard_header_height,
+            DEFAULT_LEADERBOARD_HEADER_HEIGHT,
+        )
+        self.assertEqual(
+            settings.leaderboard_footer_height,
+            DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
+        )
+        self.assertEqual(
+            leaderboard_canvas_dimensions(16, "vertical"),
             (1080, 1232),
         )
         self.assertEqual(
-            leaderboard_canvas_dimensions(16, "horizontal", 180, 120),
+            leaderboard_canvas_dimensions(16, "horizontal"),
             (1920, 848),
         )
         self.assertEqual(LEADERBOARD_ROW_HEIGHT, 48)
+
+    def test_v30_snapshot_migration_resets_custom_header_and_footer_heights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SlotStateStore(Path(directory) / "state.sqlite3")
+            repository = ScrimRepository(store)
+            scrim = repository.create(123, "Legacy Dimensions", 1001, 1002)
+            legacy = repository.payload()
+            legacy["version"] = 30
+            legacy["scrims"][0]["leaderboard_header_height"] = 220
+            legacy["scrims"][0]["leaderboard_footer_height"] = 200
+            store.save(legacy)
+
+            restored = ScrimRepository(store)
+            restored.load()
+            settings = restored.get(scrim.id)
+
+        self.assertEqual(
+            settings.leaderboard_header_height,
+            DEFAULT_LEADERBOARD_HEADER_HEIGHT,
+        )
+        self.assertEqual(
+            settings.leaderboard_footer_height,
+            DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
+        )
+        self.assertEqual(restored.payload()["version"], 31)
+
+    def test_first_slot_row_starts_at_same_height_in_both_orientations(self):
+        team_positions = {"vertical": {}, "horizontal": {}}
+        original_text = ImageDraw.ImageDraw.text
+
+        def capture_team_position(drawer, xy, text, *args, **kwargs):
+            if isinstance(text, str) and text.startswith("Team "):
+                team_positions[orientation][text] = xy[1]
+            return original_text(drawer, xy, text, *args, **kwargs)
+
+        rows = [
+            LeaderboardRow(number, f"Team {number:02d}", 1, 2, 16, 18)
+            for number in range(1, 17)
+        ]
+        for orientation in ("vertical", "horizontal"):
+            scrim = SimpleNamespace(
+                id="c" * 16,
+                guild_id=123,
+                timezone="UTC",
+                leaderboard_team_count=16,
+                leaderboard_orientation=orientation,
+                leaderboard_header_height=260,
+                leaderboard_footer_height=240,
+            )
+            with (
+                patch.object(
+                    ImageDraw.ImageDraw,
+                    "text",
+                    new=capture_team_position,
+                ),
+                patch(
+                    "main.repository.get_server_license_type",
+                    return_value="Gold",
+                ),
+            ):
+                image_buffer = build_leaderboard_image(scrim, rows)
+
+            with Image.open(image_buffer) as rendered:
+                self.assertEqual(
+                    rendered.size,
+                    leaderboard_canvas_dimensions(16, orientation),
+                )
+
+        self.assertEqual(team_positions["vertical"]["Team 01"], 318)
+        self.assertEqual(team_positions["horizontal"]["Team 01"], 318)
+        self.assertEqual(team_positions["horizontal"]["Team 09"], 318)
 
     def test_setres_uses_dashboard_and_leaderboard_submenus(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -327,6 +416,17 @@ class LeaderboardConfigurationTests(unittest.TestCase):
                     scrim_id=scrim.id,
                     background_url="https://cdn.discordapp.com/background.png",
                 )
+                with patch.object(
+                    repository,
+                    "get_server_license_type",
+                    return_value="Gold",
+                ):
+                    gold_edit_view = LeaderboardScrimEditView(
+                        owner_id=456,
+                        guild_id=123,
+                        scrim_id=scrim.id,
+                        background_url="https://cdn.discordapp.com/background.png",
+                    )
                 team_view = LeaderboardTeamCountView(
                     owner_id=456,
                     guild_id=123,
@@ -341,8 +441,8 @@ class LeaderboardConfigurationTests(unittest.TestCase):
                 )
                 with patch.object(
                     repository,
-                    "get_server_config",
-                    return_value=SimpleNamespace(license_type="Gold"),
+                    "get_server_license_type",
+                    return_value="Gold",
                 ):
                     gold_orientation_view = LeaderboardOrientationView(
                         owner_id=456,
@@ -371,9 +471,12 @@ class LeaderboardConfigurationTests(unittest.TestCase):
                 "Text Color",
                 "Restore Default Background",
                 "Back to Dashboard",
+                    "Blueprint",
             ],
         )
         self.assertTrue(edit_view.children[4].disabled)
+        self.assertTrue(edit_view.children[2].disabled)
+        self.assertFalse(gold_edit_view.children[2].disabled)
         fields = {field.name: field.value for field in edit_fields}
         self.assertEqual(fields["Teams to Display"], "24")
         self.assertIn("Built-in default", fields["Background"])

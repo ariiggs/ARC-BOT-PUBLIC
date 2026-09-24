@@ -416,6 +416,17 @@ class LeaderboardConfigurationTests(unittest.TestCase):
                     scrim_id=scrim.id,
                     background_url="https://cdn.discordapp.com/background.png",
                 )
+                with patch.object(
+                    repository,
+                    "get_server_license_type",
+                    return_value="Gold",
+                ):
+                    gold_edit_view = LeaderboardScrimEditView(
+                        owner_id=456,
+                        guild_id=123,
+                        scrim_id=scrim.id,
+                        background_url="https://cdn.discordapp.com/background.png",
+                    )
                 team_view = LeaderboardTeamCountView(
                     owner_id=456,
                     guild_id=123,
@@ -464,6 +475,8 @@ class LeaderboardConfigurationTests(unittest.TestCase):
             ],
         )
         self.assertTrue(edit_view.children[4].disabled)
+        self.assertTrue(edit_view.children[2].disabled)
+        self.assertFalse(gold_edit_view.children[2].disabled)
         fields = {field.name: field.value for field in edit_fields}
         self.assertEqual(fields["Teams to Display"], "24")
         self.assertIn("Built-in default", fields["Background"])

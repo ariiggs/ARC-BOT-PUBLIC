@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, patch
 
 from main import (
     SubscriptionStatusView,
-    auth_add,
     build_subscription_embed,
+    parse_auth_duration,
     support_link,
     subscription_status,
 )
@@ -124,19 +124,12 @@ class SubscriptionStatusTests(unittest.IsolatedAsyncioTestCase):
             "Bot Manager can view the subscription status.",
         )
 
-    async def test_auth_add_accepts_unlimited_and_illimite(self):
-        ctx = SimpleNamespace()
+    def test_auth_duration_accepts_days_and_unlimited(self):
+        self.assertEqual(parse_auth_duration("30"), 30)
         for value in ("unlimited", "illimité", "0"):
-            with (
-                patch("main.repository.is_guild_authorized", return_value=False),
-                patch("main.repository.authorize_guild") as authorize,
-                patch(
-                    "main.send_private_command_feedback",
-                    new=AsyncMock(),
-                ),
-            ):
-                await auth_add.callback(ctx, 123, value)
-                authorize.assert_called_once_with(123, 0)
+            self.assertEqual(parse_auth_duration(value), 0)
+        with self.assertRaises(ValueError):
+            parse_auth_duration("-1")
 
     def test_status_alias_is_registered(self):
         self.assertIn("status", subscription_status.aliases)

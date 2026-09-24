@@ -75,6 +75,34 @@ class GuildAuthorizationTests(unittest.TestCase):
             self.assertFalse(repository.is_guild_authorized(123))
             self.assertEqual(repository.list_authorizations(), [])
 
+    def test_authorization_listing_can_filter_tier_and_include_expired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScrimRepository(
+                SlotStateStore(Path(directory) / "state.sqlite3")
+            )
+            repository.load()
+            repository.authorize_guild(123, days=1, license_type="Standard")
+            repository.authorize_guild(456, days=30, license_type="Gold")
+            expired_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+            repository.authorized_guild_expires_at[123] = expired_at
+
+            self.assertEqual(
+                repository.list_authorizations(
+                    include_expired=True,
+                    license_type="Standard",
+                ),
+                [(123, expired_at, 1)],
+            )
+            self.assertEqual(
+                [
+                    guild_id
+                    for guild_id, _, _ in repository.list_authorizations(
+                        license_type="Gold"
+                    )
+                ],
+                [456],
+            )
+
     def test_unlimited_authorization_has_no_expiration(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = ScrimRepository(

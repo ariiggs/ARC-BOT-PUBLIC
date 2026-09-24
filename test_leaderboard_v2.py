@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, patch
 from PIL import Image, ImageDraw
 
 from main import (
+    LeaderboardBackgroundDimensionsError,
+    LeaderboardBlueprintOfferView,
     LeaderboardAccentColorModal,
     LeaderboardAccentColorView,
     LeaderboardRow,
@@ -19,6 +21,7 @@ from main import (
     OperationalMessageView,
     ResultsMessageModal,
     _current_leaderboard_background_path,
+    _build_empty_leaderboard_blueprint,
     _restore_default_leaderboard_background,
     _read_leaderboard_background_metadata,
     _record_match_scores,
@@ -44,6 +47,8 @@ from main import (
 )
 from scrim_state import (
     DEFAULT_LEADERBOARD_ACCENT_COLOR,
+    DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
+    DEFAULT_LEADERBOARD_HEADER_HEIGHT,
     MatchScore,
     MAX_MATCHES,
     STATUS_CONFIRMED,
@@ -254,7 +259,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 [MatchScore(1, 1, 7, 1)],
             )
 
-    def test_leaderboard_settings_persist_team_limit_layout_and_heights(self):
+    def test_leaderboard_settings_keep_fixed_header_and_footer_dimensions(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SlotStateStore(Path(directory) / "state.sqlite3")
             repository = ScrimRepository(store)
@@ -265,19 +270,60 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 123,
                 leaderboard_team_count=18,
                 leaderboard_orientation="vertical",
-                leaderboard_header_height=220,
-                leaderboard_footer_height=200,
                 leaderboard_accent_color="#FFD700",
             )
+            with self.assertRaisesRegex(ValueError, "fixed"):
+                repository.update_leaderboard_settings(
+                    scrim.id,
+                    123,
+                    leaderboard_header_height=220,
+                )
+            with self.assertRaisesRegex(ValueError, "fixed"):
+                repository.update_leaderboard_settings(
+                    scrim.id,
+                    123,
+                    leaderboard_footer_height=200,
+                )
 
             restored = ScrimRepository(store)
             restored.load()
             settings = restored.get(scrim.id)
             self.assertEqual(settings.leaderboard_team_count, 18)
             self.assertEqual(settings.leaderboard_orientation, "vertical")
-            self.assertEqual(settings.leaderboard_header_height, 220)
-            self.assertEqual(settings.leaderboard_footer_height, 200)
+            self.assertEqual(
+                settings.leaderboard_header_height,
+                DEFAULT_LEADERBOARD_HEADER_HEIGHT,
+            )
+            self.assertEqual(
+                settings.leaderboard_footer_height,
+                DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
+            )
             self.assertEqual(settings.leaderboard_accent_color, "#FFD700")
+
+    def test_v30_snapshot_migration_resets_custom_header_and_footer_heights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SlotStateStore(Path(directory) / "state.sqlite3")
+            repository = ScrimRepository(store)
+            scrim = repository.create(123, "Legacy Dimensions", 1001, 1002)
+            legacy = repository.payload()
+            legacy["version"] = 30
+            legacy["scrims"][0]["leaderboard_header_height"] = 220
+            legacy["scrims"][0]["leaderboard_footer_height"] = 200
+            store.save(legacy)
+
+            restored = ScrimRepository(store)
+            restored.load()
+            settings = restored.get(scrim.id)
+
+        self.assertEqual(
+            settings.leaderboard_header_height,
+            DEFAULT_LEADERBOARD_HEADER_HEIGHT,
+        )
+        self.assertEqual(
+            settings.leaderboard_footer_height,
+            DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
+        )
+        self.assertEqual(restored.payload()["version"], 31)
 
     def test_leaderboard_accent_color_rejects_nonstandard_hex(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -302,7 +348,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     _leaderboard_accent_rgb(invalid)
 
-    async def test_setres_scrim_selection_opens_accent_color_step(self):
+    async def test_setres_scrim_selection_opens_settings_menu(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = ScrimRepository(
                 SlotStateStore(Path(directory) / "state.sqlite3")
@@ -336,8 +382,10 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     await selector.callback(interaction)
 
             opened_view = interaction.edit_original_response.await_args.kwargs["view"]
-            self.assertIsInstance(opened_view, LeaderboardAccentColorView)
+            self.assertIsInstance(opened_view, LeaderboardScrimEditView)
             self.assertEqual(opened_view.scrim_id, selected_scrim.id)
+            self.assertEqual(opened_view.children[3].label, "Text Color")
+            self.assertTrue(opened_view.children[3].disabled)
 
     async def test_custom_hex_opens_modal_and_validates_before_saving(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -345,7 +393,14 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 SlotStateStore(Path(directory) / "state.sqlite3")
             )
             scrim = repository.create(123, "HEX Scrim", 1001, 1002)
-            with patch("main.repository", repository):
+            background_dir = Path(directory)
+            (background_dir / f"{scrim.id}-vertical-24.png").write_bytes(
+                b"custom background"
+            )
+            with (
+                patch("main.repository", repository),
+                patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", background_dir),
+            ):
                 color_view = LeaderboardAccentColorView(
                     owner_id=456,
                     guild_id=123,
@@ -435,6 +490,17 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     scrim_id=scrim.id,
                     background_url="https://cdn.discordapp.com/background.png",
                 )
+                with patch.object(
+                    repository,
+                    "get_server_license_type",
+                    return_value="Gold",
+                ):
+                    gold_edit_view = LeaderboardScrimEditView(
+                        owner_id=456,
+                        guild_id=123,
+                        scrim_id=scrim.id,
+                        background_url="https://cdn.discordapp.com/background.png",
+                    )
                 team_view = LeaderboardTeamCountView(
                     owner_id=456,
                     guild_id=123,
@@ -449,8 +515,8 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 )
                 with patch.object(
                     repository,
-                    "get_server_config",
-                    return_value=SimpleNamespace(license_type="Gold"),
+                    "get_server_license_type",
+                    return_value="Gold",
                 ):
                     gold_orientation_view = LeaderboardOrientationView(
                         owner_id=456,
@@ -486,9 +552,13 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     "Text Color",
                     "Restore Default Background",
                     "Back to Dashboard",
+                    "Blueprint",
                 ],
             )
             self.assertTrue(edit_view.children[4].disabled)
+            self.assertFalse(edit_view.children[6].disabled)
+            self.assertTrue(edit_view.children[2].disabled)
+            self.assertFalse(gold_edit_view.children[2].disabled)
             fields = {field.name: field.value for field in edit_fields}
             self.assertEqual(fields["Teams to Display"], "24")
             self.assertEqual(fields["Text Color"], "White (`#FFFFFF`)")
@@ -510,8 +580,8 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 ["Vertical", "Horizontal"],
             )
             self.assertEqual(
-                [option.label for option in color_view.children[0].options],
-                ["Neon Blue", "Gold", "Red", "White", "Custom HEX"],
+                [child.label for child in color_view.children],
+                ["Custom HEX", "Reset to White", "Back to Leaderboard"],
             )
             self.assertIn(HEX_COLOR_GENERATOR_URL, color_view.embed().description)
             self.assertEqual(color_modal.hex_code.min_length, 7)
@@ -563,7 +633,13 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
     async def test_background_upload_is_saved_and_rehosted_for_a_stable_link(self):
         scrim = self.make_scrim()
         payload = io.BytesIO()
-        Image.new("RGB", (128, 96), (25, 80, 140)).save(payload, format="PNG")
+        dimensions = leaderboard_canvas_dimensions(
+            scrim.leaderboard_team_count,
+            scrim.leaderboard_orientation,
+            getattr(scrim, "leaderboard_header_height", DEFAULT_LEADERBOARD_HEADER_HEIGHT),
+            getattr(scrim, "leaderboard_footer_height", DEFAULT_LEADERBOARD_FOOTER_HEIGHT),
+        )
+        Image.new("RGB", dimensions, (25, 80, 140)).save(payload, format="PNG")
 
         with tempfile.TemporaryDirectory() as directory:
             background_dir = Path(directory)
@@ -605,6 +681,67 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 "https://cdn.discordapp.com/current-background.png",
             )
             self.assertEqual(saved_metadata["attachment_url"], link)
+
+    async def test_background_upload_requires_exif_normalized_profile_dimensions(self):
+        scrim = self.make_scrim()
+        payload = io.BytesIO()
+        exif = Image.Exif()
+        exif[274] = 6
+        Image.new("RGB", (80, 100), (25, 80, 140)).save(
+            payload,
+            format="JPEG",
+            exif=exif,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", Path(directory)):
+                with self.assertRaises(
+                    LeaderboardBackgroundDimensionsError
+                ) as raised:
+                    await _store_leaderboard_background(
+                        scrim,
+                        SimpleNamespace(send=AsyncMock()),
+                        payload.getvalue(),
+                    )
+
+        self.assertEqual(raised.exception.actual, (100, 80))
+        self.assertEqual(
+            raised.exception.required,
+            leaderboard_canvas_dimensions(
+                scrim.leaderboard_team_count,
+                scrim.leaderboard_orientation,
+                getattr(scrim, "leaderboard_header_height", DEFAULT_LEADERBOARD_HEADER_HEIGHT),
+                getattr(scrim, "leaderboard_footer_height", DEFAULT_LEADERBOARD_FOOTER_HEIGHT),
+            ),
+        )
+        self.assertIn("100×80", str(raised.exception))
+
+    def test_blueprint_matches_current_leaderboard_canvas(self):
+        scrim = self.make_scrim()
+        buffer, filename = _build_empty_leaderboard_blueprint(scrim)
+        with Image.open(buffer) as blueprint:
+            self.assertEqual(
+                blueprint.size,
+                leaderboard_canvas_dimensions(
+                    scrim.leaderboard_team_count,
+                    scrim.leaderboard_orientation,
+                    getattr(scrim, "leaderboard_header_height", DEFAULT_LEADERBOARD_HEADER_HEIGHT),
+                    getattr(scrim, "leaderboard_footer_height", DEFAULT_LEADERBOARD_FOOTER_HEIGHT),
+                ),
+            )
+        self.assertIn(
+            f"{scrim.leaderboard_team_count}-{scrim.leaderboard_orientation}",
+            filename,
+        )
+        offer = LeaderboardBlueprintOfferView(
+            owner_id=456,
+            guild_id=scrim.guild_id,
+            scrim_id=scrim.id,
+        )
+        self.assertEqual(
+            [child.label for child in offer.children],
+            ["Yes, send blueprint", "No"],
+        )
 
     def test_text_color_overrides_are_scoped_to_orientation_and_team_count(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -703,13 +840,28 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 loaded.leaderboard_accent_colors,
                 {"vertical:18": "#A12BC3"},
             )
-            self.assertEqual(restored.payload()["version"], 29)
+            self.assertEqual(restored.payload()["version"], 31)
 
     async def test_backgrounds_and_preview_links_are_isolated_by_profile(self):
         scrim = self.make_scrim()
         scrim.leaderboard_team_count = 16
-        payload = io.BytesIO()
-        Image.new("RGB", (128, 96), (25, 80, 140)).save(payload, format="PNG")
+
+        def upload_payload(orientation):
+            dimensions = leaderboard_canvas_dimensions(
+                16,
+                orientation,
+                getattr(scrim, "leaderboard_header_height", DEFAULT_LEADERBOARD_HEADER_HEIGHT),
+                getattr(scrim, "leaderboard_footer_height", DEFAULT_LEADERBOARD_FOOTER_HEIGHT),
+            )
+            payload = io.BytesIO()
+            Image.new("RGB", dimensions, (25, 80, 140)).save(
+                payload,
+                format="PNG",
+            )
+            return payload.getvalue()
+
+        vertical_payload = upload_payload("vertical")
+        horizontal_payload = upload_payload("horizontal")
 
         class PreviewChannel:
             id = 555
@@ -739,7 +891,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 vertical_16_url = await _store_leaderboard_background(
                     scrim,
                     channel,
-                    payload.getvalue(),
+                    vertical_payload,
                 )
                 vertical_16_path = background_dir / f"{scrim.id}-vertical-16.png"
 
@@ -747,7 +899,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 horizontal_16_url = await _store_leaderboard_background(
                     scrim,
                     channel,
-                    payload.getvalue(),
+                    horizontal_payload,
                 )
                 horizontal_16_path = (
                     background_dir / f"{scrim.id}-horizontal-16.png"
@@ -969,7 +1121,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(loaded.match_scores, {})
             self.assertEqual(restored.get_server_config(123).license_type, "Standard")
-            self.assertEqual(restored.payload()["version"], 29)
+            self.assertEqual(restored.payload()["version"], 31)
 
     def test_v27_snapshot_migrates_default_accent_color(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -989,7 +1141,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 loaded.leaderboard_accent_color,
                 DEFAULT_LEADERBOARD_ACCENT_COLOR,
             )
-            self.assertEqual(restored.payload()["version"], 29)
+            self.assertEqual(restored.payload()["version"], 31)
 
     async def test_score_command_reports_processed_teams(self):
         scrim = self.make_scrim()
@@ -1148,8 +1300,8 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                         ),
                     ),
                     patch(
-                        "main.repository.get_server_config",
-                        return_value=SimpleNamespace(license_type="Gold"),
+                        "main.repository.get_server_license_type",
+                        return_value="Gold",
                     ),
                 ):
                     build_leaderboard_image(scrim, rows)
@@ -1163,9 +1315,15 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
     def test_leaderboard_text_color_changes_generated_text_only(self):
         scrim = self.make_scrim()
         rows = [LeaderboardRow(1, "Alpha", 1, 2, 16, 18)]
-        blue = build_leaderboard_image(scrim, rows)
-        scrim.leaderboard_accent_color = "#FFD700"
-        gold = build_leaderboard_image(scrim, rows)
+        with tempfile.TemporaryDirectory() as directory:
+            background_dir = Path(directory)
+            (background_dir / f"{scrim.id}-vertical-24.png").write_bytes(
+                LEADERBOARD_BACKGROUND.read_bytes()
+            )
+            with patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", background_dir):
+                blue = build_leaderboard_image(scrim, rows)
+                scrim.leaderboard_accent_color = "#FFD700"
+                gold = build_leaderboard_image(scrim, rows)
 
         self.assertNotEqual(blue.getvalue(), gold.getvalue())
         table_border_y = (
@@ -1194,6 +1352,49 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(LEADERBOARD_ROW_HEIGHT, 48)
         self.assertEqual(vertical_heights[-1] - vertical_heights[0], 8 * 48)
         self.assertEqual(horizontal_heights[-1] - horizontal_heights[0], 4 * 48)
+
+    def test_first_slot_row_starts_at_same_height_in_both_orientations(self):
+        team_positions = {"vertical": {}, "horizontal": {}}
+        original_text = ImageDraw.ImageDraw.text
+
+        def capture_team_position(drawer, xy, text, *args, **kwargs):
+            if isinstance(text, str) and text.startswith("Team "):
+                team_positions[orientation][text] = xy[1]
+            return original_text(drawer, xy, text, *args, **kwargs)
+
+        rows = [
+            LeaderboardRow(number, f"Team {number:02d}", 1, 2, 16, 18)
+            for number in range(1, 17)
+        ]
+        for orientation in ("vertical", "horizontal"):
+            scrim = self.make_scrim()
+            scrim.leaderboard_team_count = 16
+            scrim.leaderboard_orientation = orientation
+            # Simulate values retained by an older saved configuration.
+            scrim.leaderboard_header_height = 260
+            scrim.leaderboard_footer_height = 240
+            with (
+                patch.object(
+                    ImageDraw.ImageDraw,
+                    "text",
+                    new=capture_team_position,
+                ),
+                patch(
+                    "main.repository.get_server_license_type",
+                    return_value="Gold",
+                ),
+            ):
+                image_buffer = build_leaderboard_image(scrim, rows)
+
+            with Image.open(image_buffer) as rendered:
+                self.assertEqual(
+                    rendered.size,
+                    leaderboard_canvas_dimensions(16, orientation),
+                )
+
+        self.assertEqual(team_positions["vertical"]["Team 01"], 318)
+        self.assertEqual(team_positions["horizontal"]["Team 01"], 318)
+        self.assertEqual(team_positions["horizontal"]["Team 09"], 318)
 
     def test_static_dark_templates_include_all_configured_ranks(self):
         for orientation in ("vertical", "horizontal"):
@@ -1286,8 +1487,8 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
         scrim.leaderboard_orientation = "horizontal"
 
         with patch(
-            "main.repository.get_server_config",
-            return_value=SimpleNamespace(license_type="Gold"),
+            "main.repository.get_server_license_type",
+            return_value="Gold",
         ):
             buffer = build_leaderboard_image(
                 scrim,
