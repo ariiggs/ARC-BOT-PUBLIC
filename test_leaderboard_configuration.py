@@ -28,6 +28,8 @@ from main import (
 from scrim_state import (
     MatchScore,
     STATUS_CONFIRMED,
+    LEADERBOARD_ORIENTATIONS,
+    LEADERBOARD_TEAM_COUNTS,
     ScrimRepository,
     Slot,
     normalize_operational_messages,
@@ -374,6 +376,68 @@ class LeaderboardEmptyResultTests(unittest.IsolatedAsyncioTestCase):
                     rendered.size,
                     leaderboard_canvas_dimensions(24, "vertical", 180, 120),
                 )
+
+
+class LeaderboardScrimNameRenderingTests(unittest.TestCase):
+    @staticmethod
+    def make_scrim(name):
+        return SimpleNamespace(
+            id="c" * 16,
+            guild_id=123,
+            name=name,
+            slots={},
+            match_scores={},
+        )
+
+    def test_default_background_renders_scrim_name_for_each_layout(self):
+        scrim = self.make_scrim("Example Scrim")
+        unnamed_scrim = self.make_scrim("")
+
+        def header_pixels(image_buffer):
+            with Image.open(image_buffer) as rendered:
+                return rendered.crop((0, 0, rendered.width, 220)).tobytes()
+
+        with patch(
+            "main.repository.get_server_config",
+            return_value=SimpleNamespace(license_type="Gold"),
+        ):
+            for team_count in LEADERBOARD_TEAM_COUNTS:
+                for orientation in LEADERBOARD_ORIENTATIONS:
+                    scrim.leaderboard_team_count = team_count
+                    scrim.leaderboard_orientation = orientation
+                    unnamed_scrim.leaderboard_team_count = team_count
+                    unnamed_scrim.leaderboard_orientation = orientation
+                    with_name = build_leaderboard_image(scrim, [])
+                    without_name = build_leaderboard_image(unnamed_scrim, [])
+                    self.assertNotEqual(
+                        header_pixels(with_name),
+                        header_pixels(without_name),
+                        f"Missing default-background scrim name for "
+                        f"{team_count} teams, {orientation} layout",
+                    )
+
+    def test_custom_background_does_not_render_scrim_name(self):
+        scrim = self.make_scrim("Example Scrim")
+        unnamed_scrim = self.make_scrim("")
+
+        with tempfile.TemporaryDirectory() as directory:
+            custom_background = Path(directory) / "custom-background.png"
+            custom_background.write_bytes(LEADERBOARD_BACKGROUND.read_bytes())
+            with_name = build_leaderboard_image(
+                scrim,
+                [],
+                background_path=custom_background,
+            )
+            without_name = build_leaderboard_image(
+                unnamed_scrim,
+                [],
+                background_path=custom_background,
+            )
+
+        with Image.open(with_name) as named_image, Image.open(
+            without_name
+        ) as unnamed_image:
+            self.assertEqual(named_image.tobytes(), unnamed_image.tobytes())
 
 
 if __name__ == "__main__":

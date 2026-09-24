@@ -5691,6 +5691,42 @@ def _fit_font(
     return _load_font(min_size)
 
 
+def _fit_scrim_title(
+    draw: ImageDraw.ImageDraw,
+    scrim_name: str,
+    *,
+    max_width: int,
+    max_height: int,
+):
+    """Fit a scrim name into the built-in background's title area."""
+    title = scrim_name.strip()
+    if not title or max_width <= 0 or max_height <= 0:
+        return "", _load_font(12)
+
+    def font_for(value: str):
+        return _fit_font(
+            value,
+            max_width=max_width,
+            max_height=max_height,
+            max_size=40,
+            min_size=12,
+        )
+
+    font = font_for(title)
+    bounds = draw.textbbox((0, 0), title, font=font)
+    if bounds[2] - bounds[0] <= max_width:
+        return title, font
+
+    minimum_font = _load_font(12)
+    while title:
+        title = title[:-1].rstrip()
+        candidate = f"{title}…"
+        bounds = draw.textbbox((0, 0), candidate, font=minimum_font)
+        if bounds[2] - bounds[0] <= max_width:
+            return candidate, font_for(candidate)
+    return "…", minimum_font
+
+
 def leaderboard_canvas_dimensions(
     team_count: int,
     orientation: str,
@@ -5807,6 +5843,23 @@ def _build_configured_leaderboard_image(
         fill=text,
         anchor="mm",
     )
+    if background_path.resolve() == LEADERBOARD_BACKGROUND.resolve():
+        title_left = max(margin + 18, int(width * 0.08))
+        title_right = width - margin - date_width - 18
+        title, title_font = _fit_scrim_title(
+            draw,
+            str(getattr(scrim, "name", "") or ""),
+            max_width=title_right - title_left,
+            max_height=header_height - 16,
+        )
+        if title:
+            draw.text(
+                ((title_left + title_right) // 2, date_center_y),
+                title,
+                font=title_font,
+                fill=text,
+                anchor="mm",
+            )
 
     table_top = header_bottom + LEADERBOARD_SECTION_GAP
     columns = 2 if orientation == "horizontal" else 1
