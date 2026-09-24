@@ -2,21 +2,115 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+from PIL import Image
 from main import (
+    LeaderboardRow,
     LeaderboardOrientationView,
     LeaderboardScrimEditView,
     LeaderboardSettingsView,
     LeaderboardTeamCountView,
+    OperationalMessageView,
+    ResultsMessageModal,
+    LEADERBOARD_BACKGROUND,
+    LEADERBOARD_ROW_HEIGHT,
+    _current_leaderboard_background_path,
+    _read_leaderboard_background_metadata,
+    _restore_default_leaderboard_background,
+    _write_leaderboard_background_metadata,
+    bot,
+    build_leaderboard_image,
     calculate_leaderboard,
+    build_results_publication_message,
     leaderboard_canvas_dimensions,
 )
-from scrim_state import MatchScore, STATUS_CONFIRMED, ScrimRepository, Slot
+from scrim_state import (
+    MatchScore,
+    STATUS_CONFIRMED,
+    ScrimRepository,
+    Slot,
+    normalize_operational_messages,
+)
 from slot_storage import SlotStateStore
 
 
 class LeaderboardConfigurationTests(unittest.TestCase):
+    def test_results_publication_uses_template_and_missing_rank_defaults(self):
+        scrim = SimpleNamespace(
+            id="a" * 16,
+            name="Example",
+            slots={
+                1: SimpleNamespace(status=STATUS_CONFIRMED, team_name="Alpha"),
+            },
+            match_scores={},
+            operational_messages={
+                "publish_results": (
+                    "{scrim}|{team_count}|{match_count}|"
+                    "{top1_team}:{top1_points}:{top1_kills}:{top1_wins}|"
+                    "{top2_team}:{top2_points}:{top2_kills}:{top2_wins}"
+                )
+            },
+        )
+        rows = [LeaderboardRow(1, "Alpha", 2, 7, 10, 17)]
+
+        self.assertEqual(
+            build_results_publication_message(scrim, rows),
+            "Example|1|0|Alpha:17:7:2|—:0:0:0",
+        )
+
+    def test_results_template_rejects_unapproved_channel_placeholder(self):
+        with self.assertRaisesRegex(ValueError, "unsupported placeholder"):
+            normalize_operational_messages(
+                {"publish_results": "{channel}"}
+            )
+
+    def test_msg_panel_includes_results_template_editor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScrimRepository(
+                SlotStateStore(Path(directory) / "state.sqlite3")
+            )
+            scrim = repository.create(123, "Results", 1001, 1002)
+            with patch("main.repository", repository):
+                view = OperationalMessageView(
+                    owner_id=456,
+                    guild_id=123,
+                    selected_id=scrim.id,
+                )
+                modal = ResultsMessageModal(view)
+                labels = [
+                    item.label for item in view.children if hasattr(item, "label")
+                ]
+                fields = [field.name for field in view.embed().fields]
+
+        self.assertIn("Results", labels)
+        self.assertIn("Results publication", fields)
+        self.assertIn("{top1_team}", modal.template.default)
+
+    def test_rendered_leaderboard_changes_when_score_columns_change(self):
+        scrim = SimpleNamespace(
+            leaderboard_team_count=16,
+            leaderboard_orientation="vertical",
+            leaderboard_header_height=180,
+            leaderboard_footer_height=120,
+            timezone="UTC",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            background_path = Path(directory) / "white.png"
+            Image.new("RGB", (128, 128), (255, 255, 255)).save(background_path)
+            first = build_leaderboard_image(
+                scrim,
+                [LeaderboardRow(1, "Alpha", 1, 2, 16, 18)],
+                background_path=background_path,
+            )
+            second = build_leaderboard_image(
+                scrim,
+                [LeaderboardRow(1, "Alpha", 2, 5, 20, 25)],
+                background_path=background_path,
+            )
+
+        self.assertNotEqual(first.getvalue(), second.getvalue())
+
     def test_top_team_limit_is_independent_of_registered_slots(self):
         scrim = SimpleNamespace(
             kill_points_value=1,
@@ -73,6 +167,7 @@ class LeaderboardConfigurationTests(unittest.TestCase):
             leaderboard_canvas_dimensions(16, "horizontal", 180, 120),
             (1920, 848),
         )
+        self.assertEqual(LEADERBOARD_ROW_HEIGHT, 48)
 
     def test_setres_uses_dashboard_and_leaderboard_submenus(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -139,9 +234,11 @@ class LeaderboardConfigurationTests(unittest.TestCase):
                 "Teams to Display",
                 "Background",
                 "Orientation",
+                "Restore Default Background",
                 "Back to Dashboard",
             ],
         )
+        self.assertTrue(edit_view.children[3].disabled)
         fields = {field.name: field.value for field in edit_fields}
         self.assertEqual(fields["Teams to Display"], "24")
         self.assertIn("View current background", fields["Background"])
@@ -157,6 +254,126 @@ class LeaderboardConfigurationTests(unittest.TestCase):
             [option.label for option in gold_orientation_view.children[0].options],
             ["Vertical", "Horizontal"],
         )
+
+
+class LeaderboardBackgroundResetTests(unittest.IsolatedAsyncioTestCase):
+    def test_restore_default_button_tracks_custom_background_presence(self):
+        scrim_id = "a" * 16
+        with tempfile.TemporaryDirectory() as directory:
+            background_dir = Path(directory)
+            with patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", background_dir):
+                default_view = LeaderboardScrimEditView(
+                    owner_id=456,
+                    guild_id=123,
+                    scrim_id=scrim_id,
+                    background_url="",
+                )
+                self.assertTrue(default_view.children[3].disabled)
+
+                (background_dir / f"{scrim_id}.png").write_bytes(b"custom")
+                custom_view = LeaderboardScrimEditView(
+                    owner_id=456,
+                    guild_id=123,
+                    scrim_id=scrim_id,
+                    background_url="https://cdn.discordapp.com/custom.png",
+                )
+                self.assertFalse(custom_view.children[3].disabled)
+
+    async def test_restore_default_removes_custom_image_and_replaces_preview(self):
+        scrim = SimpleNamespace(id="b" * 16, guild_id=123, name="Example Scrim")
+        with tempfile.TemporaryDirectory() as directory:
+            background_dir = Path(directory)
+            custom_path = background_dir / f"{scrim.id}.png"
+            custom_path.write_bytes(b"custom background")
+            old_message = SimpleNamespace(deleted=False)
+
+            async def delete_old_message():
+                old_message.deleted = True
+
+            old_message.delete = delete_old_message
+
+            class OldPreviewChannel:
+                async def fetch_message(self, message_id):
+                    self.message_id = message_id
+                    return old_message
+
+            old_channel = OldPreviewChannel()
+
+            class PreviewChannel:
+                id = 555
+
+                def __init__(self):
+                    self.filename = None
+
+                async def send(self, **kwargs):
+                    self.filename = kwargs["file"].filename
+                    return SimpleNamespace(
+                        attachments=[
+                            SimpleNamespace(
+                                url="https://cdn.discordapp.com/default-background.png"
+                            )
+                        ],
+                        channel=self,
+                        id=777,
+                    )
+
+            channel = PreviewChannel()
+            with (
+                patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", background_dir),
+                patch("main.bot.get_channel", return_value=old_channel),
+            ):
+                _write_leaderboard_background_metadata(
+                    scrim.id,
+                    {
+                        "channel_id": 444,
+                        "message_id": 333,
+                        "attachment_url": "https://cdn.discordapp.com/custom.png",
+                    },
+                )
+                background_url = await _restore_default_leaderboard_background(
+                    scrim,
+                    channel,
+                )
+                metadata = _read_leaderboard_background_metadata(scrim.id)
+                current_path = _current_leaderboard_background_path(scrim)
+
+            self.assertEqual(
+                background_url,
+                "https://cdn.discordapp.com/default-background.png",
+            )
+            self.assertEqual(
+                channel.filename,
+                f"leaderboard-background-{scrim.id}.png",
+            )
+            self.assertFalse(custom_path.exists())
+            self.assertEqual(current_path, LEADERBOARD_BACKGROUND)
+            self.assertEqual(metadata["attachment_url"], background_url)
+            self.assertTrue(old_message.deleted)
+
+
+class LeaderboardEmptyResultTests(unittest.IsolatedAsyncioTestCase):
+    async def test_res_sends_an_empty_leaderboard_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScrimRepository(
+                SlotStateStore(Path(directory) / "state.sqlite3")
+            )
+            scrim = repository.create(123, "Empty Results", 1001, 1002)
+            ctx = SimpleNamespace(send=AsyncMock())
+
+            with (
+                patch("main.repository", repository),
+                patch("main.require_staff_scrim", new=AsyncMock(return_value=scrim)),
+            ):
+                await bot.get_command("res").callback(ctx)
+
+            ctx.send.assert_awaited_once()
+            image_file = ctx.send.await_args.kwargs["file"]
+            self.assertEqual(image_file.filename, "leaderboard.png")
+            with Image.open(image_file.fp) as rendered:
+                self.assertEqual(
+                    rendered.size,
+                    leaderboard_canvas_dimensions(24, "vertical", 180, 120),
+                )
 
 
 if __name__ == "__main__":

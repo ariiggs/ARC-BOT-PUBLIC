@@ -73,6 +73,7 @@ OPERATIONAL_MESSAGE_KEYS = (
     "close_registration",
     "open_slots",
     "close_slots",
+    "publish_results",
 )
 OPERATIONAL_MESSAGE_CONTEXTS = ("registration", "slots")
 DEFAULT_OPERATIONAL_MESSAGE_REFS: dict[str, dict[str, int]] = {}
@@ -81,6 +82,12 @@ DEFAULT_OPERATIONAL_MESSAGES = {
     "close_registration": "🔒 Registrations are now closed for **{scrim}**.",
     "open_slots": "✅ Slot confirmations are now open for **{scrim}**.",
     "close_slots": "🔒 Slot confirmations are now closed for **{scrim}**.",
+    "publish_results": (
+        "🏆 **{scrim} Results** · {team_count} teams · {match_count} matches\n"
+        "🥇 {top1_team} — {top1_points} pts\n"
+        "🥈 {top2_team} — {top2_points} pts\n"
+        "🥉 {top3_team} — {top3_points} pts"
+    ),
 }
 
 
@@ -111,7 +118,20 @@ def normalize_operational_messages(value: object) -> dict[str, str]:
             raise ValueError(
                 "Operational messages contain invalid placeholders."
             ) from error
-        if not fields.issubset({"scrim", "channel"}):
+        if key == "publish_results":
+            allowed_fields = {"scrim", "team_count", "match_count"}
+            allowed_fields.update(
+                f"top{rank}_{stat}"
+                for rank in range(1, 4)
+                for stat in ("team", "points", "kills", "wins")
+            )
+        else:
+            allowed_fields = {"scrim", "channel"}
+        if not fields.issubset(allowed_fields):
+            if key == "publish_results":
+                raise ValueError(
+                    "Results messages contain an unsupported placeholder."
+                )
             raise ValueError(
                 "Operational messages may only use {scrim} and {channel}."
             )
