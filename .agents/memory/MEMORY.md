@@ -10,4 +10,6 @@
 - [Global staff authorization](global-staff-authorization.md) — configure the Staff role once with !set; never duplicate it inside each scrim.
 - [GitHub mirror repositories](github-mirror-repositories.md) — sync the root bot to the private beta repo and the `A.R.C. Public/` copy to the public repo.
 - [GitHub source publication](github-source-publication.md) — publish current runtime files from the live workspace; stale or truncated transfer data can create conflict-marker syntax errors.
+- [GitHub terminal authentication](github-terminal-authentication.md) — Replit's GitHub integration does not authenticate shell Git; use the secure CLI/secret path before fetch or push.
 - [Cap Transfer authorization](cap-transfer-authorization.md) — Cap Transfer is optional; configured !cap commands require Pending or Confirmed, with staff/admin continuity.
+- [Leaderboard result publication](leaderboard-results-publication.md) — designer artwork owns title/footer; background and text color are isolated by orientation and team count.

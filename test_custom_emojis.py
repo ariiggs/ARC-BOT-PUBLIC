@@ -163,6 +163,8 @@ class CustomEmojiTests(unittest.TestCase):
                      "placement_points_string",
                      "leaderboard_layout",
                     "leaderboard_background",
+                    "leaderboard_accent_color",
+                    "leaderboard_accent_colors",
                     "leaderboard_team_count",
                     "leaderboard_orientation",
                     "leaderboard_header_height",
@@ -209,7 +211,7 @@ class CustomEmojiTests(unittest.TestCase):
                      "license_type",
                 },
             )
-            self.assertEqual(migrated.payload()["version"], 27)
+            self.assertEqual(migrated.payload()["version"], 29)
 
 
 if __name__ == "__main__":

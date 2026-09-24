@@ -48,6 +48,48 @@ DEFAULT_PLACEMENT_POINTS_STRING = "10 6 5 4 3 2 1"
 LEADERBOARD_LAYOUTS = ("1_col", "2_col")
 DEFAULT_LEADERBOARD_BACKGROUND = "reference"
 LEADERBOARD_BACKGROUNDS = ("reference", "legacy")
+LEADERBOARD_TEAM_COUNTS = (16, 18, 20, 22, 24)
+LEADERBOARD_ORIENTATIONS = ("vertical", "horizontal")
+LEADERBOARD_HEADER_HEIGHTS = (120, 160, 180, 220, 260)
+LEADERBOARD_FOOTER_HEIGHTS = (80, 120, 160, 200, 240)
+DEFAULT_LEADERBOARD_TEAM_COUNT = 24
+DEFAULT_LEADERBOARD_ORIENTATION = "vertical"
+DEFAULT_LEADERBOARD_HEADER_HEIGHT = 180
+DEFAULT_LEADERBOARD_FOOTER_HEIGHT = 120
+DEFAULT_LEADERBOARD_ACCENT_COLOR = "#FFFFFF"
+
+
+def leaderboard_profile_key(orientation: str, team_count: int) -> str:
+    if (
+        orientation not in LEADERBOARD_ORIENTATIONS
+        or type(team_count) is not int
+        or team_count not in LEADERBOARD_TEAM_COUNTS
+    ):
+        raise ValueError("Invalid leaderboard profile.")
+    return f"{orientation}:{team_count}"
+
+
+def normalize_leaderboard_accent_colors(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("Invalid leaderboard text color profiles.")
+    valid_keys = {
+        leaderboard_profile_key(orientation, team_count)
+        for orientation in LEADERBOARD_ORIENTATIONS
+        for team_count in LEADERBOARD_TEAM_COUNTS
+    }
+    normalized: dict[str, str] = {}
+    for key, color_hex in value.items():
+        if (
+            not isinstance(key, str)
+            or key not in valid_keys
+            or not isinstance(color_hex, str)
+            or re.fullmatch(r"#[0-9A-Fa-f]{6}", color_hex) is None
+        ):
+            raise ValueError("Invalid leaderboard text color profile.")
+        normalized[key] = color_hex.upper()
+    return normalized
+
+
 EMOJI_FIELDS = (
     "emoji_available",
     "emoji_reserved",
@@ -65,6 +107,7 @@ OPERATIONAL_MESSAGE_KEYS = (
     "close_registration",
     "open_slots",
     "close_slots",
+    "publish_results",
 )
 OPERATIONAL_MESSAGE_CONTEXTS = ("registration", "slots")
 DEFAULT_OPERATIONAL_MESSAGE_REFS: dict[str, dict[str, int]] = {}
@@ -73,6 +116,12 @@ DEFAULT_OPERATIONAL_MESSAGES = {
     "close_registration": "🔒 Registrations are now closed for **{scrim}**.",
     "open_slots": "✅ Slot confirmations are now open for **{scrim}**.",
     "close_slots": "🔒 Slot confirmations are now closed for **{scrim}**.",
+    "publish_results": (
+        "🏆 **{scrim} Results** · {team_count} teams · {match_count} matches\n"
+        "🥇 {top1_team} — {top1_points} pts\n"
+        "🥈 {top2_team} — {top2_points} pts\n"
+        "🥉 {top3_team} — {top3_points} pts"
+    ),
 }
 
 
@@ -103,7 +152,20 @@ def normalize_operational_messages(value: object) -> dict[str, str]:
             raise ValueError(
                 "Operational messages contain invalid placeholders."
             ) from error
-        if not fields.issubset({"scrim", "channel"}):
+        if key == "publish_results":
+            allowed_fields = {"scrim", "team_count", "match_count"}
+            allowed_fields.update(
+                f"top{rank}_{stat}"
+                for rank in range(1, 4)
+                for stat in ("team", "points", "kills", "wins")
+            )
+        else:
+            allowed_fields = {"scrim", "channel"}
+        if not fields.issubset(allowed_fields):
+            if key == "publish_results":
+                raise ValueError(
+                    "Results messages contain an unsupported placeholder."
+                )
             raise ValueError(
                 "Operational messages may only use {scrim} and {channel}."
             )
@@ -318,6 +380,12 @@ class Scrim:
     placement_points_string: str = DEFAULT_PLACEMENT_POINTS_STRING
     leaderboard_layout: str = "1_col"
     leaderboard_background: str = DEFAULT_LEADERBOARD_BACKGROUND
+    leaderboard_accent_color: str = DEFAULT_LEADERBOARD_ACCENT_COLOR
+    leaderboard_accent_colors: dict[str, str] = field(default_factory=dict)
+    leaderboard_team_count: int = DEFAULT_LEADERBOARD_TEAM_COUNT
+    leaderboard_orientation: str = DEFAULT_LEADERBOARD_ORIENTATION
+    leaderboard_header_height: int = DEFAULT_LEADERBOARD_HEADER_HEIGHT
+    leaderboard_footer_height: int = DEFAULT_LEADERBOARD_FOOTER_HEIGHT
     match_scores: dict[tuple[int, int], MatchScore] = field(default_factory=dict)
     pending_registrations: dict[str, RegistrationRequest] = field(
         default_factory=dict
@@ -370,6 +438,12 @@ class Scrim:
             "placement_points_string": self.placement_points_string,
             "leaderboard_layout": self.leaderboard_layout,
             "leaderboard_background": self.leaderboard_background,
+            "leaderboard_accent_color": self.leaderboard_accent_color,
+            "leaderboard_accent_colors": dict(self.leaderboard_accent_colors),
+            "leaderboard_team_count": self.leaderboard_team_count,
+            "leaderboard_orientation": self.leaderboard_orientation,
+            "leaderboard_header_height": self.leaderboard_header_height,
+            "leaderboard_footer_height": self.leaderboard_footer_height,
             "match_scores": [
                 asdict(score)
                 for _, score in sorted(self.match_scores.items())
@@ -760,7 +834,7 @@ class ScrimRepository:
 
     def payload(self) -> dict:
         return {
-            "version": 26,
+            "version": 29,
             "scrims": [s.payload() for s in self.scrims.values()],
             "server_configs": [
                 config.payload() for config in self.server_configs.values()
@@ -801,7 +875,7 @@ class ScrimRepository:
         try:
             version = payload.get("version")
             if type(version) is not int or version not in (
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29
             ):
                 raise ValueError("Unsupported snapshot version.")
             if not isinstance(payload["scrims"], list):
@@ -971,6 +1045,58 @@ class ScrimRepository:
                         "leaderboard_background",
                         DEFAULT_LEADERBOARD_BACKGROUND,
                     )
+                if payload["version"] < 27:
+                    values.setdefault(
+                        "leaderboard_team_count",
+                        DEFAULT_LEADERBOARD_TEAM_COUNT,
+                    )
+                    values.setdefault(
+                        "leaderboard_orientation",
+                        "horizontal"
+                        if values.get("leaderboard_layout") == "2_col"
+                        else DEFAULT_LEADERBOARD_ORIENTATION,
+                    )
+                    values.setdefault(
+                        "leaderboard_header_height",
+                        DEFAULT_LEADERBOARD_HEADER_HEIGHT,
+                    )
+                    values.setdefault(
+                        "leaderboard_footer_height",
+                        DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
+                    )
+                if payload["version"] < 28:
+                    values.setdefault(
+                        "leaderboard_accent_color",
+                        DEFAULT_LEADERBOARD_ACCENT_COLOR,
+                    )
+                if payload["version"] < 29:
+                    accent_colors = values.get("leaderboard_accent_colors", {})
+                    if not isinstance(accent_colors, dict):
+                        raise ValueError("Invalid leaderboard text color profiles.")
+                    legacy_accent = values.get(
+                        "leaderboard_accent_color",
+                        DEFAULT_LEADERBOARD_ACCENT_COLOR,
+                    )
+                    if legacy_accent != DEFAULT_LEADERBOARD_ACCENT_COLOR:
+                        profile_key = leaderboard_profile_key(
+                            values.get(
+                                "leaderboard_orientation",
+                                DEFAULT_LEADERBOARD_ORIENTATION,
+                            ),
+                            values.get(
+                                "leaderboard_team_count",
+                                DEFAULT_LEADERBOARD_TEAM_COUNT,
+                            ),
+                        )
+                        accent_colors.setdefault(profile_key, legacy_accent)
+                    if isinstance(legacy_accent, str):
+                        values["leaderboard_accent_color"] = legacy_accent.upper()
+                    values["leaderboard_accent_colors"] = accent_colors
+                values["leaderboard_accent_colors"] = (
+                    normalize_leaderboard_accent_colors(
+                        values.get("leaderboard_accent_colors", {})
+                    )
+                )
                 # Match selectors now support at most 25 games. Keep older
                 # snapshots usable by trimming only the newly unsupported tail.
                 if type(values.get("max_matches")) is int and values["max_matches"] > MAX_MATCHES:
@@ -1038,10 +1164,19 @@ class ScrimRepository:
                      "current_match_counter", "kill_points_value",
                      "placement_points_string", "leaderboard_layout",
                      "leaderboard_background",
+                      "leaderboard_accent_color",
+                      "leaderboard_accent_colors",
+                     "leaderboard_team_count", "leaderboard_orientation",
+                     "leaderboard_header_height", "leaderboard_footer_height",
                      "match_scores", "pending_registrations",
                 }:
                     raise ValueError("Invalid scrim fields.")
                 scrim = Scrim(**values)
+                scrim.leaderboard_accent_colors = (
+                    normalize_leaderboard_accent_colors(
+                        scrim.leaderboard_accent_colors
+                    )
+                )
                 try:
                     (
                         scrim.max_matches,
@@ -1143,6 +1278,19 @@ class ScrimRepository:
                     )
                     or scrim.leaderboard_layout not in LEADERBOARD_LAYOUTS
                     or scrim.leaderboard_background not in LEADERBOARD_BACKGROUNDS
+                    or not isinstance(scrim.leaderboard_accent_color, str)
+                    or re.fullmatch(
+                        r"#[0-9A-Fa-f]{6}",
+                        scrim.leaderboard_accent_color,
+                    ) is None
+                    or normalize_leaderboard_accent_colors(
+                        scrim.leaderboard_accent_colors
+                    )
+                    != scrim.leaderboard_accent_colors
+                    or scrim.leaderboard_team_count not in LEADERBOARD_TEAM_COUNTS
+                    or scrim.leaderboard_orientation not in LEADERBOARD_ORIENTATIONS
+                    or scrim.leaderboard_header_height not in LEADERBOARD_HEADER_HEIGHTS
+                    or scrim.leaderboard_footer_height not in LEADERBOARD_FOOTER_HEIGHTS
                 ):
                     raise ValueError("Invalid scrim identity or channel.")
                 name_key = (scrim.guild_id, scrim.name.casefold())
@@ -1316,7 +1464,7 @@ class ScrimRepository:
             except (KeyError, TypeError, ValueError) as error:
                 raise SlotStorageError("Invalid legacy snapshot; migration was stopped.") from error
             new_payload = {
-                "version": 26,
+                "version": 29,
                 "scrims": [],
                 "server_configs": [],
                 "idpw_configs": [],
@@ -1358,7 +1506,7 @@ class ScrimRepository:
         self.authorized_guild_expires_at = authorized_guild_expires_at
         self.authorized_guild_duration_days = authorized_guild_duration_days
         self.authorized_admin_ids = authorized_admin_ids
-        if payload.get("version", 0) < 26:
+        if payload.get("version", 0) < 29:
             self.store.save(self.payload())
 
     @contextmanager
@@ -1421,6 +1569,10 @@ class ScrimRepository:
                     "placement_points_string",
                     "leaderboard_layout",
                     "leaderboard_background",
+                    "leaderboard_team_count",
+                    "leaderboard_orientation",
+                    "leaderboard_header_height",
+                    "leaderboard_footer_height",
                     "match_scores",
                     "pending_registrations",
                 ):
@@ -1620,6 +1772,11 @@ class ScrimRepository:
         placement_points_string: str | object = _UNSET,
         leaderboard_layout: str | object = _UNSET,
         leaderboard_background: str | object = _UNSET,
+        leaderboard_accent_color: str | object = _UNSET,
+        leaderboard_team_count: int | object = _UNSET,
+        leaderboard_orientation: str | object = _UNSET,
+        leaderboard_header_height: int | object = _UNSET,
+        leaderboard_footer_height: int | object = _UNSET,
     ) -> Scrim:
         scrim = self.get(scrim_id)
         if scrim is None or scrim.guild_id != guild_id:
@@ -1644,19 +1801,85 @@ class ScrimRepository:
             if leaderboard_background is _UNSET
             else leaderboard_background
         )
+        next_accent_color = (
+            scrim.leaderboard_accent_color
+            if leaderboard_accent_color is _UNSET
+            else leaderboard_accent_color
+        )
+        if isinstance(next_accent_color, str):
+            next_accent_color = next_accent_color.upper()
+        next_accent_colors = normalize_leaderboard_accent_colors(
+            scrim.leaderboard_accent_colors
+        )
+        next_team_count = (
+            scrim.leaderboard_team_count
+            if leaderboard_team_count is _UNSET
+            else leaderboard_team_count
+        )
+        if leaderboard_orientation is _UNSET:
+            next_orientation = scrim.leaderboard_orientation
+            if leaderboard_layout is not _UNSET:
+                next_orientation = (
+                    "horizontal" if next_layout == "2_col" else "vertical"
+                )
+        else:
+            next_orientation = leaderboard_orientation
+        next_header_height = (
+            scrim.leaderboard_header_height
+            if leaderboard_header_height is _UNSET
+            else leaderboard_header_height
+        )
+        next_footer_height = (
+            scrim.leaderboard_footer_height
+            if leaderboard_footer_height is _UNSET
+            else leaderboard_footer_height
+        )
         if (
             type(next_kill_points) is not int
             or next_kill_points < 0
             or not parse_placement_points(next_placement_points)
             or next_layout not in LEADERBOARD_LAYOUTS
             or next_background not in LEADERBOARD_BACKGROUNDS
+            or not isinstance(next_accent_color, str)
+            or re.fullmatch(r"#[0-9A-F]{6}", next_accent_color) is None
+            or next_team_count not in LEADERBOARD_TEAM_COUNTS
+            or next_orientation not in LEADERBOARD_ORIENTATIONS
+            or next_header_height not in LEADERBOARD_HEADER_HEIGHTS
+            or next_footer_height not in LEADERBOARD_FOOTER_HEIGHTS
         ):
             raise ValueError("Invalid leaderboard configuration.")
+        active_profile_key = leaderboard_profile_key(
+            next_orientation,
+            next_team_count,
+        )
+        if leaderboard_accent_color is not _UNSET:
+            if next_accent_color == DEFAULT_LEADERBOARD_ACCENT_COLOR:
+                next_accent_colors.pop(active_profile_key, None)
+            else:
+                next_accent_colors[active_profile_key] = next_accent_color
+        next_accent_color = next_accent_colors.get(
+            active_profile_key,
+            DEFAULT_LEADERBOARD_ACCENT_COLOR,
+        )
+        if (
+            next_orientation == "horizontal"
+            and getattr(self.server_configs.get(guild_id), "license_type", "Standard")
+            != "Gold"
+        ):
+            raise ValueError("Horizontal layout requires a Gold license.")
         with self.transaction():
             scrim.kill_points_value = next_kill_points
             scrim.placement_points_string = next_placement_points
-            scrim.leaderboard_layout = next_layout
+            scrim.leaderboard_layout = (
+                "2_col" if next_orientation == "horizontal" else "1_col"
+            )
             scrim.leaderboard_background = next_background
+            scrim.leaderboard_accent_color = next_accent_color
+            scrim.leaderboard_accent_colors = next_accent_colors
+            scrim.leaderboard_team_count = next_team_count
+            scrim.leaderboard_orientation = next_orientation
+            scrim.leaderboard_header_height = next_header_height
+            scrim.leaderboard_footer_height = next_footer_height
         return scrim
 
     def get_match_scores(self, scrim_id: str) -> list[MatchScore]:

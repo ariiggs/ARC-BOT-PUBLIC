@@ -165,7 +165,7 @@ class GuildAuthorizationTests(unittest.TestCase):
             migrated = ScrimRepository(store)
             migrated.load()
             self.assertEqual(migrated.list_authorized_admin_ids(), [])
-            self.assertEqual(migrated.payload()["version"], 18)
+            self.assertEqual(migrated.payload()["version"], 29)
 
 
 if __name__ == "__main__":

@@ -210,3 +210,395 @@ mtime_ms = 1790156714128
 storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/c3e435e6-a03b-47e7-a8ca-5a0a4b32014a/e605a896-5ae0-4a57-89b8-802acd864e35"
 storage_version_token = "1790156730012751"
 content_type = "image/png"
+
+[[outputs]]
+id = "mQjNzXDU0XSCw3Tds0GU3"
+uri = "file://exports/leaderboard-24-team-white-preview.png"
+type = "image"
+title = "White 24-Team Leaderboard Preview"
+description = "Single white-background 24-team sample with fictional match results and pixel dimensions for every selectable team count."
+logical_id = "c9ef8f3c-482c-4d91-92cb-2733538d5a3b"
+content_hash = "sha256:3e2bed0ca1c873220d43c8b188cf7ee5c23e3ec74ec5348854ec9042cd58db7b"
+size = 159312
+mtime_ms = 1790245710094
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/c9ef8f3c-482c-4d91-92cb-2733538d5a3b/db87832a-5ac1-4586-ac7c-07b6daed0531"
+storage_version_token = "1790245783334066"
+content_type = "image/png"
+
+[[outputs]]
+id = "xgA2ebjUeoxFXjs89WLHH"
+uri = "file://exports/leaderboard-24-team-vertical-preview.png"
+type = "image"
+title = "Vertical leaderboard sizing preview"
+description = "Restored to the attached dimensions: 48px body rows and board heights from 1232px at 16 teams to 1616px at 24 teams."
+logical_id = "e8cabb4d-d1cf-427d-b64b-b6b97c0eb4e3"
+content_hash = "sha256:656fb6f49bd8711951e3cd86d44d3a6f75e2e128dd99f65a9708e605144352a2"
+size = 60947
+mtime_ms = 1790248444582
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/e8cabb4d-d1cf-427d-b64b-b6b97c0eb4e3/cfd0447a-7c76-4af0-b961-356399746910"
+storage_version_token = "1790248487694223"
+content_type = "image/png"
+
+[[outputs]]
+id = "naq6VDl5D0IUN8-UrkAUJ"
+uri = "file://exports/leaderboard-24-team-horizontal-preview.png"
+type = "image"
+title = "Horizontal leaderboard sizing preview"
+description = "Restored to the attached dimensions: 48px body rows and board heights from 848px at 16 teams to 1040px at 24 teams."
+logical_id = "5471e655-596b-4679-b63c-030f77643026"
+content_hash = "sha256:e62e63fc7f891aab82f54191c69e771b92317f692c3a40c5d36e74602c7c857b"
+size = 40326
+mtime_ms = 1790248444686
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/5471e655-596b-4679-b63c-030f77643026/feae966a-8d97-43d3-81f4-b141ccc7a52a"
+storage_version_token = "1790248488673884"
+content_type = "image/png"
+
+[[outputs]]
+id = "7QcpwzCjl7iUW6L5vgDrp"
+uri = "file://exports/default-background-scrim-name-vertical-preview.png"
+type = "image"
+title = "Default background — vertical preview"
+description = "24-team vertical board with the sample scrim name in the default header."
+logical_id = "073ef467-1754-48cd-91fe-cff33f8bcd0b"
+content_hash = "sha256:bbdcd2751ec0bdb3ebfcac70c40e3d46b84acb62b3609c66979585f6107aa4d6"
+size = 113821
+mtime_ms = 1790250798908
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/073ef467-1754-48cd-91fe-cff33f8bcd0b/8076be60-fe6d-4ad2-8afc-738095d2fb63"
+storage_version_token = "1790250821124688"
+content_type = "image/png"
+
+[[outputs]]
+id = "WIlEhbs9YIE77f7UIbL8f"
+uri = "file://exports/default-background-scrim-name-horizontal-preview.png"
+type = "image"
+title = "Default background — horizontal preview"
+description = "24-team horizontal board with the same sample scrim name in the default header."
+logical_id = "66ed965c-1018-454e-bcd9-ef298115cccb"
+content_hash = "sha256:e8a928717a6cc07b015f01008098b9be4bc0614e452ee304dffbe83935476dc7"
+size = 82117
+mtime_ms = 1790250799205
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/66ed965c-1018-454e-bcd9-ef298115cccb/80da64b6-e0ac-47c5-b4f4-eedfcd149239"
+storage_version_token = "1790250822136230"
+content_type = "image/png"
+
+[[outputs]]
+id = "QnhZ6inN6c64dsuyq0ooD"
+uri = "file://exports/default-background-20-team-title-proposal.png"
+type = "image"
+title = "20-team default-background title proposal"
+description = "Preview only: BETA in DejaVu Sans Regular at 48 px, with 20 fictitious teams and sample scores. No bot code changed."
+logical_id = "b39eebe3-3984-4fa9-914e-926ffc504e34"
+content_hash = "sha256:213c6a1b117b2a318babeb74298e0fd7868d70767ed33624863c44e272d81d96"
+size = 98103
+mtime_ms = 1790252791986
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/b39eebe3-3984-4fa9-914e-926ffc504e34/0ba2d4ac-bd44-4478-905f-e805bb168926"
+storage_version_token = "1790252819385066"
+content_type = "image/png"
+
+[[outputs]]
+id = "7t_jI5__FNmm_RbQx6Rwe"
+uri = "file://exports/leaderboard-20-team-montserrat-preview.png"
+type = "image"
+title = "Aperçu du classement — Montserrat"
+description = "Rendu généré avec le code du bot : Montserrat ExtraBold pour BETA, Bold pour les noms et scores, Regular pour les en-têtes et la date. Les 20 équipes et résultats sont fictifs."
+logical_id = "5c732545-6152-4438-9070-a91832ca8b3b"
+content_hash = "sha256:1d2f04556143a114e985523290a014bb0936fb2a5fead5b8b5ced64afee518df"
+size = 109694
+mtime_ms = 1790254144581
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/5c732545-6152-4438-9070-a91832ca8b3b/b69bd319-75ad-4f01-b84c-29adee18de5f"
+storage_version_token = "1790254283623227"
+content_type = "image/png"
+
+[[outputs]]
+id = "u_Y36lPCS5-R_NwgrF7Ch"
+uri = "file://exports/leaderboard-blueprints/leaderboard-blueprints-overview.png"
+type = "image"
+title = "Dark leaderboard blueprint overview"
+description = "Overview of all 10 dark, empty leaderboard canvases with native dimensions."
+logical_id = "881aef66-3a44-4e09-acdd-528a82bc1a2e"
+content_hash = "sha256:03bcb2be8df61fca7146681a8517577a43388d323103d18b89ab475ee9751427"
+size = 169689
+mtime_ms = 1790272207766
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/881aef66-3a44-4e09-acdd-528a82bc1a2e/ebcfeb31-ac5c-491f-83ea-3a70f3fc95a2"
+storage_version_token = "1790272391217390"
+content_type = "image/png"
+
+[[outputs]]
+id = "_1gpiPWn3pBhwGPvh7ope"
+uri = "file://exports/leaderboard-blueprints/leaderboard-16-team-vertical-blueprint.png"
+type = "image"
+title = "16 teams — vertical blueprint"
+description = "Empty annotated guide; native design area 1080 × 1232 px at 1:1 scale, with measurement arrows outside the canvas."
+logical_id = "7502d00a-790f-44bc-8025-6738b986cf4d"
+content_hash = "sha256:43c2cdefd4b5f24ece096b7c254e236a8357e5d106be50a5f46f42e3da0a13a1"
+size = 40095
+mtime_ms = 1790271012934
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/7502d00a-790f-44bc-8025-6738b986cf4d/31886272-0521-4080-b8e7-cbcd2a865d8d"
+storage_version_token = "1790271085802301"
+content_type = "image/png"
+
+[[outputs]]
+id = "VaLx4-3_w_NDNInPfMUfG"
+uri = "file://exports/leaderboard-blueprints/leaderboard-18-team-vertical-blueprint.png"
+type = "image"
+title = "18 teams — vertical blueprint"
+description = "Empty annotated guide; native design area 1080 × 1328 px at 1:1 scale, with measurement arrows outside the canvas."
+logical_id = "67e9a389-e2cc-4722-ad8a-748d166fd898"
+content_hash = "sha256:03bbb27ccb1e6ee187b1ecd1bdae697fa514887decc775912e1eb926a02c980a"
+size = 40778
+mtime_ms = 1790271013054
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/67e9a389-e2cc-4722-ad8a-748d166fd898/fbd8c694-2df8-4cee-aab3-a7252fc3b325"
+storage_version_token = "1790271086767960"
+content_type = "image/png"
+
+[[outputs]]
+id = "gxOEFtFJoR9D9ESqzwr8Y"
+uri = "file://exports/leaderboard-blueprints/leaderboard-20-team-vertical-blueprint.png"
+type = "image"
+title = "20 teams — vertical blueprint"
+description = "Empty annotated guide; native design area 1080 × 1424 px at 1:1 scale, with measurement arrows outside the canvas."
+logical_id = "05f2fca7-7e9d-4ab7-81a4-79d74209398a"
+content_hash = "sha256:616cc32e7479e06d343be36679f468cfbdf8679b817fc91426aea3304ebf24d8"
+size = 41398
+mtime_ms = 1790271013182
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/05f2fca7-7e9d-4ab7-81a4-79d74209398a/1c30c8cb-f0d3-420e-a34b-44282b904f86"
+storage_version_token = "1790271087664103"
+content_type = "image/png"
+
+[[outputs]]
+id = "K1LNyyZaVR9D3ybd8O21-"
+uri = "file://exports/leaderboard-blueprints/leaderboard-22-team-vertical-blueprint.png"
+type = "image"
+title = "22 teams — vertical blueprint"
+description = "Empty annotated guide; native design area 1080 × 1520 px at 1:1 scale, with measurement arrows outside the canvas."
+logical_id = "d3c33c2e-7f3a-438d-9661-8994b1ea1ecf"
+content_hash = "sha256:73bcf6860a73818725afd8a661726672722abbc23db343921be508efcddccb46"
+size = 41613
+mtime_ms = 1790271013326
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/d3c33c2e-7f3a-438d-9661-8994b1ea1ecf/8eb4bda9-d5f3-442b-9fac-55147840aefd"
+storage_version_token = "1790271088802440"
+content_type = "image/png"
+
+[[outputs]]
+id = "Ns7YyvizTFdcokKyK1kHr"
+uri = "file://exports/leaderboard-blueprints/leaderboard-24-team-vertical-blueprint.png"
+type = "image"
+title = "24-team vertical blueprint"
+description = "Dimensioned dark blueprint with fixed headings and ranks; date, names, and scores are blank."
+logical_id = "483b7b9f-67ee-4826-8e9a-ab6f4996b839"
+content_hash = "sha256:3599cbf11e0a19b20ad4b930590ac28a82af9999492b4c033533262917e603ce"
+size = 58774
+mtime_ms = 1790272205638
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/483b7b9f-67ee-4826-8e9a-ab6f4996b839/ec103bd9-5d7a-46b4-b1d3-fe6fd1c0c7cc"
+storage_version_token = "1790272392190779"
+content_type = "image/png"
+
+[[outputs]]
+id = "87GfQ3vV9sSZYCzerS4x-"
+uri = "file://exports/leaderboard-blueprints/leaderboard-16-team-horizontal-blueprint.png"
+type = "image"
+title = "16 teams — horizontal blueprint"
+description = "Empty annotated guide; native design area 1920 × 848 px at 1:1 scale, with measurement arrows outside the canvas."
+logical_id = "d247b25b-22b7-431d-86fd-0fc39ce42cbe"
+content_hash = "sha256:f38e07a205c9dfb0e24829c9c992739fd96acc7b464d1ff08b9ad6870c92fdc3"
+size = 42893
+mtime_ms = 1790271013702
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/d247b25b-22b7-431d-86fd-0fc39ce42cbe/bf234215-8acb-4eca-9241-ef7e7e58fa1e"
+storage_version_token = "1790271090786284"
+content_type = "image/png"
+
+[[outputs]]
+id = "KVei5atrfSxsHqm2h0tN6"
+uri = "file://exports/leaderboard-blueprints/leaderboard-18-team-horizontal-blueprint.png"
+type = "image"
+title = "18 teams — horizontal blueprint"
+description = "Empty annotated guide; native design area 1920 × 896 px at 1:1 scale, with measurement arrows outside the canvas."
+logical_id = "2017533e-eaba-47ba-8dd7-5eea31d7f8bf"
+content_hash = "sha256:2cdbbf0364f7c9e5a1610ced1f31cfc25db133cb83d919018506719ea5e3754c"
+size = 43742
+mtime_ms = 1790271013870
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/2017533e-eaba-47ba-8dd7-5eea31d7f8bf/c857d04d-cea0-423b-a3cd-855cc24ca5fb"
+storage_version_token = "1790271091628194"
+content_type = "image/png"
+
+[[outputs]]
+id = "zmFjYa-G6_BszPlmr2R92"
+uri = "file://exports/leaderboard-blueprints/leaderboard-20-team-horizontal-blueprint.png"
+type = "image"
+title = "20 teams — horizontal blueprint"
+description = "Empty annotated guide; native design area 1920 × 944 px at 1:1 scale, with measurement arrows outside the canvas."
+logical_id = "4675f479-cc03-434b-bbbc-c56aafcdaf36"
+content_hash = "sha256:9b82c9b8de38f27add75beaedd027ac3085615fec424bb06794040b84840203e"
+size = 43614
+mtime_ms = 1790271014086
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/4675f479-cc03-434b-bbbc-c56aafcdaf36/8e3859c3-38af-4421-93dc-6d2f2d78504f"
+storage_version_token = "1790271092483373"
+content_type = "image/png"
+
+[[outputs]]
+id = "_3P8_aP1D1LWBRhNuIK_f"
+uri = "file://exports/leaderboard-blueprints/leaderboard-22-team-horizontal-blueprint.png"
+type = "image"
+title = "22 teams — horizontal blueprint"
+description = "Empty annotated guide; native design area 1920 × 992 px at 1:1 scale, with measurement arrows outside the canvas."
+logical_id = "6409c940-c969-4b0f-939c-408895a93d89"
+content_hash = "sha256:80f6fc4443434d355371a2f3251e900866c9d779e8365123f78bf8828aaa4c64"
+size = 43539
+mtime_ms = 1790271014310
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/6409c940-c969-4b0f-939c-408895a93d89/622fdf1c-0d66-4ca8-84b5-ddb87a6202f8"
+storage_version_token = "1790271093343541"
+content_type = "image/png"
+
+[[outputs]]
+id = "2ZShjq_ycJFHy204oinAN"
+uri = "file://exports/leaderboard-blueprints/leaderboard-24-team-horizontal-blueprint.png"
+type = "image"
+title = "24-team horizontal blueprint"
+description = "Dimensioned dark blueprint with two static rank columns and empty dynamic fields."
+logical_id = "b004b1fb-004a-4245-bc3f-b45ee61bf942"
+content_hash = "sha256:ba1346c842efb8eed09451aa8732a0ae68b95f4a2f09d4934d9c4fe3063917a1"
+size = 57247
+mtime_ms = 1790272207186
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/b004b1fb-004a-4245-bc3f-b45ee61bf942/6375a258-e212-457f-b5f0-f4f73fef9999"
+storage_version_token = "1790272393362148"
+content_type = "image/png"
+
+[[outputs]]
+id = "js8xXgu0EEhZrxvXcjsFW"
+uri = "file://exports/leaderboard-blueprints/empty-canvases/leaderboard-16-team-vertical-empty.png"
+type = "image"
+title = "16-team vertical empty canvas"
+description = "Exact-size dark canvas with static labels and ranks; date, team names, and scores are left empty."
+logical_id = "caa2d2c1-0926-4c8b-8073-d02af909504c"
+content_hash = "sha256:0c79c676f321126746a0d281e2472ebc1f577ce7adbbc0daccb4f3c55b6480f2"
+size = 27041
+mtime_ms = 1790272204154
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/caa2d2c1-0926-4c8b-8073-d02af909504c/d542de4f-fef3-4349-b9a0-58b4a3cb9921"
+storage_version_token = "1790272394521241"
+content_type = "image/png"
+
+[[outputs]]
+id = "kTzROqvplhhYBVBoDovov"
+uri = "file://exports/leaderboard-blueprints/empty-canvases/leaderboard-18-team-vertical-empty.png"
+type = "image"
+title = "18-team vertical empty canvas"
+description = "Exact-size dark canvas with static labels and ranks; date, team names, and scores are left empty."
+logical_id = "122d8423-c153-437e-9944-348e594b8583"
+content_hash = "sha256:a74ac521f4525f2dade2e76315634ae7e6b977bc88ebcf5eb611abe945fd54a1"
+size = 28815
+mtime_ms = 1790272204466
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/122d8423-c153-437e-9944-348e594b8583/533c375f-e9c7-4a0a-9bc8-d40cbfa6db69"
+storage_version_token = "1790272396487160"
+content_type = "image/png"
+
+[[outputs]]
+id = "mgmGjLMY6YO5qCJwIyuz-"
+uri = "file://exports/leaderboard-blueprints/empty-canvases/leaderboard-20-team-vertical-empty.png"
+type = "image"
+title = "20-team vertical empty canvas"
+description = "Exact-size dark canvas with static labels and ranks; date, team names, and scores are left empty."
+logical_id = "4fc112be-b054-499f-b78c-33b08cc9ff5f"
+content_hash = "sha256:949621b4d1b58303485a5e18ab4449dd091cbfc26d566f55178e42786dd37bd1"
+size = 31359
+mtime_ms = 1790272204810
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/4fc112be-b054-499f-b78c-33b08cc9ff5f/7ef2e63a-0432-47fe-9ef1-9e2d7fa2a821"
+storage_version_token = "1790272398211959"
+content_type = "image/png"
+
+[[outputs]]
+id = "zyA4LYnTev-a7jFvNLr09"
+uri = "file://exports/leaderboard-blueprints/empty-canvases/leaderboard-22-team-vertical-empty.png"
+type = "image"
+title = "22-team vertical empty canvas"
+description = "Exact-size dark canvas with static labels and ranks; date, team names, and scores are left empty."
+logical_id = "462ba2c1-ba45-47bf-ba21-a9bf2201681a"
+content_hash = "sha256:ecc6e2d5746fb5e3559a09833ca634d85045869fa7300134048ffd6246c46516"
+size = 33133
+mtime_ms = 1790272205154
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/462ba2c1-ba45-47bf-ba21-a9bf2201681a/176d7e72-7048-4df0-b1aa-c3b3ecfd6bdb"
+storage_version_token = "1790272400012248"
+content_type = "image/png"
+
+[[outputs]]
+id = "_Kl7eHyaoGLEzbE1FW69H"
+uri = "file://exports/leaderboard-blueprints/empty-canvases/leaderboard-24-team-vertical-empty.png"
+type = "image"
+title = "24-team vertical empty canvas"
+description = "Exact-size dark canvas with static labels and ranks; date, team names, and scores are left empty."
+logical_id = "c7668275-6bfa-4ffe-a202-dc63a7b603fb"
+content_hash = "sha256:a20c2c2667ad0912fd9bdd480011b1b7e98abb07a6fcc8af976d9ba128663385"
+size = 34926
+mtime_ms = 1790272205518
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/c7668275-6bfa-4ffe-a202-dc63a7b603fb/fdc33df1-b33f-4acc-a33a-ea76f7a9bca0"
+storage_version_token = "1790272401901688"
+content_type = "image/png"
+
+[[outputs]]
+id = "v-Zwcpb_fVD8g08z9gl7H"
+uri = "file://exports/leaderboard-blueprints/empty-canvases/leaderboard-16-team-horizontal-empty.png"
+type = "image"
+title = "16-team horizontal empty canvas"
+description = "Exact-size dark canvas with static labels and ranks; date, team names, and scores are left empty."
+logical_id = "bafd8dc2-fb17-486e-8e5c-ed6bff409f43"
+content_hash = "sha256:3d389ec2b3dd6d57a2c1a18fa5fbfe038a5b8eedfd25bc1c0ea1602c7a2c4603"
+size = 22830
+mtime_ms = 1790272205806
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/bafd8dc2-fb17-486e-8e5c-ed6bff409f43/5fdc176d-6ad5-4a75-9a72-596c21520d85"
+storage_version_token = "1790272395467354"
+content_type = "image/png"
+
+[[outputs]]
+id = "KlRpKb2hdlVQ-Ynt_W6jC"
+uri = "file://exports/leaderboard-blueprints/empty-canvases/leaderboard-18-team-horizontal-empty.png"
+type = "image"
+title = "18-team horizontal empty canvas"
+description = "Exact-size dark canvas with static labels and ranks; date, team names, and scores are left empty."
+logical_id = "106824e4-40ad-4e17-949d-21ac269add59"
+content_hash = "sha256:992d13253f95090c65cd4ec188a695e82c2c5ce8b97a205749210b63a974f460"
+size = 24860
+mtime_ms = 1790272206114
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/106824e4-40ad-4e17-949d-21ac269add59/a1e9fb20-db99-4207-8f8b-063f897fb01f"
+storage_version_token = "1790272397348769"
+content_type = "image/png"
+
+[[outputs]]
+id = "_lWaB18lt-p3hCEoVN8aO"
+uri = "file://exports/leaderboard-blueprints/empty-canvases/leaderboard-20-team-horizontal-empty.png"
+type = "image"
+title = "20-team horizontal empty canvas"
+description = "Exact-size dark canvas with static labels and ranks; date, team names, and scores are left empty."
+logical_id = "5e1f671b-3d1a-4efb-bbf4-6ea9be040308"
+content_hash = "sha256:e055405af3f1e872f9d89ce3553aa42f83e257ed088bc1e7767d34674ab8f8fc"
+size = 23988
+mtime_ms = 1790272206418
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/5e1f671b-3d1a-4efb-bbf4-6ea9be040308/f107ff72-b6e6-4e21-93ba-5c25daf174ab"
+storage_version_token = "1790272399112633"
+content_type = "image/png"
+
+[[outputs]]
+id = "DBgjM0rcEysowtyYj742r"
+uri = "file://exports/leaderboard-blueprints/empty-canvases/leaderboard-22-team-horizontal-empty.png"
+type = "image"
+title = "22-team horizontal empty canvas"
+description = "Exact-size dark canvas with static labels and ranks; date, team names, and scores are left empty."
+logical_id = "8bacb2ae-5c5d-4187-b13e-5313c05712a4"
+content_hash = "sha256:3c82a496fa6ed9cc9492eb06b337a7ebbeef241d9835e31972ebeee3c3b0ab0d"
+size = 27946
+mtime_ms = 1790272206742
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/8bacb2ae-5c5d-4187-b13e-5313c05712a4/877eae8f-2c7d-439b-b3fd-0ed542c8c259"
+storage_version_token = "1790272400903132"
+content_type = "image/png"
+
+[[outputs]]
+id = "qErkH97KXciWzZhs1ptkk"
+uri = "file://exports/leaderboard-blueprints/empty-canvases/leaderboard-24-team-horizontal-empty.png"
+type = "image"
+title = "24-team horizontal empty canvas"
+description = "Exact-size dark canvas with static labels and ranks; date, team names, and scores are left empty."
+logical_id = "378a5015-110d-40e1-ab1a-164e551052f0"
+content_hash = "sha256:7b6561f83f6bc096d5d151aca81a9b1b5ed9d65365ca0283f06854aa9200546a"
+size = 29428
+mtime_ms = 1790272207074
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/378a5015-110d-40e1-ab1a-164e551052f0/954f607f-953a-4915-84e1-a5cf0515abbf"
+storage_version_token = "1790272402820709"
+content_type = "image/png"

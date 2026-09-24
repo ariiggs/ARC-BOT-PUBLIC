@@ -25,6 +25,7 @@ from scrim_state import (
     STATUS_CONFIRMED,
     STATUS_PENDING,
     STATUS_RESERVED,
+    DEFAULT_LEADERBOARD_ACCENT_COLOR,
     DEFAULT_PLACEMENT_POINTS_STRING,
     DEFAULT_OPERATIONAL_MESSAGES,
     DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
@@ -59,6 +60,12 @@ SUPPORT_SERVER_URL = "https://discord.gg/S8uaGEJGv8"
 LEADERBOARD_BACKGROUND = (
     Path(__file__).parent / "assets" / "leaderboard-background.png"
 )
+LEADERBOARD_TABLE_TEMPLATE_DIR = (
+    Path(__file__).parent / "assets" / "leaderboard-templates"
+)
+LEADERBOARD_DATE_BADGE_TEMPLATE = (
+    LEADERBOARD_TABLE_TEMPLATE_DIR / "date-badge.png"
+)
 LEADERBOARD_FONT_PATH = (
     Path(__file__).parent / "assets" / "fonts" / "Montserrat[wght].ttf"
 )
@@ -78,6 +85,33 @@ LEADERBOARD_OUTER_MARGIN = 28
 LEADERBOARD_SECTION_GAP = 22
 LEADERBOARD_TABLE_HEADER_HEIGHT = 64
 LEADERBOARD_ROW_HEIGHT = 48
+LEADERBOARD_ACCENT_COLOR_OPTIONS = (
+    ("Neon Blue", "#00AEFF"),
+    ("Gold", "#FFD700"),
+    ("Red", "#FF4655"),
+    ("White", "#FFFFFF"),
+)
+HEX_COLOR_GENERATOR_URL = "https://htmlcolorcodes.com/color-picker/"
+
+
+def _leaderboard_accent_rgb(color_hex: str) -> tuple[int, int, int]:
+    if (
+        not isinstance(color_hex, str)
+        or re.fullmatch(r"#[0-9A-Fa-f]{6}", color_hex) is None
+    ):
+        raise ValueError("Text colors must use the #RRGGBB HEX format.")
+    return tuple(
+        int(color_hex[offset : offset + 2], 16)
+        for offset in (1, 3, 5)
+    )
+
+
+def _leaderboard_accent_label(color_hex: str) -> str:
+    normalized = color_hex.upper()
+    for name, option_hex in LEADERBOARD_ACCENT_COLOR_OPTIONS:
+        if normalized == option_hex:
+            return f"{name} (`{normalized}`)"
+    return f"Custom HEX (`{normalized}`)"
 
 state_store = SlotStateStore(
     os.getenv("SLOTS_DB_PATH", str(Path(__file__).parent / "data" / "slots.sqlite3"))
@@ -3628,20 +3662,56 @@ _register_specific_score_commands()
 _leaderboard_background_locks: dict[str, asyncio.Lock] = {}
 
 
-def _leaderboard_background_path(scrim_id: str) -> Path:
+def _leaderboard_profile_suffix(orientation: str, team_count: int) -> str:
+    if (
+        orientation not in LEADERBOARD_ORIENTATIONS
+        or type(team_count) is not int
+        or team_count not in LEADERBOARD_TEAM_COUNTS
+    ):
+        raise ValueError("Invalid leaderboard profile for a background.")
+    return f"{orientation}-{team_count}"
+
+
+def _leaderboard_background_path(
+    scrim_id: str,
+    orientation: str | None = None,
+    team_count: int | None = None,
+) -> Path:
     if not re.fullmatch(r"[a-f0-9]{16}", scrim_id):
         raise ValueError("Invalid scrim id for a leaderboard background.")
-    return LEADERBOARD_BACKGROUND_UPLOAD_DIR / f"{scrim_id}.png"
+    if orientation is None and team_count is None:
+        return LEADERBOARD_BACKGROUND_UPLOAD_DIR / f"{scrim_id}.png"
+    if orientation is None or team_count is None:
+        raise ValueError("Both orientation and team count are required.")
+    suffix = _leaderboard_profile_suffix(orientation, team_count)
+    return LEADERBOARD_BACKGROUND_UPLOAD_DIR / f"{scrim_id}-{suffix}.png"
 
 
-def _leaderboard_background_metadata_path(scrim_id: str) -> Path:
+def _leaderboard_background_metadata_path(
+    scrim_id: str,
+    orientation: str | None = None,
+    team_count: int | None = None,
+) -> Path:
     if not re.fullmatch(r"[a-f0-9]{16}", scrim_id):
         raise ValueError("Invalid scrim id for a leaderboard background.")
-    return LEADERBOARD_BACKGROUND_UPLOAD_DIR / f"{scrim_id}.json"
+    if orientation is None and team_count is None:
+        return LEADERBOARD_BACKGROUND_UPLOAD_DIR / f"{scrim_id}.json"
+    if orientation is None or team_count is None:
+        raise ValueError("Both orientation and team count are required.")
+    suffix = _leaderboard_profile_suffix(orientation, team_count)
+    return LEADERBOARD_BACKGROUND_UPLOAD_DIR / f"{scrim_id}-{suffix}.json"
 
 
-def _read_leaderboard_background_metadata(scrim_id: str) -> dict[str, object]:
-    path = _leaderboard_background_metadata_path(scrim_id)
+def _read_leaderboard_background_metadata(
+    scrim_id: str,
+    orientation: str | None = None,
+    team_count: int | None = None,
+) -> dict[str, object]:
+    path = _leaderboard_background_metadata_path(
+        scrim_id,
+        orientation,
+        team_count,
+    )
     if not path.exists():
         return {}
     try:
@@ -3656,8 +3726,14 @@ def _read_leaderboard_background_metadata(scrim_id: str) -> dict[str, object]:
 def _write_leaderboard_background_metadata(
     scrim_id: str,
     metadata: dict[str, object],
+    orientation: str | None = None,
+    team_count: int | None = None,
 ) -> None:
-    path = _leaderboard_background_metadata_path(scrim_id)
+    path = _leaderboard_background_metadata_path(
+        scrim_id,
+        orientation,
+        team_count,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
     temporary_path.write_text(
@@ -3667,8 +3743,81 @@ def _write_leaderboard_background_metadata(
     os.replace(temporary_path, path)
 
 
+def _leaderboard_scrim_profile(scrim: Scrim) -> tuple[str, int]:
+    return (
+        getattr(
+            scrim,
+            "leaderboard_orientation",
+            DEFAULT_LEADERBOARD_ORIENTATION,
+        ),
+        getattr(
+            scrim,
+            "leaderboard_team_count",
+            DEFAULT_LEADERBOARD_TEAM_COUNT,
+        ),
+    )
+
+
+def _migrate_legacy_leaderboard_background(scrim: Scrim) -> None:
+    legacy_image_path = _leaderboard_background_path(scrim.id)
+    legacy_metadata_path = _leaderboard_background_metadata_path(scrim.id)
+    if not legacy_image_path.exists() and not legacy_metadata_path.exists():
+        return
+
+    orientation, team_count = _leaderboard_scrim_profile(scrim)
+    profile_image_path = _leaderboard_background_path(
+        scrim.id,
+        orientation,
+        team_count,
+    )
+    profile_metadata_path = _leaderboard_background_metadata_path(
+        scrim.id,
+        orientation,
+        team_count,
+    )
+    profile_image_existed = profile_image_path.exists()
+    metadata_to_migrate = None
+    if (
+        not profile_image_existed
+        and not profile_metadata_path.exists()
+        and legacy_metadata_path.exists()
+    ):
+        metadata_to_migrate = _read_leaderboard_background_metadata(scrim.id)
+
+    profile_image_path.parent.mkdir(parents=True, exist_ok=True)
+    if legacy_image_path.exists():
+        if not profile_image_existed:
+            os.replace(legacy_image_path, profile_image_path)
+        else:
+            legacy_image_path.unlink()
+    if metadata_to_migrate is not None:
+        _write_leaderboard_background_metadata(
+            scrim.id,
+            metadata_to_migrate,
+            orientation,
+            team_count,
+        )
+    legacy_metadata_path.unlink(missing_ok=True)
+
+
+def _current_leaderboard_background_metadata(scrim: Scrim) -> dict[str, object]:
+    _migrate_legacy_leaderboard_background(scrim)
+    orientation, team_count = _leaderboard_scrim_profile(scrim)
+    return _read_leaderboard_background_metadata(
+        scrim.id,
+        orientation,
+        team_count,
+    )
+
+
 def _current_leaderboard_background_path(scrim: Scrim) -> Path:
-    custom_path = _leaderboard_background_path(scrim.id)
+    _migrate_legacy_leaderboard_background(scrim)
+    orientation, team_count = _leaderboard_scrim_profile(scrim)
+    custom_path = _leaderboard_background_path(
+        scrim.id,
+        orientation,
+        team_count,
+    )
     return custom_path if custom_path.is_file() else LEADERBOARD_BACKGROUND
 
 
@@ -3705,7 +3854,7 @@ async def _ensure_leaderboard_background_preview(
 ) -> str:
     """Return a durable Discord CDN link for this scrim's current background."""
     async with _leaderboard_background_lock(scrim.id):
-        metadata = _read_leaderboard_background_metadata(scrim.id)
+        metadata = _current_leaderboard_background_metadata(scrim)
         channel_id = metadata.get("channel_id")
         message_id = metadata.get("message_id")
         if type(channel_id) is int and type(message_id) is int:
@@ -3728,15 +3877,21 @@ async def _ensure_leaderboard_background_preview(
         if not hasattr(channel, "send"):
             raise ValueError("The current channel cannot host a background preview.")
         background_path = _current_leaderboard_background_path(scrim)
+        orientation, team_count = _leaderboard_scrim_profile(scrim)
+        profile_suffix = _leaderboard_profile_suffix(
+            orientation,
+            team_count,
+        )
         preview_file = discord.File(
             background_path,
-            filename=f"leaderboard-background-{scrim.id}.png",
+            filename=f"leaderboard-background-{scrim.id}-{profile_suffix}.png",
         )
         try:
             preview = await channel.send(
                 content=(
                     "Current leaderboard background for "
-                    f"**{discord.utils.escape_markdown(scrim.name)}**"
+                    f"**{discord.utils.escape_markdown(scrim.name)}** "
+                    f"({orientation}, {team_count} teams)"
                 ),
                 file=preview_file,
                 allowed_mentions=discord.AllowedMentions.none(),
@@ -3753,6 +3908,8 @@ async def _ensure_leaderboard_background_preview(
                 "message_id": preview.id,
                 "attachment_url": attachment_url,
             },
+            orientation,
+            team_count,
         )
         return attachment_url
 
@@ -3913,7 +4070,7 @@ class LeaderboardSettingsView(LeaderboardPanelView):
                     scrims[0],
                     interaction.channel,
                 )
-                view = LeaderboardScrimEditView(
+                view = LeaderboardAccentColorView(
                     owner_id=self.owner_id,
                     guild_id=self.guild_id,
                     scrim_id=scrims[0].id,
@@ -4029,7 +4186,7 @@ class LeaderboardScrimSelectView(LeaderboardPanelView):
                 selected,
                 interaction.channel,
             )
-            view = LeaderboardScrimEditView(
+            view = LeaderboardAccentColorView(
                 owner_id=self.owner_id,
                 guild_id=self.guild_id,
                 scrim_id=selected.id,
@@ -4106,22 +4263,34 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         orientation = scrim.leaderboard_orientation
         if orientation == "horizontal" and not is_gold:
             orientation = "vertical"
-        saved_background_url = _read_leaderboard_background_metadata(
-            self.scrim_id
-        ).get("attachment_url")
+        background_metadata = _current_leaderboard_background_metadata(scrim)
+        saved_background_url = background_metadata.get("attachment_url")
+        profile_background_path = _leaderboard_background_path(
+            scrim.id,
+            scrim.leaderboard_orientation,
+            scrim.leaderboard_team_count,
+        )
         if isinstance(saved_background_url, str) and saved_background_url:
             self.background_url = saved_background_url
-        background_text = (
-            f"[View current background]({self.background_url})"
-            if self.background_url
-            else "Background link unavailable"
+            background_text = f"[View current background]({saved_background_url})"
+        elif profile_background_path.is_file():
+            background_text = "Custom background saved; preview link unavailable"
+        else:
+            background_text = "Built-in default background"
+        accent_color = getattr(
+            scrim,
+            "leaderboard_accent_color",
+            DEFAULT_LEADERBOARD_ACCENT_COLOR,
         )
         embed = discord.Embed(
             title=f"Edit Leaderboard — {discord.utils.escape_markdown(scrim.name)}",
             description=(
-                "Choose a setting below. Horizontal orientation requires Gold."
+                "Background and text color are saved separately for each "
+                "orientation and team count. Horizontal orientation requires Gold."
                 if not is_gold
-                else "Choose a leaderboard setting below."
+                else
+                "Background and text color are saved separately for each "
+                "orientation and team count."
             ),
             color=discord.Color.blurple(),
         )
@@ -4138,6 +4307,11 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         embed.add_field(
             name="Orientation",
             value=orientation.title(),
+            inline=True,
+        )
+        embed.add_field(
+            name="Text Color",
+            value=_leaderboard_accent_label(accent_color),
             inline=True,
         )
         embed.add_field(
@@ -4311,8 +4485,42 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         orientation_button.callback = orientation_callback
         self.add_item(orientation_button)
 
+        accent_button = discord.ui.Button(
+            label="Text Color",
+            emoji="🎨",
+            style=discord.ButtonStyle.primary,
+            row=1,
+        )
+
+        async def accent_callback(interaction: discord.Interaction) -> None:
+            view = LeaderboardAccentColorView(
+                owner_id=self.owner_id,
+                guild_id=self.guild_id,
+                scrim_id=self.scrim_id,
+                background_url=self.background_url,
+            )
+            await interaction.response.edit_message(
+                content=view.content(),
+                embed=view.embed(),
+                view=view,
+            )
+
+        accent_button.callback = accent_callback
+        self.add_item(accent_button)
+
+        scrim = repository.get(self.scrim_id)
         has_custom_background = _leaderboard_background_path(
-            self.scrim_id
+            self.scrim_id,
+            getattr(
+                scrim,
+                "leaderboard_orientation",
+                DEFAULT_LEADERBOARD_ORIENTATION,
+            ),
+            getattr(
+                scrim,
+                "leaderboard_team_count",
+                DEFAULT_LEADERBOARD_TEAM_COUNT,
+            ),
         ).is_file()
         restore_background_button = discord.ui.Button(
             label="Restore Default Background",
@@ -4337,7 +4545,11 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
                     ephemeral=True,
                 )
                 return
-            if not _leaderboard_background_path(self.scrim_id).is_file():
+            if not _leaderboard_background_path(
+                self.scrim_id,
+                scrim.leaderboard_orientation,
+                scrim.leaderboard_team_count,
+            ).is_file():
                 await interaction.response.send_message(
                     "This scrim is already using the default background.",
                     ephemeral=True,
@@ -4405,6 +4617,264 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
 
         back_button.callback = back_callback
         self.add_item(back_button)
+
+
+class LeaderboardAccentColorView(LeaderboardPanelView):
+    """Choose the generated date, team, and score text color for one scrim."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        scrim_id: str,
+        background_url: str,
+    ) -> None:
+        super().__init__(
+            owner_id=owner_id,
+            guild_id=guild_id,
+            scrim_id=scrim_id,
+        )
+        self.background_url = background_url
+        self.rebuild()
+
+    def content(self) -> str:
+        return (
+            "**Leaderboard Text Color**\n"
+            "Choose a color for generated dates, team names, and scores."
+        )
+
+    def embed(self) -> discord.Embed:
+        scrim = repository.get(self.scrim_id)
+        accent_color = getattr(
+            scrim,
+            "leaderboard_accent_color",
+            DEFAULT_LEADERBOARD_ACCENT_COLOR,
+        )
+        return discord.Embed(
+            title="Leaderboard Text Color",
+            description=(
+                f"Current color: **{_leaderboard_accent_label(accent_color)}**\n"
+                "This color applies only to generated dates, team names, and "
+                "scores. Table styling stays fixed.\n"
+                "Choose a preset below, or select **Custom HEX** and enter a "
+                "code in `#RRGGBB` format.\n"
+                f"[Open a HEX color generator]({HEX_COLOR_GENERATOR_URL})"
+            ),
+            color=discord.Color.blurple(),
+        )
+
+    def rebuild(self) -> None:
+        self.clear_items()
+        scrim = repository.get(self.scrim_id)
+        current = getattr(
+            scrim,
+            "leaderboard_accent_color",
+            DEFAULT_LEADERBOARD_ACCENT_COLOR,
+        ).upper()
+        options = [
+            discord.SelectOption(
+                label=name,
+                value=color_hex,
+                description=color_hex,
+                default=current == color_hex,
+            )
+            for name, color_hex in LEADERBOARD_ACCENT_COLOR_OPTIONS
+        ]
+        options.append(
+            discord.SelectOption(
+                label="Custom HEX",
+                value="custom",
+                description="Enter a custom #RRGGBB color",
+            )
+        )
+        selector = discord.ui.Select(
+            placeholder="Choose a text color",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+        async def select_callback(interaction: discord.Interaction) -> None:
+            selected = selector.values[0]
+            if selected == "custom":
+                await interaction.response.send_modal(
+                    LeaderboardAccentColorModal(
+                        color_view=self,
+                        prompt_message=interaction.message,
+                    )
+                )
+                return
+            if selected not in {
+                color_hex for _, color_hex in LEADERBOARD_ACCENT_COLOR_OPTIONS
+            }:
+                await interaction.response.send_message(
+                    "That text color is not available.",
+                    ephemeral=True,
+                )
+                return
+            await self.save_color(interaction, selected)
+
+        selector.callback = select_callback
+        self.add_item(selector)
+
+        back_button = discord.ui.Button(
+            label="Back to Leaderboard",
+            emoji="↩️",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+
+        async def back_callback(interaction: discord.Interaction) -> None:
+            view = LeaderboardScrimEditView(
+                owner_id=self.owner_id,
+                guild_id=self.guild_id,
+                scrim_id=self.scrim_id,
+                background_url=self.background_url,
+            )
+            await interaction.response.edit_message(
+                content=view.content(),
+                embed=view.embed(),
+                view=view,
+            )
+
+        back_button.callback = back_callback
+        self.add_item(back_button)
+
+    async def save_color(
+        self,
+        interaction: discord.Interaction,
+        color_hex: str,
+        *,
+        prompt_message: discord.Message | None = None,
+        from_modal: bool = False,
+    ) -> None:
+        scrim = repository.get(self.scrim_id)
+        if (
+            interaction.user.id != self.owner_id
+            or interaction.guild_id != self.guild_id
+            or scrim is None
+            or scrim.guild_id != self.guild_id
+            or not is_active(scrim)
+            or not member_can_configure_scrim(interaction.user, scrim)
+        ):
+            await interaction.response.send_message(
+                "You no longer have access to this leaderboard panel.",
+                ephemeral=True,
+            )
+            return
+        if re.fullmatch(r"#[0-9A-Fa-f]{6}", color_hex) is None:
+            await interaction.response.send_message(
+                "Enter a HEX color in `#RRGGBB` format, such as `#FF00FF`. "
+                f"[Open a HEX color generator]({HEX_COLOR_GENERATOR_URL})",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        if from_modal:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            repository.update_leaderboard_settings(
+                self.scrim_id,
+                self.guild_id,
+                leaderboard_accent_color=color_hex.upper(),
+            )
+        except (SlotStorageError, ValueError) as error:
+            message = f"Could not save the text color: {error}"
+            if from_modal:
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(
+                    message,
+                    ephemeral=True,
+                )
+            return
+
+        updated_view = LeaderboardScrimEditView(
+            owner_id=self.owner_id,
+            guild_id=self.guild_id,
+            scrim_id=self.scrim_id,
+            background_url=self.background_url,
+        )
+        if not from_modal:
+            await interaction.response.edit_message(
+                content=(
+                    f"Text color saved as `{color_hex.upper()}`. "
+                    "Changes are saved automatically."
+                ),
+                embed=updated_view.embed(),
+                view=updated_view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        if prompt_message is not None:
+            try:
+                await prompt_message.edit(
+                    content=updated_view.content(),
+                    embed=updated_view.embed(),
+                    view=updated_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                logger.exception(
+                    "Saved leaderboard text color, but could not refresh "
+                    "the panel for scrim %s.",
+                    self.scrim_id,
+                )
+                await interaction.followup.send(
+                    "Text color saved. Reopen `!setres` if the panel does not refresh.",
+                    ephemeral=True,
+                )
+                return
+        await interaction.followup.send(
+            f"Text color saved as `{color_hex.upper()}`.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class LeaderboardAccentColorModal(discord.ui.Modal):
+    """Collect and validate a custom six-digit HEX text color."""
+
+    def __init__(
+        self,
+        *,
+        color_view: LeaderboardAccentColorView,
+        prompt_message: discord.Message | None,
+    ) -> None:
+        super().__init__(title="Custom HEX Text Color")
+        self.color_view = color_view
+        self.prompt_message = prompt_message
+        self.hex_code = discord.ui.TextInput(
+            label="Hexadecimal color code",
+            placeholder="#FF00FF",
+            min_length=7,
+            max_length=7,
+            required=True,
+            style=discord.TextStyle.short,
+        )
+        self.add_item(self.hex_code)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        color_hex = self.hex_code.value
+        if re.fullmatch(r"#[0-9A-Fa-f]{6}", color_hex) is None:
+            await interaction.response.send_message(
+                "Invalid HEX code. It must start with `#` and contain exactly "
+                "six letters or numbers, for example `#FF00FF`.\n"
+                f"[Open a HEX color generator]({HEX_COLOR_GENERATOR_URL})",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        await self.color_view.save_color(
+            interaction,
+            color_hex.upper(),
+            prompt_message=self.prompt_message,
+            from_modal=True,
+        )
 
 
 class LeaderboardTeamCountView(LeaderboardPanelView):
@@ -4675,28 +5145,46 @@ async def _store_leaderboard_background(
     except (Image.DecompressionBombError, OSError) as error:
         raise ValueError("That file is not a supported image.") from error
 
+    orientation, team_count = _leaderboard_scrim_profile(scrim)
+    profile_suffix = _leaderboard_profile_suffix(orientation, team_count)
     lock = _leaderboard_background_lock(scrim.id)
     async with lock:
-        metadata_path = _leaderboard_background_metadata_path(scrim.id)
-        final_path = _leaderboard_background_path(scrim.id)
+        _migrate_legacy_leaderboard_background(scrim)
+        metadata_path = _leaderboard_background_metadata_path(
+            scrim.id,
+            orientation,
+            team_count,
+        )
+        final_path = _leaderboard_background_path(
+            scrim.id,
+            orientation,
+            team_count,
+        )
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        previous_metadata = _read_leaderboard_background_metadata(scrim.id)
+        previous_metadata = _read_leaderboard_background_metadata(
+            scrim.id,
+            orientation,
+            team_count,
+        )
         previous_image = final_path.read_bytes() if final_path.exists() else None
         temporary_image_path = final_path.with_name(
-            f".{scrim.id}.{secrets.token_hex(4)}.tmp.png"
+            f".{scrim.id}-{profile_suffix}.{secrets.token_hex(4)}.tmp.png"
         )
         image.save(temporary_image_path, format="PNG", optimize=True)
         preview = None
         try:
             preview_file = discord.File(
                 temporary_image_path,
-                filename=f"leaderboard-background-{scrim.id}.png",
+                filename=(
+                    f"leaderboard-background-{scrim.id}-{profile_suffix}.png"
+                ),
             )
             try:
                 preview = await channel.send(
                     content=(
                         "Current leaderboard background for "
-                        f"**{discord.utils.escape_markdown(scrim.name)}**"
+                        f"**{discord.utils.escape_markdown(scrim.name)}** "
+                        f"({orientation}, {team_count} teams)"
                     ),
                     file=preview_file,
                     allowed_mentions=discord.AllowedMentions.none(),
@@ -4715,6 +5203,8 @@ async def _store_leaderboard_background(
                     "message_id": preview.id,
                     "attachment_url": preview.attachments[0].url,
                 },
+                orientation,
+                team_count,
             )
         except Exception:
             temporary_image_path.unlink(missing_ok=True)
@@ -4722,7 +5212,7 @@ async def _store_leaderboard_background(
                 final_path.unlink(missing_ok=True)
             else:
                 restore_path = final_path.with_name(
-                    f".{scrim.id}.{secrets.token_hex(4)}.restore.png"
+                    f".{scrim.id}-{profile_suffix}.{secrets.token_hex(4)}.restore.png"
                 )
                 restore_path.write_bytes(previous_image)
                 os.replace(restore_path, final_path)
@@ -4747,28 +5237,46 @@ async def _restore_default_leaderboard_background(
     if not LEADERBOARD_BACKGROUND.is_file():
         raise ValueError("The built-in leaderboard background is missing.")
 
+    orientation, team_count = _leaderboard_scrim_profile(scrim)
+    profile_suffix = _leaderboard_profile_suffix(orientation, team_count)
     lock = _leaderboard_background_lock(scrim.id)
     async with lock:
-        custom_path = _leaderboard_background_path(scrim.id)
+        _migrate_legacy_leaderboard_background(scrim)
+        custom_path = _leaderboard_background_path(
+            scrim.id,
+            orientation,
+            team_count,
+        )
         if not custom_path.is_file():
             raise ValueError("This scrim is already using the default background.")
-        metadata_path = _leaderboard_background_metadata_path(scrim.id)
-        previous_metadata = _read_leaderboard_background_metadata(scrim.id)
+        metadata_path = _leaderboard_background_metadata_path(
+            scrim.id,
+            orientation,
+            team_count,
+        )
+        previous_metadata = _read_leaderboard_background_metadata(
+            scrim.id,
+            orientation,
+            team_count,
+        )
         backup_path = custom_path.with_name(
-            f".{scrim.id}.{secrets.token_hex(4)}.reset.png"
+            f".{scrim.id}-{profile_suffix}.{secrets.token_hex(4)}.reset.png"
         )
         preview = None
         moved_custom = False
         try:
             preview_file = discord.File(
                 LEADERBOARD_BACKGROUND,
-                filename=f"leaderboard-background-{scrim.id}.png",
+                filename=(
+                    f"leaderboard-background-{scrim.id}-{profile_suffix}.png"
+                ),
             )
             try:
                 preview = await channel.send(
                     content=(
                         "Restored built-in leaderboard background for "
-                        f"**{discord.utils.escape_markdown(scrim.name)}**"
+                        f"**{discord.utils.escape_markdown(scrim.name)}** "
+                        f"({orientation}, {team_count} teams)"
                     ),
                     file=preview_file,
                     allowed_mentions=discord.AllowedMentions.none(),
@@ -4789,6 +5297,8 @@ async def _restore_default_leaderboard_background(
                     "message_id": preview.id,
                     "attachment_url": preview.attachments[0].url,
                 },
+                orientation,
+                team_count,
             )
         except Exception:
             if moved_custom and backup_path.exists():
@@ -4804,6 +5314,8 @@ async def _restore_default_leaderboard_background(
                     _write_leaderboard_background_metadata(
                         scrim.id,
                         previous_metadata,
+                        orientation,
+                        team_count,
                     )
                 else:
                     metadata_path.unlink(missing_ok=True)
@@ -5694,43 +6206,6 @@ def _fit_font(
     return _load_font(min_size, weight=weight)
 
 
-def _fit_scrim_title(
-    draw: ImageDraw.ImageDraw,
-    scrim_name: str,
-    *,
-    max_width: int,
-    max_height: int,
-):
-    """Fit a scrim name into the built-in background's title area."""
-    title = scrim_name.strip()
-    if not title or max_width <= 0 or max_height <= 0:
-        return "", _load_font(12, weight=800)
-
-    def font_for(value: str):
-        return _fit_font(
-            value,
-            max_width=max_width,
-            max_height=max_height,
-            max_size=80,
-            min_size=12,
-            weight=800,
-        )
-
-    font = font_for(title)
-    bounds = draw.textbbox((0, 0), title, font=font)
-    if bounds[2] - bounds[0] <= max_width:
-        return title, font
-
-    minimum_font = _load_font(12, weight=800)
-    while title:
-        title = title[:-1].rstrip()
-        candidate = f"{title}…"
-        bounds = draw.textbbox((0, 0), candidate, font=minimum_font)
-        if bounds[2] - bounds[0] <= max_width:
-            return candidate, font_for(candidate)
-    return "…", minimum_font
-
-
 def leaderboard_canvas_dimensions(
     team_count: int,
     orientation: str,
@@ -5812,60 +6287,48 @@ def _build_configured_leaderboard_image(
             (width, height),
             method=Image.Resampling.LANCZOS,
         ).convert("RGBA")
-    draw = ImageDraw.Draw(output, "RGBA")
     margin = LEADERBOARD_OUTER_MARGIN
-    border = (0, 174, 255)
-    panel = (17, 25, 38)
-    panel_alt = (21, 32, 47)
-    text = (237, 244, 251)
-    muted = (143, 177, 202)
+    generated_text = _leaderboard_accent_rgb(
+        getattr(
+            scrim,
+            "leaderboard_accent_color",
+            DEFAULT_LEADERBOARD_ACCENT_COLOR,
+        )
+    )
+    table_top = margin + header_height + LEADERBOARD_SECTION_GAP
+    table_template_path = (
+        LEADERBOARD_TABLE_TEMPLATE_DIR
+        / f"table-{team_limit}-{orientation}.png"
+    )
+    with Image.open(table_template_path) as table_template:
+        output.alpha_composite(
+            table_template.convert("RGBA"),
+            dest=(0, table_top),
+        )
 
-    header_bottom = margin + header_height
+    with Image.open(LEADERBOARD_DATE_BADGE_TEMPLATE) as date_badge:
+        date_badge = date_badge.convert("RGBA")
+        date_width, date_height = date_badge.size
+        date_center_y = margin + header_height // 2
+        date_left = width - margin - date_width
+        output.alpha_composite(
+            date_badge,
+            dest=(date_left, date_center_y - date_height // 2),
+        )
+
+    draw = ImageDraw.Draw(output, "RGBA")
     date_label = datetime.now(
         timezone_for_name(getattr(scrim, "timezone", "UTC"))
     ).strftime("%d %b %Y").upper()
-    date_center_y = margin + header_height // 2
     date_font = _load_font(18, weight=400)
-    date_bbox = draw.textbbox((0, 0), date_label, font=date_font)
-    date_width = date_bbox[2] - date_bbox[0] + 32
-    draw.rounded_rectangle(
-        (
-            width - margin - date_width,
-            date_center_y - 20,
-            width - margin,
-            date_center_y + 20,
-        ),
-        radius=10,
-        fill=(13, 39, 57, 220),
-        outline=(37, 107, 141, 230),
-        width=1,
-    )
     draw.text(
         (width - margin - date_width // 2, date_center_y),
         date_label,
         font=date_font,
-        fill=text,
+        fill=generated_text,
         anchor="mm",
     )
-    if background_path.resolve() == LEADERBOARD_BACKGROUND.resolve():
-        title_left = max(margin + 18, int(width * 0.08))
-        title_right = width - margin - date_width - 18
-        title, title_font = _fit_scrim_title(
-            draw,
-            str(getattr(scrim, "name", "") or ""),
-            max_width=title_right - title_left,
-            max_height=header_height - 16,
-        )
-        if title:
-            draw.text(
-                ((title_left + title_right) // 2, date_center_y),
-                title,
-                font=title_font,
-                fill=text,
-                anchor="mm",
-            )
 
-    table_top = header_bottom + LEADERBOARD_SECTION_GAP
     columns = 2 if orientation == "horizontal" else 1
     column_gap = 24 if columns == 2 else 0
     column_width = (
@@ -5874,91 +6337,32 @@ def _build_configured_leaderboard_image(
     per_column_capacity = (
         (team_limit + 1) // 2 if columns == 2 else team_limit
     )
-    split_index = (len(rows) + 1) // 2 if columns == 2 else len(rows)
+    split_index = per_column_capacity if columns == 2 else len(rows)
     row_font = 21 if columns == 1 else 18
-    header_font = 17 if columns == 1 else 15
     row_top = table_top + LEADERBOARD_TABLE_HEADER_HEIGHT
 
     for column_index in range(columns):
         x = margin + column_index * (column_width + column_gap)
-        draw.rounded_rectangle(
-            (
-                x,
-                table_top,
-                x + column_width,
-                table_top
-                + LEADERBOARD_TABLE_HEADER_HEIGHT
-                + per_column_capacity * LEADERBOARD_ROW_HEIGHT,
-            ),
-            radius=12,
-            fill=(*panel, 220),
-            outline=(34, 70, 96),
-            width=2,
-        )
-        draw.rounded_rectangle(
-            (
-                x + 2,
-                table_top + 2,
-                x + column_width - 2,
-                table_top + LEADERBOARD_TABLE_HEADER_HEIGHT,
-            ),
-            radius=10,
-            fill=(13, 39, 57, 225),
-        )
         if columns == 2:
             column_rows = (
                 rows[:split_index]
                 if column_index == 0
                 else rows[split_index:]
             )
-            rank_start = 0 if column_index == 0 else split_index
         else:
             column_rows = rows
-            rank_start = 0
 
-        rank_x = x + 22
         team_x = x + (74 if columns == 1 else 62)
         wins_x = x + column_width - (390 if columns == 1 else 330)
         kills_x = x + column_width - (280 if columns == 1 else 245)
         place_x = x + column_width - (160 if columns == 1 else 135)
         total_x = x + column_width - 20
-        header_y = table_top + 22
-        for label, label_x, anchor in (
-            ("#", rank_x, "la"),
-            ("TEAM", team_x, "la"),
-            ("W", wins_x, "ra"),
-            ("KILLS", kills_x, "ra"),
-            ("PLACE", place_x, "ra"),
-            ("TOTAL", total_x, "ra"),
-        ):
-            draw.text(
-                (label_x, header_y),
-                label,
-                font=_load_font(header_font, weight=400),
-                fill=border,
-                anchor=anchor,
-            )
         for row_index in range(per_column_capacity):
             y = row_top + row_index * LEADERBOARD_ROW_HEIGHT
-            if row_index % 2 == 1:
-                draw.rectangle(
-                    (x + 3, y, x + column_width - 3, y + LEADERBOARD_ROW_HEIGHT),
-                    fill=(*panel_alt, 220),
-                )
-            draw.line(
-                (
-                    x + 14,
-                    y + LEADERBOARD_ROW_HEIGHT - 1,
-                    x + column_width - 14,
-                    y + LEADERBOARD_ROW_HEIGHT - 1,
-                ),
-                fill=(37, 58, 76),
-                width=1,
-            )
             if row_index >= len(column_rows):
                 continue
             row = column_rows[row_index]
-            rank = rank_start + row_index + 1
+            text_y = y + LEADERBOARD_ROW_HEIGHT // 2
             team_max_width = wins_x - team_x - 20
             team_font = _fit_font(
                 row.team_name,
@@ -5968,19 +6372,11 @@ def _build_configured_leaderboard_image(
                 min_size=13,
                 weight=LEADERBOARD_BODY_FONT_WEIGHT,
             )
-            text_y = y + LEADERBOARD_ROW_HEIGHT // 2
-            draw.text(
-                (rank_x, text_y),
-                f"{rank:02d}",
-                font=_load_font(row_font, weight=400),
-                fill=muted,
-                anchor="lm",
-            )
             draw.text(
                 (team_x, text_y),
                 row.team_name,
                 font=team_font,
-                fill=text,
+                fill=generated_text,
                 anchor="lm",
             )
             for value, value_x in (
@@ -5996,7 +6392,7 @@ def _build_configured_leaderboard_image(
                         row_font,
                         weight=LEADERBOARD_BODY_FONT_WEIGHT,
                     ),
-                    fill=text,
+                    fill=generated_text,
                     anchor="rm",
                 )
     buffer = io.BytesIO()

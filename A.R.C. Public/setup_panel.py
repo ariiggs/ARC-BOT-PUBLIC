@@ -61,6 +61,21 @@ def _role_ref(role_id: int | None) -> str:
     return f"<@&{role_id}>" if role_id else "not configured"
 
 
+ADDITIONAL_SETTINGS_SECTIONS = (
+    ("cap_transfer", "Cap Transfer", "🔁"),
+    ("matches_maps", "Matches & Maps", "🎮"),
+    ("registration", "Registrations", "📝"),
+    ("idpw", "ID&PW", "🔐"),
+)
+
+
+def _cap_transfer_summary(scrim: Any) -> str:
+    channel_id = getattr(scrim, "cap_channel_id", None)
+    if channel_id:
+        return f"🟢 Cap Transfer (`!cap`): <#{channel_id}>"
+    return "⚪ Cap Transfer (`!cap`): Not configured"
+
+
 def _scrim_configuration_details(scrim, repository) -> str:
     idpw = repository.get_idpw_config(scrim.id)
     timezone_name = getattr(scrim, "timezone", DEFAULT_IDPW_TIMEZONE)
@@ -407,6 +422,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             board_refreshed = False
 
         def format_value(field: str, value: object) -> str:
+            if value is None:
+                return "not configured"
             if field.endswith("channel_id"):
                 return f"<#{value}>"
             if field.endswith("role_id"):
@@ -451,10 +468,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 edit_view = None
                 text += " Reopen `!setup` if the configuration menu does not refresh."
         try:
-            await interaction.edit_original_response(
-                content=text,
-                view=edit_view,
-            )
+            response_kwargs = {
+                "content": text,
+                "view": edit_view,
+            }
+            if success_view is not None:
+                embed_factory = getattr(edit_view, "embed", None)
+                if callable(embed_factory):
+                    response_kwargs["embed"] = embed_factory()
+            await interaction.edit_original_response(**response_kwargs)
         except discord.HTTPException:
             logger.exception("Could not report the saved scrim configuration")
             try:
@@ -940,6 +962,13 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             )
             idpw_ready = bool(target_channel and password_type and timezone_name)
             idpw_partial = bool(target_channel or password_type or timezone_name)
+            matches_maps_text = (
+                f"{'🟢' if matches_ready else '⚪'} Matches & Maps:\n"
+                f"Matches: **{matches or 'Not configured'}**\n"
+                f"Maps: **{assigned_maps}/{matches} assigned**"
+                if matches_ready
+                else "⚪ Matches & Maps: Not configured"
+            )
             embed = discord.Embed(
                 title=f"Manage Scrim — {_safe_name(selected.name)}",
                 description="Configuration overview",
@@ -985,11 +1014,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             embed.add_field(
                 name="Additional Settings",
                 value=(
-                    f"{'🟢' if matches_ready else '⚪'} Matches & Maps:\n"
-                    f"Matches: **{matches or 'Not configured'}**\n"
-                    f"Maps: **{assigned_maps}/{matches} assigned**"
-                    if matches_ready
-                    else "⚪ Matches & Maps: Not configured"
+                    f"{_cap_transfer_summary(selected)}\n"
+                    f"{matches_maps_text}"
                 ),
                 inline=False,
             )
@@ -1042,12 +1068,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
         def rebuild(self) -> None:
             self.clear_items()
-            options = (
-                ("matches_maps", "Matches & Maps", "🎮"),
-                ("registration", "Registrations", "📝"),
-                ("idpw", "ID&PW", "🔐"),
-            )
-            for section, label, emoji in options:
+            for section, label, emoji in ADDITIONAL_SETTINGS_SECTIONS:
                 button = discord.ui.Button(
                     label=label,
                     emoji=emoji,
@@ -1123,15 +1144,22 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     title="Scrim no longer exists",
                     color=discord.Color.red(),
                 )
-            return discord.Embed(
+            embed = discord.Embed(
                 title=f"Additional Settings — {_safe_name(selected.name)}",
                 description=(
-                    "Matches & Maps, Registrations, and ID&PW are optional. "
+                    "Cap Transfer (`!cap`), Matches & Maps, Registrations, "
+                    "and ID&PW are optional. "
                     "This panel shows configuration only; live registration and "
                     "slot states are handled elsewhere."
                 ),
                 color=discord.Color.blurple(),
             )
+            embed.add_field(
+                name="Current Cap Transfer channel",
+                value=_cap_transfer_summary(selected),
+                inline=False,
+            )
+            return embed
 
     class GridSettingModal(discord.ui.Modal):
         """One-input modal used by every setting in the configuration grid."""
@@ -1838,6 +1866,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             self.name = name or ""
             self.public_channel_id: int | None = None
             self.staff_channel_id: int | None = None
+            self.cap_channel_id: int | None = None
             self.target_channel_id: int | None = None
             self.logs_channel_id: int | None = None
             self.history_channel_id: int | None = None
@@ -1871,6 +1900,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             self.name = scrim.name
             self.public_channel_id = scrim.public_channel_id
             self.staff_channel_id = scrim.staff_channel_id
+            self.cap_channel_id = getattr(scrim, "cap_channel_id", None)
             self.target_channel_id = config.target_channel_id if config else None
             self.logs_channel_id = scrim.logs_channel_id
             self.history_channel_id = scrim.history_channel_id
@@ -1938,6 +1968,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             if self.is_edit:
                 section_titles = {
                     "required": "Required Settings",
+                    "cap_transfer": "Cap Transfer",
                     "matches_maps": "Matches & Maps",
                     "registration": "Registrations",
                     "idpw": "ID&PW",
@@ -2011,6 +2042,32 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     ("matches", "Matches", "Match count", f"1-{MAX_MATCHES}", self.max_matches),
                     ("maps", "Maps", "Map rotation (optional)", "Erangel, Miramar, Sanhok", ", ".join(self.maps)),
                 )
+            elif self.section == "cap_transfer":
+                button = discord.ui.Button(
+                    label="Set Cap Transfer Channel",
+                    emoji="🔁",
+                    style=discord.ButtonStyle.primary,
+                    row=0,
+                )
+
+                async def cap_transfer_callback(
+                    interaction: discord.Interaction,
+                ) -> None:
+                    if not await self.interaction_check(interaction):
+                        return
+                    await interaction.response.edit_message(
+                        content=(
+                            "Select a text channel for `!cap`, or choose "
+                            "Disable Cap Transfer."
+                        ),
+                        embed=None,
+                        view=ScrimChannelPicker(self, "cap_channel_id"),
+                    )
+
+                button.callback = cap_transfer_callback
+                self.add_item(button)
+                self._add_edit_back_button(row=1)
+                return
             elif self.section == "registration":
                 button = discord.ui.Button(
                     label="Registration Settings",
@@ -2149,6 +2206,25 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             self._add_edit_back_button(row=1 if self.section != "required" else 2)
 
         def embed(self) -> discord.Embed:
+            if self.is_edit and self.section == "cap_transfer":
+                embed = discord.Embed(
+                    title=f"Cap Transfer — {_safe_name(self.name)}",
+                    description=(
+                        "Choose the channel where authorized members can use "
+                        "`!cap`. This setting is optional."
+                    ),
+                    color=discord.Color.blurple(),
+                )
+                embed.add_field(
+                    name="Current channel for `!cap`",
+                    value=(
+                        f"<#{self.cap_channel_id}>"
+                        if self.cap_channel_id
+                        else "Not configured"
+                    ),
+                    inline=False,
+                )
+                return embed
             if not self.is_edit:
                 channel_ready = all(
                     (
@@ -2191,7 +2267,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     value=(
                         "📌 Additional Settings can be added in the "
                         "**Manage Scrim** menu from the main menu!\n"
-                        "*(Matches & Maps · Registrations · ID&PW)*"
+                        "*(Cap Transfer · Matches & Maps · Registrations · ID&PW)*"
                     ),
                     inline=False,
                 )
@@ -4786,6 +4862,16 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     self.edit_view.panel,
                     self.edit_view.scrim_id,
                     changes={self.field: channel.id},
+                    success_view=(
+                        AdditionalSettingsMenuView(
+                            self.edit_view.panel,
+                            self.edit_view.owner_id,
+                            self.edit_view.guild_id,
+                            self.edit_view.scrim_id,
+                        )
+                        if self.field == "cap_channel_id"
+                        else None
+                    ),
                 )
 
             picker.callback = callback
@@ -4810,6 +4896,12 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                         self.edit_view.scrim_id,
                         changes={self.field: None},
                         notice="Cap Transfer is disabled for this scrim.",
+                        success_view=AdditionalSettingsMenuView(
+                            self.edit_view.panel,
+                            self.edit_view.owner_id,
+                            self.edit_view.guild_id,
+                            self.edit_view.scrim_id,
+                        ),
                     )
 
                 clear_button.callback = clear_callback
