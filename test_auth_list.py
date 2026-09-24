@@ -55,6 +55,10 @@ class AuthListTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value="A.R.C. Scrims"),
             ),
             patch(
+                "main.repository.get_server_license_type",
+                return_value="Gold",
+            ),
+            patch(
                 "main.send_private_command_feedback",
                 new=AsyncMock(),
             ) as send_feedback,
@@ -66,6 +70,7 @@ class AuthListTests(unittest.IsolatedAsyncioTestCase):
             kwargs["embed"].title,
             "💎 **A.R.C. Subscription Status**",
         )
+        self.assertIn("**Plan:** Gold", kwargs["embed"].fields[0].value)
         self.assertIn("**Status:** 🟢 Active", kwargs["embed"].fields[0].value)
         self.assertIn(
             "**Time Remaining:** ♾️ Lifetime / Unlimited",

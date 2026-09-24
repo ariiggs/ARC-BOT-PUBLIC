@@ -726,6 +726,7 @@ class ScrimRepository:
         self.authorized_guild_ids: set[int] = set()
         self.authorized_guild_expires_at: dict[int, datetime] = {}
         self.authorized_guild_duration_days: dict[int, int] = {}
+        self.authorized_guild_license_types: dict[int, str] = {}
         self.authorized_admin_ids: set[int] = set()
 
     def get(self, scrim_id: str) -> Scrim | None:
@@ -743,6 +744,18 @@ class ScrimRepository:
             return False
         expires_at = self.authorized_guild_expires_at.get(guild_id)
         return expires_at is None or expires_at > datetime.now(timezone.utc)
+
+    def get_server_license_type(self, guild_id: int) -> str:
+        """Return the active authorization tier, falling back to legacy config."""
+        authorized_license = self.authorized_guild_license_types.get(guild_id)
+        if authorized_license is not None:
+            return (
+                authorized_license
+                if self.is_guild_authorized(guild_id)
+                else DEFAULT_LICENSE_TYPE
+            )
+        config = self.server_configs.get(guild_id)
+        return config.license_type if config is not None else DEFAULT_LICENSE_TYPE
 
     def get_guild_subscription(
         self, guild_id: int
@@ -776,11 +789,21 @@ class ScrimRepository:
             )
         ]
 
-    def authorize_guild(self, guild_id: int, days: int | None = None) -> bool:
+    def authorize_guild(
+        self,
+        guild_id: int,
+        days: int | None = None,
+        *,
+        license_type: str | None = None,
+    ) -> bool:
         if not _positive_id(guild_id):
             raise ValueError("The guild ID must be a positive integer.")
         if days is not None and (type(days) is not int or days < 0):
             raise ValueError("The authorization duration must be zero or more days.")
+        if license_type is None:
+            license_type = self.get_server_license_type(guild_id)
+        if license_type not in LICENSE_TYPES:
+            raise ValueError("Choose a Standard or Gold license.")
         duration_days = 0 if days is None else days
         expires_at = (
             datetime.now(timezone.utc) + timedelta(days=duration_days)
@@ -791,11 +814,37 @@ class ScrimRepository:
         with self.transaction():
             self.authorized_guild_ids.add(guild_id)
             self.authorized_guild_duration_days[guild_id] = duration_days
+            self.authorized_guild_license_types[guild_id] = license_type
             if expires_at is None:
                 self.authorized_guild_expires_at.pop(guild_id, None)
             else:
                 self.authorized_guild_expires_at[guild_id] = expires_at
+            current_config = self.server_configs.get(guild_id)
+            if current_config is not None:
+                self.server_configs[guild_id] = ServerConfig(
+                    guild_id,
+                    current_config.head_staff_role_id,
+                    current_config.staff_role_id,
+                    current_config.logs_channel_id,
+                    license_type,
+                )
+            if license_type != "Gold":
+                self._downgrade_horizontal_leaderboards(guild_id)
         return not was_authorized
+
+    def _downgrade_horizontal_leaderboards(self, guild_id: int) -> None:
+        for scrim in self.scrims.values():
+            if (
+                scrim.guild_id != guild_id
+                or scrim.leaderboard_orientation != "horizontal"
+            ):
+                continue
+            scrim.leaderboard_orientation = "vertical"
+            scrim.leaderboard_layout = "1_col"
+            scrim.leaderboard_accent_color = scrim.leaderboard_accent_colors.get(
+                leaderboard_profile_key("vertical", scrim.leaderboard_team_count),
+                DEFAULT_LEADERBOARD_ACCENT_COLOR,
+            )
 
     def revoke_guild(self, guild_id: int) -> bool:
         if not _positive_id(guild_id):
@@ -806,6 +855,17 @@ class ScrimRepository:
             self.authorized_guild_ids.remove(guild_id)
             self.authorized_guild_expires_at.pop(guild_id, None)
             self.authorized_guild_duration_days.pop(guild_id, None)
+            self.authorized_guild_license_types.pop(guild_id, None)
+            current_config = self.server_configs.get(guild_id)
+            if current_config is not None:
+                self.server_configs[guild_id] = ServerConfig(
+                    guild_id,
+                    current_config.head_staff_role_id,
+                    current_config.staff_role_id,
+                    current_config.logs_channel_id,
+                    DEFAULT_LICENSE_TYPE,
+                )
+            self._downgrade_horizontal_leaderboards(guild_id)
         return True
 
     def is_admin_authorized(self, user_id: int) -> bool:
@@ -834,7 +894,7 @@ class ScrimRepository:
 
     def payload(self) -> dict:
         return {
-            "version": 29,
+            "version": 30,
             "scrims": [s.payload() for s in self.scrims.values()],
             "server_configs": [
                 config.payload() for config in self.server_configs.values()
@@ -855,6 +915,12 @@ class ScrimRepository:
                     self.authorized_guild_duration_days.items()
                 )
             },
+            "authorized_guild_license_types": {
+                str(guild_id): license_type
+                for guild_id, license_type in sorted(
+                    self.authorized_guild_license_types.items()
+                )
+            },
             "authorized_admin_ids": sorted(self.authorized_admin_ids),
             "legacy": copy.deepcopy(self.legacy),
         }
@@ -870,12 +936,13 @@ class ScrimRepository:
         set[int],
             dict[int, datetime],
             dict[int, int],
+        dict[int, str],
         set[int],
     ]:
         try:
             version = payload.get("version")
             if type(version) is not int or version not in (
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30
             ):
                 raise ValueError("Unsupported snapshot version.")
             if not isinstance(payload["scrims"], list):
@@ -948,6 +1015,26 @@ class ScrimRepository:
                     authorized_guild_duration_days[guild_id] = max(
                         1, math.ceil(remaining / timedelta(days=1).total_seconds())
                     )
+            raw_authorized_guild_license_types = payload.get(
+                "authorized_guild_license_types", {}
+            )
+            if not isinstance(raw_authorized_guild_license_types, dict):
+                raise ValueError("Invalid authorized guild license map.")
+            authorized_guild_license_types: dict[int, str] = {}
+            for raw_guild_id, raw_license_type in (
+                raw_authorized_guild_license_types.items()
+            ):
+                if (
+                    not isinstance(raw_guild_id, str)
+                    or not raw_guild_id.isdigit()
+                    or not _positive_id(int(raw_guild_id))
+                    or int(raw_guild_id) not in authorized_guild_ids
+                    or raw_license_type not in LICENSE_TYPES
+                ):
+                    raise ValueError("Invalid authorized guild license.")
+                authorized_guild_license_types[int(raw_guild_id)] = (
+                    raw_license_type
+                )
             raw_authorized_admin_ids = payload.get("authorized_admin_ids", [])
             if not isinstance(raw_authorized_admin_ids, list):
                 raise ValueError("Invalid authorized admin list.")
@@ -1358,6 +1445,14 @@ class ScrimRepository:
                 ):
                     raise ValueError("Invalid server configuration.")
                 configs[config.guild_id] = config
+            for guild_id in authorized_guild_ids:
+                if guild_id not in authorized_guild_license_types:
+                    config = configs.get(guild_id)
+                    authorized_guild_license_types[guild_id] = (
+                        config.license_type
+                        if config is not None
+                        else DEFAULT_LICENSE_TYPE
+                    )
             if payload["version"] < 7:
                 for scrim in result.values():
                     server_config = configs.get(scrim.guild_id)
@@ -1446,6 +1541,7 @@ class ScrimRepository:
                 authorized_guild_ids,
                 authorized_guild_expires_at,
                 authorized_guild_duration_days,
+                authorized_guild_license_types,
                 authorized_admin_ids,
             )
         except (KeyError, TypeError, ValueError) as error:
@@ -1464,13 +1560,14 @@ class ScrimRepository:
             except (KeyError, TypeError, ValueError) as error:
                 raise SlotStorageError("Invalid legacy snapshot; migration was stopped.") from error
             new_payload = {
-                "version": 29,
+                "version": 30,
                 "scrims": [],
                 "server_configs": [],
                 "idpw_configs": [],
                 "authorized_guild_ids": [],
                 "authorized_guild_expires_at": {},
                 "authorized_guild_duration_days": {},
+                "authorized_guild_license_types": {},
                 "authorized_admin_ids": [],
                 "legacy": legacy,
             }
@@ -1483,6 +1580,7 @@ class ScrimRepository:
                 self.authorized_guild_ids,
                 self.authorized_guild_expires_at,
                 self.authorized_guild_duration_days,
+                self.authorized_guild_license_types,
                 self.authorized_admin_ids,
             ) = self._decode(new_payload)
             return
@@ -1494,6 +1592,7 @@ class ScrimRepository:
             authorized_guild_ids,
             authorized_guild_expires_at,
             authorized_guild_duration_days,
+            authorized_guild_license_types,
             authorized_admin_ids,
         ) = self._decode(payload)
         self.scrims, self.legacy, self.server_configs, self.idpw_configs = (
@@ -1505,8 +1604,9 @@ class ScrimRepository:
         self.authorized_guild_ids = authorized_guild_ids
         self.authorized_guild_expires_at = authorized_guild_expires_at
         self.authorized_guild_duration_days = authorized_guild_duration_days
+        self.authorized_guild_license_types = authorized_guild_license_types
         self.authorized_admin_ids = authorized_admin_ids
-        if payload.get("version", 0) < 29:
+        if payload.get("version", 0) < 30:
             self.store.save(self.payload())
 
     @contextmanager
@@ -1518,6 +1618,7 @@ class ScrimRepository:
         authorized_guild_ids = self.authorized_guild_ids.copy()
         authorized_guild_expires_at = self.authorized_guild_expires_at.copy()
         authorized_guild_duration_days = self.authorized_guild_duration_days.copy()
+        authorized_guild_license_types = self.authorized_guild_license_types.copy()
         authorized_admin_ids = self.authorized_admin_ids.copy()
         try:
             yield
@@ -1533,6 +1634,7 @@ class ScrimRepository:
                 restored_authorized_guild_ids,
                 restored_authorized_guild_expires_at,
                 restored_authorized_guild_duration_days,
+                restored_authorized_guild_license_types,
                 restored_authorized_admin_ids,
             ) = self._decode(before)
             for scrim_id, scrim in self.scrims.items():
@@ -1569,7 +1671,6 @@ class ScrimRepository:
                     "placement_points_string",
                     "leaderboard_layout",
                     "leaderboard_background",
-                    "leaderboard_accent_color",
                     "leaderboard_team_count",
                     "leaderboard_orientation",
                     "leaderboard_header_height",
@@ -1592,6 +1693,9 @@ class ScrimRepository:
             self.authorized_guild_ids = authorized_guild_ids
             self.authorized_guild_expires_at = authorized_guild_expires_at
             self.authorized_guild_duration_days = authorized_guild_duration_days
+            self.authorized_guild_license_types = (
+                restored_authorized_guild_license_types
+            )
             self.authorized_admin_ids = authorized_admin_ids
             raise
 
@@ -1605,8 +1709,10 @@ class ScrimRepository:
         head_staff_role_id: int,
         staff_role_id: int,
         logs_channel_id: int,
-        license_type: str = DEFAULT_LICENSE_TYPE,
+        license_type: str | None = None,
     ) -> ServerConfig:
+        if license_type is None:
+            license_type = self.get_server_license_type(guild_id)
         config = ServerConfig(
             guild_id,
             head_staff_role_id,
@@ -1864,8 +1970,7 @@ class ScrimRepository:
         )
         if (
             next_orientation == "horizontal"
-            and getattr(self.server_configs.get(guild_id), "license_type", "Standard")
-            != "Gold"
+            and self.get_server_license_type(guild_id) != "Gold"
         ):
             raise ValueError("Horizontal layout requires a Gold license.")
         with self.transaction():

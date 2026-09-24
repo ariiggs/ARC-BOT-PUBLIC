@@ -124,19 +124,48 @@ class SubscriptionStatusTests(unittest.IsolatedAsyncioTestCase):
             "Bot Manager can view the subscription status.",
         )
 
-    async def test_auth_add_accepts_unlimited_and_illimite(self):
-        ctx = SimpleNamespace()
+    async def test_auth_add_prompts_tier_before_guild_id(self):
         for value in ("unlimited", "illimité", "0"):
+            dm_channel = SimpleNamespace(id=77, send=AsyncMock())
+            author = SimpleNamespace(id=1234)
+            author.create_dm = AsyncMock(return_value=dm_channel)
+            ctx = SimpleNamespace(
+                author=author,
+                message=SimpleNamespace(delete=AsyncMock()),
+            )
+            tier_message = SimpleNamespace(
+                author=author,
+                channel=dm_channel,
+                content="Gold",
+            )
+            guild_message = SimpleNamespace(
+                author=author,
+                channel=dm_channel,
+                content="123",
+            )
             with (
                 patch("main.repository.is_guild_authorized", return_value=False),
                 patch("main.repository.authorize_guild") as authorize,
                 patch(
-                    "main.send_private_command_feedback",
-                    new=AsyncMock(),
-                ),
+                    "main.bot.wait_for",
+                    new=AsyncMock(side_effect=[tier_message, guild_message]),
+                ) as wait_for,
             ):
-                await auth_add.callback(ctx, 123, value)
-                authorize.assert_called_once_with(123, 0)
+                await auth_add.callback(ctx, value)
+                authorize.assert_called_once_with(
+                    123,
+                    0,
+                    license_type="Gold",
+                )
+                self.assertIn(
+                    "Choose the authorization tier first",
+                    dm_channel.send.await_args_list[0].args[0],
+                )
+                self.assertIn(
+                    "Now send the guild ID",
+                    dm_channel.send.await_args_list[1].args[0],
+                )
+                self.assertEqual(wait_for.await_count, 2)
 
     def test_status_alias_is_registered(self):
         self.assertIn("status", subscription_status.aliases)

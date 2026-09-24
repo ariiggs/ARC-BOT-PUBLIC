@@ -64,17 +64,19 @@ class V15UpdateTests(unittest.TestCase):
             self.assertEqual(restored.pw_type, "fixed")
             self.assertEqual(restored.fixed_pw, "")
             self.assertEqual(restored.current_match_counter, 1)
-        self.assertEqual(migrated.payload()["version"], 29)
+        self.assertEqual(migrated.payload()["version"], 30)
 
     def test_help_text_contains_both_categories_and_fits_discord_message_limit(self):
         help_text = build_help_text()
 
         self.assertTrue(help_text.startswith(">>> "))
         self.assertIn("!setup", help_text)
+        self.assertIn("!setres", help_text)
         self.assertIn("!register Team / TAG [/ @Manager]", help_text)
         self.assertIn("!cap add|transfer|remove @User", help_text)
         self.assertIn(f"!resg1-{MAX_MATCHES} slot kills placement", help_text)
         self.assertIn(f"!resg1-{MAX_MATCHES} slot kills placement", HELP_COPY_TEXT)
+        self.assertIn("!setres", HELP_COPY_TEXT)
         self.assertNotIn("```", help_text)
         self.assertLessEqual(len(help_text), 1000)
 

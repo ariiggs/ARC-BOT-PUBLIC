@@ -115,7 +115,7 @@ class CustomEmojiTests(unittest.TestCase):
                     "head_staff_role_id",
                     "staff_role_id",
                     "logs_channel_id",
-                     "license_type",
+                    "license_type",
                 },
             )
             self.assertEqual(
@@ -146,7 +146,7 @@ class CustomEmojiTests(unittest.TestCase):
                     "public_message_id",
                     "staff_message_id",
                     "is_open",
-                     "registration_open",
+                    "registration_open",
                     "operational_messages",
                     "operational_message_refs",
                     "slot_start",
@@ -159,9 +159,9 @@ class CustomEmojiTests(unittest.TestCase):
                     "pw_type",
                     "fixed_pw",
                     "current_match_counter",
-                     "kill_points_value",
-                     "placement_points_string",
-                     "leaderboard_layout",
+                    "kill_points_value",
+                    "placement_points_string",
+                    "leaderboard_layout",
                     "leaderboard_background",
                     "leaderboard_accent_color",
                     "leaderboard_accent_colors",
@@ -169,7 +169,7 @@ class CustomEmojiTests(unittest.TestCase):
                     "leaderboard_orientation",
                     "leaderboard_header_height",
                     "leaderboard_footer_height",
-                     "match_scores",
+                    "match_scores",
                     "pending_registrations",
                 },
             )
@@ -208,10 +208,10 @@ class CustomEmojiTests(unittest.TestCase):
                     "head_staff_role_id",
                     "staff_role_id",
                     "logs_channel_id",
-                     "license_type",
+                    "license_type",
                 },
             )
-            self.assertEqual(migrated.payload()["version"], 29)
+            self.assertEqual(migrated.payload()["version"], 30)
 
 
 if __name__ == "__main__":

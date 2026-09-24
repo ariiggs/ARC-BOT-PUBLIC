@@ -3022,10 +3022,10 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     self.leaderboard_layout = values[2]
                     if self.leaderboard_layout not in LEADERBOARD_LAYOUTS:
                         raise ValueError("Layout must be 1_col or 2_col.")
-                    config = repository.get_server_config(self.guild_id)
                     if (
                         self.leaderboard_layout == "2_col"
-                        and getattr(config, "license_type", "Standard") != "Gold"
+                        and repository.get_server_license_type(self.guild_id)
+                        != "Gold"
                     ):
                         raise ValueError("The 2-column layout requires a Gold license.")
                 else:
