@@ -32,8 +32,6 @@ from scrim_state import (
     DEFAULT_LEADERBOARD_HEADER_HEIGHT,
     DEFAULT_LEADERBOARD_ORIENTATION,
     DEFAULT_LEADERBOARD_TEAM_COUNT,
-    LEADERBOARD_FOOTER_HEIGHTS,
-    LEADERBOARD_HEADER_HEIGHTS,
     OPERATIONAL_MESSAGE_KEYS,
     LEADERBOARD_LAYOUTS,
     LEADERBOARD_ORIENTATIONS,
@@ -5259,16 +5257,6 @@ async def _store_leaderboard_background(
     required_dimensions = leaderboard_canvas_dimensions(
         team_count,
         orientation,
-        getattr(
-            scrim,
-            "leaderboard_header_height",
-            DEFAULT_LEADERBOARD_HEADER_HEIGHT,
-        ),
-        getattr(
-            scrim,
-            "leaderboard_footer_height",
-            DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
-        ),
     )
     try:
         with Image.open(io.BytesIO(payload)) as source:
@@ -6448,18 +6436,26 @@ def _fit_font(
 def leaderboard_canvas_dimensions(
     team_count: int,
     orientation: str,
-    header_height: int,
-    footer_height: int,
+    header_height: int | None = None,
+    footer_height: int | None = None,
 ) -> tuple[int, int]:
-    """Return the exact canvas size for a configured leaderboard."""
+    """Return canvas dimensions with the fixed header and footer bands."""
     if team_count not in LEADERBOARD_TEAM_COUNTS:
         raise ValueError("Choose 16, 18, 20, 22, or 24 teams.")
     if orientation not in LEADERBOARD_ORIENTATIONS:
         raise ValueError("Choose a vertical or horizontal layout.")
-    if header_height not in LEADERBOARD_HEADER_HEIGHTS:
-        raise ValueError("Choose a supported header height.")
-    if footer_height not in LEADERBOARD_FOOTER_HEIGHTS:
-        raise ValueError("Choose a supported footer height.")
+    if header_height not in (None, DEFAULT_LEADERBOARD_HEADER_HEIGHT):
+        raise ValueError(
+            f"Leaderboard header height is fixed at "
+            f"{DEFAULT_LEADERBOARD_HEADER_HEIGHT}px."
+        )
+    if footer_height not in (None, DEFAULT_LEADERBOARD_FOOTER_HEIGHT):
+        raise ValueError(
+            f"Leaderboard footer height is fixed at "
+            f"{DEFAULT_LEADERBOARD_FOOTER_HEIGHT}px."
+        )
+    header_height = DEFAULT_LEADERBOARD_HEADER_HEIGHT
+    footer_height = DEFAULT_LEADERBOARD_FOOTER_HEIGHT
     width = (
         LEADERBOARD_VERTICAL_WIDTH
         if orientation == "vertical"
@@ -6485,22 +6481,11 @@ def leaderboard_canvas_dimensions(
 def _build_empty_leaderboard_blueprint(scrim: Scrim) -> tuple[io.BytesIO, str]:
     """Create an upload-ready empty canvas for the scrim's current profile."""
     orientation, team_count = _leaderboard_scrim_profile(scrim)
-    header_height = getattr(
-        scrim,
-        "leaderboard_header_height",
-        DEFAULT_LEADERBOARD_HEADER_HEIGHT,
-    )
-    footer_height = getattr(
-        scrim,
-        "leaderboard_footer_height",
-        DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
-    )
     width, height = leaderboard_canvas_dimensions(
         team_count,
         orientation,
-        header_height,
-        footer_height,
     )
+    header_height = DEFAULT_LEADERBOARD_HEADER_HEIGHT
     with Image.open(LEADERBOARD_BACKGROUND) as background:
         output = ImageOps.fit(
             background.convert("RGB"),
@@ -6558,16 +6543,7 @@ def _build_configured_leaderboard_image(
         "leaderboard_orientation",
         DEFAULT_LEADERBOARD_ORIENTATION,
     )
-    header_height = getattr(
-        scrim,
-        "leaderboard_header_height",
-        DEFAULT_LEADERBOARD_HEADER_HEIGHT,
-    )
-    footer_height = getattr(
-        scrim,
-        "leaderboard_footer_height",
-        DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
-    )
+    header_height = DEFAULT_LEADERBOARD_HEADER_HEIGHT
     if orientation == "horizontal":
         if repository.get_server_license_type(scrim.guild_id) != "Gold":
             orientation = "vertical"
@@ -6576,9 +6552,8 @@ def _build_configured_leaderboard_image(
     width, height = leaderboard_canvas_dimensions(
         team_limit,
         orientation,
-        header_height,
-        footer_height,
     )
+    footer_height = DEFAULT_LEADERBOARD_FOOTER_HEIGHT
     with Image.open(background_path) as source_background:
         output = ImageOps.fit(
             source_background.convert("RGB"),

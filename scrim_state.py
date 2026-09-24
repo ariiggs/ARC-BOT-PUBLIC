@@ -50,12 +50,12 @@ DEFAULT_LEADERBOARD_BACKGROUND = "reference"
 LEADERBOARD_BACKGROUNDS = ("reference", "legacy")
 LEADERBOARD_TEAM_COUNTS = (16, 18, 20, 22, 24)
 LEADERBOARD_ORIENTATIONS = ("vertical", "horizontal")
-LEADERBOARD_HEADER_HEIGHTS = (120, 160, 180, 220, 260)
-LEADERBOARD_FOOTER_HEIGHTS = (80, 120, 160, 200, 240)
 DEFAULT_LEADERBOARD_TEAM_COUNT = 24
 DEFAULT_LEADERBOARD_ORIENTATION = "vertical"
 DEFAULT_LEADERBOARD_HEADER_HEIGHT = 180
 DEFAULT_LEADERBOARD_FOOTER_HEIGHT = 120
+LEADERBOARD_HEADER_HEIGHTS = (DEFAULT_LEADERBOARD_HEADER_HEIGHT,)
+LEADERBOARD_FOOTER_HEIGHTS = (DEFAULT_LEADERBOARD_FOOTER_HEIGHT,)
 DEFAULT_LEADERBOARD_ACCENT_COLOR = "#FFFFFF"
 
 
@@ -894,7 +894,7 @@ class ScrimRepository:
 
     def payload(self) -> dict:
         return {
-            "version": 30,
+            "version": 31,
             "scrims": [s.payload() for s in self.scrims.values()],
             "server_configs": [
                 config.payload() for config in self.server_configs.values()
@@ -942,7 +942,7 @@ class ScrimRepository:
         try:
             version = payload.get("version")
             if type(version) is not int or version not in (
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
             ):
                 raise ValueError("Unsupported snapshot version.")
             if not isinstance(payload["scrims"], list):
@@ -1179,6 +1179,13 @@ class ScrimRepository:
                     if isinstance(legacy_accent, str):
                         values["leaderboard_accent_color"] = legacy_accent.upper()
                     values["leaderboard_accent_colors"] = accent_colors
+                if payload["version"] < 31:
+                    values["leaderboard_header_height"] = (
+                        DEFAULT_LEADERBOARD_HEADER_HEIGHT
+                    )
+                    values["leaderboard_footer_height"] = (
+                        DEFAULT_LEADERBOARD_FOOTER_HEIGHT
+                    )
                 values["leaderboard_accent_colors"] = (
                     normalize_leaderboard_accent_colors(
                         values.get("leaderboard_accent_colors", {})
@@ -1560,7 +1567,7 @@ class ScrimRepository:
             except (KeyError, TypeError, ValueError) as error:
                 raise SlotStorageError("Invalid legacy snapshot; migration was stopped.") from error
             new_payload = {
-                "version": 30,
+                "version": 31,
                 "scrims": [],
                 "server_configs": [],
                 "idpw_configs": [],
@@ -1606,7 +1613,7 @@ class ScrimRepository:
         self.authorized_guild_duration_days = authorized_guild_duration_days
         self.authorized_guild_license_types = authorized_guild_license_types
         self.authorized_admin_ids = authorized_admin_ids
-        if payload.get("version", 0) < 30:
+        if payload.get("version", 0) < 31:
             self.store.save(self.payload())
 
     @contextmanager
@@ -1931,16 +1938,18 @@ class ScrimRepository:
                 )
         else:
             next_orientation = leaderboard_orientation
-        next_header_height = (
-            scrim.leaderboard_header_height
-            if leaderboard_header_height is _UNSET
-            else leaderboard_header_height
-        )
-        next_footer_height = (
-            scrim.leaderboard_footer_height
-            if leaderboard_footer_height is _UNSET
-            else leaderboard_footer_height
-        )
+        if (
+            leaderboard_header_height is not _UNSET
+            and leaderboard_header_height != DEFAULT_LEADERBOARD_HEADER_HEIGHT
+        ) or (
+            leaderboard_footer_height is not _UNSET
+            and leaderboard_footer_height != DEFAULT_LEADERBOARD_FOOTER_HEIGHT
+        ):
+            raise ValueError(
+                "Leaderboard header and footer dimensions are fixed."
+            )
+        next_header_height = DEFAULT_LEADERBOARD_HEADER_HEIGHT
+        next_footer_height = DEFAULT_LEADERBOARD_FOOTER_HEIGHT
         if (
             type(next_kill_points) is not int
             or next_kill_points < 0

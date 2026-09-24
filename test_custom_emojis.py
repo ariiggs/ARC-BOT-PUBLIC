@@ -211,7 +211,7 @@ class CustomEmojiTests(unittest.TestCase):
                     "license_type",
                 },
             )
-            self.assertEqual(migrated.payload()["version"], 30)
+            self.assertEqual(migrated.payload()["version"], 31)
 
 
 if __name__ == "__main__":
