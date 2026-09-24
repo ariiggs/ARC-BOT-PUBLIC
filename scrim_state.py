@@ -48,6 +48,14 @@ DEFAULT_PLACEMENT_POINTS_STRING = "10 6 5 4 3 2 1"
 LEADERBOARD_LAYOUTS = ("1_col", "2_col")
 DEFAULT_LEADERBOARD_BACKGROUND = "reference"
 LEADERBOARD_BACKGROUNDS = ("reference", "legacy")
+LEADERBOARD_TEAM_COUNTS = (16, 18, 20, 22, 24)
+LEADERBOARD_ORIENTATIONS = ("vertical", "horizontal")
+LEADERBOARD_HEADER_HEIGHTS = (120, 160, 180, 220, 260)
+LEADERBOARD_FOOTER_HEIGHTS = (80, 120, 160, 200, 240)
+DEFAULT_LEADERBOARD_TEAM_COUNT = 24
+DEFAULT_LEADERBOARD_ORIENTATION = "vertical"
+DEFAULT_LEADERBOARD_HEADER_HEIGHT = 180
+DEFAULT_LEADERBOARD_FOOTER_HEIGHT = 120
 EMOJI_FIELDS = (
     "emoji_available",
     "emoji_reserved",
@@ -318,6 +326,10 @@ class Scrim:
     placement_points_string: str = DEFAULT_PLACEMENT_POINTS_STRING
     leaderboard_layout: str = "1_col"
     leaderboard_background: str = DEFAULT_LEADERBOARD_BACKGROUND
+    leaderboard_team_count: int = DEFAULT_LEADERBOARD_TEAM_COUNT
+    leaderboard_orientation: str = DEFAULT_LEADERBOARD_ORIENTATION
+    leaderboard_header_height: int = DEFAULT_LEADERBOARD_HEADER_HEIGHT
+    leaderboard_footer_height: int = DEFAULT_LEADERBOARD_FOOTER_HEIGHT
     match_scores: dict[tuple[int, int], MatchScore] = field(default_factory=dict)
     pending_registrations: dict[str, RegistrationRequest] = field(
         default_factory=dict
@@ -370,6 +382,10 @@ class Scrim:
             "placement_points_string": self.placement_points_string,
             "leaderboard_layout": self.leaderboard_layout,
             "leaderboard_background": self.leaderboard_background,
+            "leaderboard_team_count": self.leaderboard_team_count,
+            "leaderboard_orientation": self.leaderboard_orientation,
+            "leaderboard_header_height": self.leaderboard_header_height,
+            "leaderboard_footer_height": self.leaderboard_footer_height,
             "match_scores": [
                 asdict(score)
                 for _, score in sorted(self.match_scores.items())
@@ -760,7 +776,7 @@ class ScrimRepository:
 
     def payload(self) -> dict:
         return {
-            "version": 26,
+            "version": 27,
             "scrims": [s.payload() for s in self.scrims.values()],
             "server_configs": [
                 config.payload() for config in self.server_configs.values()
@@ -801,7 +817,7 @@ class ScrimRepository:
         try:
             version = payload.get("version")
             if type(version) is not int or version not in (
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27
             ):
                 raise ValueError("Unsupported snapshot version.")
             if not isinstance(payload["scrims"], list):
@@ -971,6 +987,25 @@ class ScrimRepository:
                         "leaderboard_background",
                         DEFAULT_LEADERBOARD_BACKGROUND,
                     )
+                if payload["version"] < 27:
+                    values.setdefault(
+                        "leaderboard_team_count",
+                        DEFAULT_LEADERBOARD_TEAM_COUNT,
+                    )
+                    values.setdefault(
+                        "leaderboard_orientation",
+                        "horizontal"
+                        if values.get("leaderboard_layout") == "2_col"
+                        else DEFAULT_LEADERBOARD_ORIENTATION,
+                    )
+                    values.setdefault(
+                        "leaderboard_header_height",
+                        DEFAULT_LEADERBOARD_HEADER_HEIGHT,
+                    )
+                    values.setdefault(
+                        "leaderboard_footer_height",
+                        DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
+                    )
                 # Match selectors now support at most 25 games. Keep older
                 # snapshots usable by trimming only the newly unsupported tail.
                 if type(values.get("max_matches")) is int and values["max_matches"] > MAX_MATCHES:
@@ -1038,6 +1073,8 @@ class ScrimRepository:
                      "current_match_counter", "kill_points_value",
                      "placement_points_string", "leaderboard_layout",
                      "leaderboard_background",
+                     "leaderboard_team_count", "leaderboard_orientation",
+                     "leaderboard_header_height", "leaderboard_footer_height",
                      "match_scores", "pending_registrations",
                 }:
                     raise ValueError("Invalid scrim fields.")
@@ -1143,6 +1180,10 @@ class ScrimRepository:
                     )
                     or scrim.leaderboard_layout not in LEADERBOARD_LAYOUTS
                     or scrim.leaderboard_background not in LEADERBOARD_BACKGROUNDS
+                    or scrim.leaderboard_team_count not in LEADERBOARD_TEAM_COUNTS
+                    or scrim.leaderboard_orientation not in LEADERBOARD_ORIENTATIONS
+                    or scrim.leaderboard_header_height not in LEADERBOARD_HEADER_HEIGHTS
+                    or scrim.leaderboard_footer_height not in LEADERBOARD_FOOTER_HEIGHTS
                 ):
                     raise ValueError("Invalid scrim identity or channel.")
                 name_key = (scrim.guild_id, scrim.name.casefold())
@@ -1316,7 +1357,7 @@ class ScrimRepository:
             except (KeyError, TypeError, ValueError) as error:
                 raise SlotStorageError("Invalid legacy snapshot; migration was stopped.") from error
             new_payload = {
-                "version": 26,
+                "version": 27,
                 "scrims": [],
                 "server_configs": [],
                 "idpw_configs": [],
@@ -1358,7 +1399,7 @@ class ScrimRepository:
         self.authorized_guild_expires_at = authorized_guild_expires_at
         self.authorized_guild_duration_days = authorized_guild_duration_days
         self.authorized_admin_ids = authorized_admin_ids
-        if payload.get("version", 0) < 26:
+        if payload.get("version", 0) < 27:
             self.store.save(self.payload())
 
     @contextmanager
@@ -1421,6 +1462,10 @@ class ScrimRepository:
                     "placement_points_string",
                     "leaderboard_layout",
                     "leaderboard_background",
+                    "leaderboard_team_count",
+                    "leaderboard_orientation",
+                    "leaderboard_header_height",
+                    "leaderboard_footer_height",
                     "match_scores",
                     "pending_registrations",
                 ):
@@ -1620,6 +1665,10 @@ class ScrimRepository:
         placement_points_string: str | object = _UNSET,
         leaderboard_layout: str | object = _UNSET,
         leaderboard_background: str | object = _UNSET,
+        leaderboard_team_count: int | object = _UNSET,
+        leaderboard_orientation: str | object = _UNSET,
+        leaderboard_header_height: int | object = _UNSET,
+        leaderboard_footer_height: int | object = _UNSET,
     ) -> Scrim:
         scrim = self.get(scrim_id)
         if scrim is None or scrim.guild_id != guild_id:
@@ -1644,19 +1693,58 @@ class ScrimRepository:
             if leaderboard_background is _UNSET
             else leaderboard_background
         )
+        next_team_count = (
+            scrim.leaderboard_team_count
+            if leaderboard_team_count is _UNSET
+            else leaderboard_team_count
+        )
+        if leaderboard_orientation is _UNSET:
+            next_orientation = scrim.leaderboard_orientation
+            if leaderboard_layout is not _UNSET:
+                next_orientation = (
+                    "horizontal" if next_layout == "2_col" else "vertical"
+                )
+        else:
+            next_orientation = leaderboard_orientation
+        next_header_height = (
+            scrim.leaderboard_header_height
+            if leaderboard_header_height is _UNSET
+            else leaderboard_header_height
+        )
+        next_footer_height = (
+            scrim.leaderboard_footer_height
+            if leaderboard_footer_height is _UNSET
+            else leaderboard_footer_height
+        )
         if (
             type(next_kill_points) is not int
             or next_kill_points < 0
             or not parse_placement_points(next_placement_points)
             or next_layout not in LEADERBOARD_LAYOUTS
             or next_background not in LEADERBOARD_BACKGROUNDS
+            or next_team_count not in LEADERBOARD_TEAM_COUNTS
+            or next_orientation not in LEADERBOARD_ORIENTATIONS
+            or next_header_height not in LEADERBOARD_HEADER_HEIGHTS
+            or next_footer_height not in LEADERBOARD_FOOTER_HEIGHTS
         ):
             raise ValueError("Invalid leaderboard configuration.")
+        if (
+            next_orientation == "horizontal"
+            and getattr(self.server_configs.get(guild_id), "license_type", "Standard")
+            != "Gold"
+        ):
+            raise ValueError("Horizontal layout requires a Gold license.")
         with self.transaction():
             scrim.kill_points_value = next_kill_points
             scrim.placement_points_string = next_placement_points
-            scrim.leaderboard_layout = next_layout
+            scrim.leaderboard_layout = (
+                "2_col" if next_orientation == "horizontal" else "1_col"
+            )
             scrim.leaderboard_background = next_background
+            scrim.leaderboard_team_count = next_team_count
+            scrim.leaderboard_orientation = next_orientation
+            scrim.leaderboard_header_height = next_header_height
+            scrim.leaderboard_footer_height = next_footer_height
         return scrim
 
     def get_match_scores(self, scrim_id: str) -> list[MatchScore]:

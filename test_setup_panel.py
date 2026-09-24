@@ -3,7 +3,11 @@ import tempfile
 from types import SimpleNamespace
 from pathlib import Path
 
-from setup_panel import _scrim_configuration_details
+from setup_panel import (
+    ADDITIONAL_SETTINGS_SECTIONS,
+    _cap_transfer_summary,
+    _scrim_configuration_details,
+)
 from scrim_state import ScrimRepository
 from slot_storage import SlotStateStore
 
@@ -127,8 +131,25 @@ class SetupPanelTests(unittest.TestCase):
         details = _scrim_configuration_details(scrim, repository)
 
         self.assertIn("ID/PW target: <#999>", details)
+        self.assertIn("Cap Transfer channel: <#103>", details)
         self.assertIn("Map rotation: **2 Matches Configured**", details)
         self.assertIn("Current match: **1** / 2", details)
+
+    def test_cap_transfer_is_available_and_visible_as_an_additional_setting(self):
+        scrim = SimpleNamespace(cap_channel_id=103)
+
+        self.assertIn(
+            ("cap_transfer", "Cap Transfer", "🔁"),
+            ADDITIONAL_SETTINGS_SECTIONS,
+        )
+        self.assertEqual(
+            _cap_transfer_summary(scrim),
+            "🟢 Cap Transfer (`!cap`): <#103>",
+        )
+        self.assertEqual(
+            _cap_transfer_summary(SimpleNamespace(cap_channel_id=None)),
+            "⚪ Cap Transfer (`!cap`): Not configured",
+        )
 
 
 if __name__ == "__main__":

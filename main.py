@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -16,7 +17,7 @@ from pathlib import Path
 
 import discord
 from discord.ext import commands
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from slot_storage import SlotStateStore, SlotStorageError
 from scrim_state import (
@@ -26,8 +27,16 @@ from scrim_state import (
     STATUS_RESERVED,
     DEFAULT_PLACEMENT_POINTS_STRING,
     DEFAULT_OPERATIONAL_MESSAGES,
+    DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
+    DEFAULT_LEADERBOARD_HEADER_HEIGHT,
+    DEFAULT_LEADERBOARD_ORIENTATION,
+    DEFAULT_LEADERBOARD_TEAM_COUNT,
+    LEADERBOARD_FOOTER_HEIGHTS,
+    LEADERBOARD_HEADER_HEIGHTS,
     OPERATIONAL_MESSAGE_KEYS,
     LEADERBOARD_LAYOUTS,
+    LEADERBOARD_ORIENTATIONS,
+    LEADERBOARD_TEAM_COUNTS,
     MatchScore,
     MAX_MATCHES,
     Scrim,
@@ -50,9 +59,16 @@ SUPPORT_SERVER_URL = "https://discord.gg/S8uaGEJGv8"
 LEADERBOARD_BACKGROUND = (
     Path(__file__).parent / "assets" / "leaderboard-background.png"
 )
-LEGACY_LEADERBOARD_BACKGROUND = (
-    Path(__file__).parent / "assets" / "leaderboard-background-legacy.png"
+LEADERBOARD_BACKGROUND_UPLOAD_DIR = (
+    Path(__file__).parent / "data" / "leaderboard-backgrounds"
 )
+MAX_LEADERBOARD_BACKGROUND_UPLOAD_BYTES = 8 * 1024 * 1024
+LEADERBOARD_VERTICAL_WIDTH = 1080
+LEADERBOARD_HORIZONTAL_WIDTH = 1920
+LEADERBOARD_OUTER_MARGIN = 28
+LEADERBOARD_SECTION_GAP = 22
+LEADERBOARD_TABLE_HEADER_HEIGHT = 64
+LEADERBOARD_ROW_HEIGHT = 48
 
 state_store = SlotStateStore(
     os.getenv("SLOTS_DB_PATH", str(Path(__file__).parent / "data" / "slots.sqlite3"))
@@ -70,7 +86,6 @@ _loaded = False
 # Each scrim owns its own live announcement and alert tasks.
 active_idpw: dict[str, dict[str, object]] = {}
 logs_coverage_snapshots_sent: set[str] = set()
-selected_scrims: dict[tuple[int, int], str] = {}
 
 
 class UnauthorizedGuild(commands.CheckFailure):
@@ -259,6 +274,18 @@ def member_is_staff_in_guild(member: object, guild_id: int) -> bool:
     )
 
 
+def member_can_configure_scrim(member: object, scrim: Scrim) -> bool:
+    """Check leaderboard configuration access for this specific scrim."""
+    if (
+        member_is_head_staff(member, scrim.guild_id)
+        or member_is_staff(member, scrim)
+    ):
+        return True
+    return scrim.staff_role_id is not None and scrim.staff_role_id in {
+        getattr(role, "id", None) for role in getattr(member, "roles", ())
+    }
+
+
 def member_is_admin(member: object) -> bool:
     permissions = getattr(member, "guild_permissions", None)
     return bool(
@@ -292,11 +319,19 @@ async def require_staff_scrim(
         return None
     scrim = resolve_channel_scrim(ctx)
     selected = False
-    if scrim is None and not public_only:
-        selected_scrim = resolve_selected_scrim(ctx)
-        if selected_scrim is not None:
-            scrim = selected_scrim
+    override = getattr(ctx, "_staff_scrim_override", None)
+    if scrim is None and not public_only and override is not None:
+        if (
+            is_active(override)
+            and override.guild_id == ctx.guild.id
+            and member_is_staff(ctx.author, override)
+        ):
+            scrim = override
             selected = True
+        try:
+            delattr(ctx, "_staff_scrim_override")
+        except AttributeError:
+            pass
     allowed_channel_ids = (
         (scrim.public_channel_id, scrim.staff_channel_id)
         if scrim is not None and allow_public
@@ -306,7 +341,10 @@ async def require_staff_scrim(
         if scrim is not None
         else ()
     )
-    if scrim is None or (not selected and ctx.channel.id not in allowed_channel_ids):
+    if scrim is None:
+        await show_staff_scrim_selector(ctx)
+        return None
+    if not selected and ctx.channel.id not in allowed_channel_ids:
         if public_only:
             message = "This command must be used in the configured public slots channel."
         elif allow_public:
@@ -562,61 +600,42 @@ def resolve_named_scrim(guild_id: int, name: str) -> Scrim | None:
 def resolve_channel_scrim(ctx: commands.Context, *, staff_only: bool = False) -> Scrim | None:
     if ctx.guild is None:
         return None
+    channel_id = getattr(ctx.channel, "id", None)
     matches = [
-        scrim for scrim in repository.list(ctx.guild.id)
-        if ctx.channel.id in (
-            (scrim.staff_channel_id,) if staff_only
-            else (scrim.public_channel_id, scrim.staff_channel_id)
+        scrim
+        for scrim in repository.list(ctx.guild.id)
+        if channel_id in (
+            (getattr(scrim, "staff_channel_id", None),)
+            if staff_only
+            else (
+                getattr(scrim, "public_channel_id", None),
+                getattr(scrim, "staff_channel_id", None),
+            )
         )
     ]
     return matches[0] if len(matches) == 1 else None
 
 
-def resolve_selected_scrim(ctx: commands.Context) -> Scrim | None:
-    """Return the user's selected scrim while it remains active on this server."""
-    if ctx.guild is None:
-        return None
-    key = (ctx.guild.id, ctx.author.id)
-    scrim_id = selected_scrims.get(key)
-    if scrim_id is None:
-        return None
-    scrim = repository.get(scrim_id)
-    if scrim is None or scrim.guild_id != ctx.guild.id:
-        selected_scrims.pop(key, None)
-        return None
-    return scrim
-
-
-def resolve_registration_scrim(ctx: commands.Context) -> Scrim | None:
-    """Resolve the scrim whose optional public registration channel was used."""
-    if ctx.guild is None:
-        return None
-    matches = [
-        scrim
-        for scrim in repository.list(ctx.guild.id)
-        if getattr(scrim, "registration_channel_id", None) == ctx.channel.id
-    ]
-    return matches[0] if len(matches) == 1 else None
-
-
-class UseScrimSelectView(discord.ui.View):
-    """Let Staff select an active scrim without typing its exact name."""
+class StaffScrimSelectView(discord.ui.View):
+    """Select a scrim for one Staff command without persisting the choice."""
 
     def __init__(
         self,
-        *,
-        owner_id: int,
-        guild_id: int,
+        ctx: commands.Context,
         scrims: list[Scrim],
     ) -> None:
         super().__init__(timeout=120)
-        self.owner_id = owner_id
-        self.guild_id = guild_id
+        self.ctx = ctx
+        self.owner_id = ctx.author.id
+        self.guild_id = ctx.guild.id
+        self.channel_id = ctx.channel.id
         self.scrim_ids = {scrim.id for scrim in scrims}
-        self.message = None
+        self.command = getattr(ctx, "command", None)
+        self.command_args = tuple(getattr(ctx, "args", (ctx,)))
+        self.command_kwargs = dict(getattr(ctx, "kwargs", {}))
 
         select = discord.ui.Select(
-            placeholder="Select an active scrim...",
+            placeholder="Select a scrim for this command...",
             min_values=1,
             max_values=1,
             options=[
@@ -635,9 +654,13 @@ class UseScrimSelectView(discord.ui.View):
                     ephemeral=True,
                 )
                 return
-            if interaction.guild is None or interaction.guild.id != self.guild_id:
+            if (
+                interaction.guild is None
+                or interaction.guild.id != self.guild_id
+                or interaction.channel_id != self.channel_id
+            ):
                 await interaction.response.send_message(
-                    "This selector is not valid in this server.",
+                    "This selector is not valid in this server or channel.",
                     ephemeral=True,
                 )
                 return
@@ -665,40 +688,55 @@ class UseScrimSelectView(discord.ui.View):
                 return
             if not member_is_staff(interaction.user, scrim):
                 await interaction.response.send_message(
-                    "You need the configured Staff role to select this scrim.",
+                    "You do not have the authorized Staff role for this scrim.",
                     ephemeral=True,
                 )
                 self.stop()
                 return
 
-            selected_scrims[(self.guild_id, interaction.user.id)] = scrim.id
+            disable_view_items(self)
+            self.stop()
             await interaction.response.edit_message(
                 content=(
-                    f"✅ Selected scrim: "
-                    f"**{discord.utils.escape_markdown(scrim.name)}**. "
-                    "Staff commands can now use it outside a configured scrim "
-                    "channel."
+                    f"✅ Running this command for "
+                    f"**{discord.utils.escape_markdown(scrim.name)}**."
                 ),
-                view=None,
+                view=self,
             )
-            self.stop()
+            setattr(self.ctx, "_staff_scrim_override", scrim)
+            try:
+                command = self.command
+                if command is None:
+                    await interaction.followup.send(
+                        "The command could not be resumed.",
+                        ephemeral=True,
+                    )
+                    return
+                callback = getattr(command, "callback", None)
+                if callback is not None:
+                    await callback(*self.command_args, **self.command_kwargs)
+                else:
+                    await command.invoke(self.ctx)
+            except Exception:
+                logger.exception("Could not resume the command after scrim selection.")
+            finally:
+                try:
+                    delattr(self.ctx, "_staff_scrim_override")
+                except AttributeError:
+                    pass
 
         select.callback = callback
         self.add_item(select)
 
 
-@bot.command(name="use", aliases=["select"])
-@commands.guild_only()
-async def use_scrim(ctx: commands.Context) -> None:
-    """Select a scrim for staff commands used outside a configured channel."""
+async def show_staff_scrim_selector(ctx: commands.Context) -> None:
+    """Ask Staff to choose a scrim for the current command invocation."""
     if ctx.guild is None:
         return
-
     active_scrims = [
         scrim
         for scrim in repository.list(ctx.guild.id)
-        if not getattr(scrim, "deleted", False)
-        and member_is_staff(ctx.author, scrim)
+        if is_active(scrim) and member_is_staff(ctx.author, scrim)
     ]
     if not active_scrims:
         await send_private_command_feedback(
@@ -708,21 +746,29 @@ async def use_scrim(ctx: commands.Context) -> None:
         )
         return
 
-    view = UseScrimSelectView(
-        owner_id=ctx.author.id,
-        guild_id=ctx.guild.id,
-        scrims=active_scrims,
-    )
+    view = StaffScrimSelectView(ctx, active_scrims)
     try:
-        view.message = await ctx.send(
-            "Select an active scrim to use for your staff commands:",
+        await ctx.send(
+            "Select a scrim for this command:",
             view=view,
             delete_after=120,
         )
     except discord.HTTPException:
-        logger.exception("Could not show the !use scrim selector.")
+        logger.exception("Could not show the Staff scrim selector.")
     finally:
         await delete_command_message(ctx)
+
+
+def resolve_registration_scrim(ctx: commands.Context) -> Scrim | None:
+    """Resolve the scrim whose optional public registration channel was used."""
+    if ctx.guild is None:
+        return None
+    matches = [
+        scrim
+        for scrim in repository.list(ctx.guild.id)
+        if getattr(scrim, "registration_channel_id", None) == ctx.channel.id
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def registration_role_allows(ctx: commands.Context, scrim: Scrim) -> bool:
@@ -3426,6 +3472,14 @@ async def _record_match_scores(
     scrim = await require_staff_scrim(ctx)
     if scrim is None:
         return
+    if match_number > scrim.max_matches:
+        await send_private_command_feedback(
+            ctx,
+            f"❌ Match {match_number} is not configured for this scrim. "
+            f"The match limit is {scrim.max_matches}.",
+            silent=False,
+        )
+        return
     scores = parse_match_score_lines(
         input_string,
         match_number=match_number,
@@ -3458,7 +3512,7 @@ async def _record_match_scores(
 
 
 def _register_specific_score_commands() -> None:
-    for match_number in range(1, 11):
+    for match_number in range(1, MAX_MATCHES + 1):
         def make_score_handler(game_number: int):
             async def specific_score(
                 ctx: commands.Context,
@@ -3475,6 +3529,1071 @@ def _register_specific_score_commands() -> None:
 
 
 _register_specific_score_commands()
+
+
+_leaderboard_background_locks: dict[str, asyncio.Lock] = {}
+
+
+def _leaderboard_background_path(scrim_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{16}", scrim_id):
+        raise ValueError("Invalid scrim id for a leaderboard background.")
+    return LEADERBOARD_BACKGROUND_UPLOAD_DIR / f"{scrim_id}.png"
+
+
+def _leaderboard_background_metadata_path(scrim_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{16}", scrim_id):
+        raise ValueError("Invalid scrim id for a leaderboard background.")
+    return LEADERBOARD_BACKGROUND_UPLOAD_DIR / f"{scrim_id}.json"
+
+
+def _read_leaderboard_background_metadata(scrim_id: str) -> dict[str, object]:
+    path = _leaderboard_background_metadata_path(scrim_id)
+    if not path.exists():
+        return {}
+    try:
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("The saved leaderboard background link could not be read.") from error
+    if not isinstance(metadata, dict):
+        raise ValueError("The saved leaderboard background link is invalid.")
+    return metadata
+
+
+def _write_leaderboard_background_metadata(
+    scrim_id: str,
+    metadata: dict[str, object],
+) -> None:
+    path = _leaderboard_background_metadata_path(scrim_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    temporary_path.write_text(
+        json.dumps(metadata, ensure_ascii=True),
+        encoding="utf-8",
+    )
+    os.replace(temporary_path, path)
+
+
+def _current_leaderboard_background_path(scrim: Scrim) -> Path:
+    custom_path = _leaderboard_background_path(scrim.id)
+    return custom_path if custom_path.is_file() else LEADERBOARD_BACKGROUND
+
+
+def _leaderboard_background_lock(scrim_id: str) -> asyncio.Lock:
+    lock = _leaderboard_background_locks.get(scrim_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _leaderboard_background_locks[scrim_id] = lock
+    return lock
+
+
+async def _delete_background_preview(
+    metadata: dict[str, object],
+) -> None:
+    channel_id = metadata.get("channel_id")
+    message_id = metadata.get("message_id")
+    if type(channel_id) is not int or type(message_id) is not int:
+        return
+    channel = bot.get_channel(channel_id)
+    if channel is None or not hasattr(channel, "fetch_message"):
+        return
+    try:
+        message = await channel.fetch_message(message_id)
+        await message.delete()
+    except (discord.NotFound, discord.Forbidden):
+        return
+    except discord.HTTPException:
+        logger.exception("Could not remove replaced leaderboard background preview")
+
+
+async def _ensure_leaderboard_background_preview(
+    scrim: Scrim,
+    channel: object,
+) -> str:
+    """Return a durable Discord CDN link for this scrim's current background."""
+    async with _leaderboard_background_lock(scrim.id):
+        metadata = _read_leaderboard_background_metadata(scrim.id)
+        channel_id = metadata.get("channel_id")
+        message_id = metadata.get("message_id")
+        if type(channel_id) is int and type(message_id) is int:
+            preview_channel = bot.get_channel(channel_id)
+            if preview_channel is not None and hasattr(
+                preview_channel,
+                "fetch_message",
+            ):
+                try:
+                    preview_message = await preview_channel.fetch_message(message_id)
+                    if preview_message.attachments:
+                        return preview_message.attachments[0].url
+                except (discord.NotFound, discord.Forbidden):
+                    pass
+                except discord.HTTPException:
+                    logger.exception(
+                        "Could not check leaderboard background preview for %s",
+                        scrim.id,
+                    )
+        if not hasattr(channel, "send"):
+            raise ValueError("The current channel cannot host a background preview.")
+        background_path = _current_leaderboard_background_path(scrim)
+        preview_file = discord.File(
+            background_path,
+            filename=f"leaderboard-background-{scrim.id}.png",
+        )
+        try:
+            preview = await channel.send(
+                content=(
+                    "Current leaderboard background for "
+                    f"**{discord.utils.escape_markdown(scrim.name)}**"
+                ),
+                file=preview_file,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        finally:
+            preview_file.close()
+        if not preview.attachments:
+            raise RuntimeError("Discord did not return the uploaded background link.")
+        attachment_url = preview.attachments[0].url
+        _write_leaderboard_background_metadata(
+            scrim.id,
+            {
+                "channel_id": preview.channel.id,
+                "message_id": preview.id,
+                "attachment_url": attachment_url,
+            },
+        )
+        return attachment_url
+
+
+def _available_leaderboard_scrims(
+    guild_id: int,
+    member: object,
+) -> list[Scrim]:
+    return [
+        scrim
+        for scrim in repository.list(guild_id)
+        if is_active(scrim) and member_can_configure_scrim(member, scrim)
+    ]
+
+
+class LeaderboardPanelView(discord.ui.View):
+    """Owner- and scrim-bound base for the standalone leaderboard panel."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        scrim_id: str | None = None,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.scrim_id = scrim_id
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the staff member who opened this panel can use it.",
+                ephemeral=True,
+            )
+            return False
+        if interaction.guild_id != self.guild_id:
+            await interaction.response.send_message(
+                "This leaderboard panel is not valid in this server.",
+                ephemeral=True,
+            )
+            return False
+        if self.scrim_id is not None:
+            scrim = repository.get(self.scrim_id)
+            if (
+                scrim is None
+                or scrim.guild_id != self.guild_id
+                or not is_active(scrim)
+                or not member_can_configure_scrim(interaction.user, scrim)
+            ):
+                await interaction.response.send_message(
+                    "You no longer have access to this leaderboard panel.",
+                    ephemeral=True,
+                )
+                return False
+        return True
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[object],
+    ) -> None:
+        logger.error(
+            "Leaderboard panel interaction failed",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        message = "Could not update leaderboard settings. Please try again."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
+
+class LeaderboardSettingsView(LeaderboardPanelView):
+    """Dashboard for the separate !setres staff panel."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        scrims: list[Scrim],
+        has_created_scrims: bool | None = None,
+    ) -> None:
+        super().__init__(owner_id=owner_id, guild_id=guild_id)
+        self.scrim_ids = [scrim.id for scrim in scrims]
+        self.has_created_scrims = (
+            bool(repository.list(guild_id))
+            if has_created_scrims is None
+            else has_created_scrims
+        )
+        self.rebuild()
+
+    def content(self) -> str:
+        return (
+            "**Leaderboard Settings**\n"
+            "Edit the leaderboard presentation for one of your active scrims."
+        )
+
+    def embed(self) -> discord.Embed:
+        if self.scrim_ids:
+            scrims = [
+                repository.get(scrim_id)
+                for scrim_id in self.scrim_ids
+            ]
+            description = "\n".join(
+                f"• **{discord.utils.escape_markdown(scrim.name)}**"
+                for scrim in scrims
+                if scrim is not None and scrim.guild_id == self.guild_id
+            )
+        elif not self.has_created_scrims:
+            description = (
+                "No scrims have been created yet. Use `!setup` to create one."
+            )
+        else:
+            description = (
+                "No active scrims are available to your Staff role."
+            )
+        return discord.Embed(
+            title="Leaderboard Settings",
+            description=description,
+            color=discord.Color.blurple(),
+        )
+
+    def rebuild(self) -> None:
+        self.clear_items()
+        edit_button = discord.ui.Button(
+            label="Edit Leaderboard",
+            emoji="📊",
+            style=discord.ButtonStyle.primary,
+            disabled=not self.scrim_ids,
+            row=0,
+        )
+
+        async def edit_callback(interaction: discord.Interaction) -> None:
+            scrims = _available_leaderboard_scrims(
+                self.guild_id,
+                interaction.user,
+            )
+            if not scrims:
+                self.scrim_ids = []
+                self.has_created_scrims = bool(repository.list(self.guild_id))
+                self.rebuild()
+                await interaction.response.edit_message(
+                    content=self.content(),
+                    embed=self.embed(),
+                    view=self,
+                )
+                return
+            if len(scrims) == 1:
+                await interaction.response.defer()
+                background_url = await _ensure_leaderboard_background_preview(
+                    scrims[0],
+                    interaction.channel,
+                )
+                view = LeaderboardScrimEditView(
+                    owner_id=self.owner_id,
+                    guild_id=self.guild_id,
+                    scrim_id=scrims[0].id,
+                    background_url=background_url,
+                )
+                await interaction.edit_original_response(
+                    content=view.content(),
+                    embed=view.embed(),
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            view = LeaderboardScrimSelectView(
+                owner_id=self.owner_id,
+                guild_id=self.guild_id,
+                scrims=scrims,
+            )
+            await interaction.response.edit_message(
+                content=view.content(),
+                embed=view.embed(),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        edit_button.callback = edit_callback
+        self.add_item(edit_button)
+
+        close_button = discord.ui.Button(
+            label="Close",
+            emoji="✖️",
+            style=discord.ButtonStyle.secondary,
+            row=0,
+        )
+
+        async def close_callback(interaction: discord.Interaction) -> None:
+            self.stop()
+            await interaction.response.edit_message(
+                content="Leaderboard settings closed.",
+                embed=None,
+                view=None,
+            )
+
+        close_button.callback = close_callback
+        self.add_item(close_button)
+
+
+class LeaderboardScrimSelectView(LeaderboardPanelView):
+    """Select an active scrim before opening its leaderboard settings."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        scrims: list[Scrim],
+    ) -> None:
+        super().__init__(owner_id=owner_id, guild_id=guild_id)
+        self.scrim_ids = [scrim.id for scrim in scrims]
+        self.scrims = scrims[:25]
+        self.rebuild()
+
+    def content(self) -> str:
+        return (
+            "**Edit Leaderboard**\n"
+            "Choose which scrim's leaderboard settings to edit."
+        )
+
+    def embed(self) -> discord.Embed:
+        return discord.Embed(
+            title="Select a Scrim",
+            description="Choose an active scrim from the dropdown below.",
+            color=discord.Color.blurple(),
+        )
+
+    def rebuild(self) -> None:
+        self.clear_items()
+        selector = discord.ui.Select(
+            placeholder="Choose a scrim",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=scrim.name[:100],
+                    value=scrim.id,
+                )
+                for scrim in self.scrims
+            ],
+            row=0,
+        )
+
+        async def select_callback(interaction: discord.Interaction) -> None:
+            selected_id = selector.values[0]
+            if selected_id not in self.scrim_ids:
+                await interaction.response.send_message(
+                    "That scrim selection is no longer available.",
+                    ephemeral=True,
+                )
+                return
+            selected = repository.get(selected_id)
+            if (
+                selected is None
+                or selected.guild_id != self.guild_id
+                or not is_active(selected)
+                or not member_can_configure_scrim(interaction.user, selected)
+            ):
+                await interaction.response.send_message(
+                    "You no longer have access to that scrim.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.defer()
+            background_url = await _ensure_leaderboard_background_preview(
+                selected,
+                interaction.channel,
+            )
+            view = LeaderboardScrimEditView(
+                owner_id=self.owner_id,
+                guild_id=self.guild_id,
+                scrim_id=selected.id,
+                background_url=background_url,
+            )
+            await interaction.edit_original_response(
+                content=view.content(),
+                embed=view.embed(),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        selector.callback = select_callback
+        self.add_item(selector)
+
+        back_button = discord.ui.Button(
+            label="Back to Dashboard",
+            emoji="↩️",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+
+        async def back_callback(interaction: discord.Interaction) -> None:
+            scrims = _available_leaderboard_scrims(
+                self.guild_id,
+                interaction.user,
+            )
+            view = LeaderboardSettingsView(
+                owner_id=self.owner_id,
+                guild_id=self.guild_id,
+                scrims=scrims,
+            )
+            await interaction.response.edit_message(
+                content=view.content(),
+                embed=view.embed(),
+                view=view,
+            )
+
+        back_button.callback = back_callback
+        self.add_item(back_button)
+
+
+class LeaderboardScrimEditView(LeaderboardPanelView):
+    """Show the selected scrim and its leaderboard controls."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        scrim_id: str,
+        background_url: str,
+    ) -> None:
+        super().__init__(
+            owner_id=owner_id,
+            guild_id=guild_id,
+            scrim_id=scrim_id,
+        )
+        self.background_url = background_url
+        self.rebuild()
+
+    def content(self) -> str:
+        return "**Edit Leaderboard**\nChanges are saved automatically."
+
+    def embed(self) -> discord.Embed:
+        scrim = repository.get(self.scrim_id)
+        if scrim is None or scrim.guild_id != self.guild_id:
+            return discord.Embed(
+                title="Scrim no longer exists",
+                color=discord.Color.red(),
+            )
+        config = repository.get_server_config(self.guild_id)
+        is_gold = getattr(config, "license_type", "Standard") == "Gold"
+        orientation = scrim.leaderboard_orientation
+        if orientation == "horizontal" and not is_gold:
+            orientation = "vertical"
+        saved_background_url = _read_leaderboard_background_metadata(
+            self.scrim_id
+        ).get("attachment_url")
+        if isinstance(saved_background_url, str) and saved_background_url:
+            self.background_url = saved_background_url
+        background_text = (
+            f"[View current background]({self.background_url})"
+            if self.background_url
+            else "Background link unavailable"
+        )
+        embed = discord.Embed(
+            title=f"Edit Leaderboard — {discord.utils.escape_markdown(scrim.name)}",
+            description=(
+                "Choose a setting below. Horizontal orientation requires Gold."
+                if not is_gold
+                else "Choose a leaderboard setting below."
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="Scrim",
+            value=discord.utils.escape_markdown(scrim.name),
+            inline=True,
+        )
+        embed.add_field(
+            name="Teams to Display",
+            value=str(scrim.leaderboard_team_count),
+            inline=True,
+        )
+        embed.add_field(
+            name="Orientation",
+            value=orientation.title(),
+            inline=True,
+        )
+        embed.add_field(
+            name="Background",
+            value=background_text,
+            inline=False,
+        )
+        return embed
+
+    def rebuild(self) -> None:
+        self.clear_items()
+        teams_button = discord.ui.Button(
+            label="Teams to Display",
+            emoji="🔢",
+            style=discord.ButtonStyle.primary,
+            row=0,
+        )
+
+        async def teams_callback(interaction: discord.Interaction) -> None:
+            view = LeaderboardTeamCountView(
+                owner_id=self.owner_id,
+                guild_id=self.guild_id,
+                scrim_id=self.scrim_id,
+                background_url=self.background_url,
+            )
+            await interaction.response.edit_message(
+                content=view.content(),
+                embed=view.embed(),
+                view=view,
+            )
+
+        teams_button.callback = teams_callback
+        self.add_item(teams_button)
+
+        background_button = discord.ui.Button(
+            label="Background",
+            emoji="🖼️",
+            style=discord.ButtonStyle.primary,
+            row=0,
+        )
+
+        async def background_callback(interaction: discord.Interaction) -> None:
+            await interaction.response.send_message(
+                (
+                    "To replace this background, send one image attachment in "
+                    f"this channel and mention {bot.user.mention}. "
+                    "Accepted formats: PNG, JPG, or WebP; maximum size: 8 MB. "
+                    "You have 2 minutes."
+                ),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            bot_user = bot.user
+
+            def upload_check(message: discord.Message) -> bool:
+                return (
+                    message.author.id == self.owner_id
+                    and message.channel.id == interaction.channel_id
+                    and (
+                        bool(message.attachments)
+                        or (
+                            bot_user is not None
+                            and bot_user in message.mentions
+                        )
+                    )
+                )
+
+            try:
+                upload_message = await bot.wait_for(
+                    "message",
+                    check=upload_check,
+                    timeout=120,
+                )
+            except asyncio.TimeoutError:
+                await interaction.followup.send(
+                    "Background upload timed out. Use the Background button to try again.",
+                    ephemeral=True,
+                )
+                return
+
+            if bot_user is None or bot_user not in upload_message.mentions:
+                await interaction.followup.send(
+                    "Please mention this bot in the message that contains the image.",
+                    ephemeral=True,
+                )
+                return
+            if len(upload_message.attachments) != 1:
+                await interaction.followup.send(
+                    "Attach exactly one image file.",
+                    ephemeral=True,
+                )
+                return
+            attachment = upload_message.attachments[0]
+            if attachment.size > MAX_LEADERBOARD_BACKGROUND_UPLOAD_BYTES:
+                await interaction.followup.send(
+                    "That image is larger than the 8 MB limit.",
+                    ephemeral=True,
+                )
+                return
+
+            try:
+                payload = await attachment.read()
+                if len(payload) > MAX_LEADERBOARD_BACKGROUND_UPLOAD_BYTES:
+                    raise ValueError("That image is larger than the 8 MB limit.")
+                scrim = repository.get(self.scrim_id)
+                if (
+                    scrim is None
+                    or scrim.guild_id != self.guild_id
+                    or not is_active(scrim)
+                    or not member_can_configure_scrim(
+                        interaction.user,
+                        scrim,
+                    )
+                ):
+                    raise ValueError(
+                        "You no longer have access to this leaderboard."
+                    )
+                background_url = await _store_leaderboard_background(
+                    scrim,
+                    upload_message.channel,
+                    payload,
+                )
+                updated_view = LeaderboardScrimEditView(
+                    owner_id=self.owner_id,
+                    guild_id=self.guild_id,
+                    scrim_id=self.scrim_id,
+                    background_url=background_url,
+                )
+                await interaction.message.edit(
+                    content=(
+                        "**Edit Leaderboard**\n"
+                        "Background saved. Changes are saved automatically."
+                    ),
+                    embed=updated_view.embed(),
+                    view=updated_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                await interaction.followup.send(
+                    "Background saved.",
+                    ephemeral=True,
+                )
+            except (OSError, ValueError, discord.HTTPException) as error:
+                await interaction.followup.send(
+                    f"Could not save that background: {error}",
+                    ephemeral=True,
+                )
+
+        background_button.callback = background_callback
+        self.add_item(background_button)
+
+        orientation_button = discord.ui.Button(
+            label="Orientation",
+            emoji="↔️",
+            style=discord.ButtonStyle.primary,
+            row=0,
+        )
+
+        async def orientation_callback(interaction: discord.Interaction) -> None:
+            view = LeaderboardOrientationView(
+                owner_id=self.owner_id,
+                guild_id=self.guild_id,
+                scrim_id=self.scrim_id,
+                background_url=self.background_url,
+            )
+            await interaction.response.edit_message(
+                content=view.content(),
+                embed=view.embed(),
+                view=view,
+            )
+
+        orientation_button.callback = orientation_callback
+        self.add_item(orientation_button)
+
+        back_button = discord.ui.Button(
+            label="Back to Dashboard",
+            emoji="↩️",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+
+        async def back_callback(interaction: discord.Interaction) -> None:
+            scrims = _available_leaderboard_scrims(
+                self.guild_id,
+                interaction.user,
+            )
+            view = LeaderboardSettingsView(
+                owner_id=self.owner_id,
+                guild_id=self.guild_id,
+                scrims=scrims,
+            )
+            await interaction.response.edit_message(
+                content=view.content(),
+                embed=view.embed(),
+                view=view,
+            )
+
+        back_button.callback = back_callback
+        self.add_item(back_button)
+
+
+class LeaderboardTeamCountView(LeaderboardPanelView):
+    """Choose the number of highest-ranked teams shown."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        scrim_id: str,
+        background_url: str,
+    ) -> None:
+        super().__init__(
+            owner_id=owner_id,
+            guild_id=guild_id,
+            scrim_id=scrim_id,
+        )
+        self.background_url = background_url
+        self.rebuild()
+
+    def content(self) -> str:
+        return "**Teams to Display**\nChoose how many ranked teams to show."
+
+    def embed(self) -> discord.Embed:
+        scrim = repository.get(self.scrim_id)
+        current = (
+            scrim.leaderboard_team_count
+            if scrim is not None
+            else DEFAULT_LEADERBOARD_TEAM_COUNT
+        )
+        return discord.Embed(
+            title="Teams to Display",
+            description=f"Current setting: **{current} teams**.",
+            color=discord.Color.blurple(),
+        )
+
+    def rebuild(self) -> None:
+        self.clear_items()
+        scrim = repository.get(self.scrim_id)
+        current = (
+            scrim.leaderboard_team_count
+            if scrim is not None
+            else DEFAULT_LEADERBOARD_TEAM_COUNT
+        )
+        selector = discord.ui.Select(
+            placeholder="Choose 16, 18, 20, 22, or 24 teams",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=f"{count} teams",
+                    value=str(count),
+                    default=count == current,
+                )
+                for count in LEADERBOARD_TEAM_COUNTS
+            ],
+            row=0,
+        )
+
+        async def select_callback(interaction: discord.Interaction) -> None:
+            try:
+                repository.update_leaderboard_settings(
+                    self.scrim_id,
+                    self.guild_id,
+                    leaderboard_team_count=int(selector.values[0]),
+                )
+            except (SlotStorageError, ValueError) as error:
+                await interaction.response.send_message(
+                    f"Could not save the team count: {error}",
+                    ephemeral=True,
+                )
+                return
+            view = LeaderboardScrimEditView(
+                owner_id=self.owner_id,
+                guild_id=self.guild_id,
+                scrim_id=self.scrim_id,
+                background_url=self.background_url,
+            )
+            await interaction.response.edit_message(
+                content=view.content(),
+                embed=view.embed(),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        selector.callback = select_callback
+        self.add_item(selector)
+
+        back_button = discord.ui.Button(
+            label="Back to Leaderboard",
+            emoji="↩️",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+
+        async def back_callback(interaction: discord.Interaction) -> None:
+            view = LeaderboardScrimEditView(
+                owner_id=self.owner_id,
+                guild_id=self.guild_id,
+                scrim_id=self.scrim_id,
+                background_url=self.background_url,
+            )
+            await interaction.response.edit_message(
+                content=view.content(),
+                embed=view.embed(),
+                view=view,
+            )
+
+        back_button.callback = back_callback
+        self.add_item(back_button)
+
+
+class LeaderboardOrientationView(LeaderboardPanelView):
+    """Choose vertical or Gold-only horizontal leaderboard orientation."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        scrim_id: str,
+        background_url: str,
+    ) -> None:
+        super().__init__(
+            owner_id=owner_id,
+            guild_id=guild_id,
+            scrim_id=scrim_id,
+        )
+        self.background_url = background_url
+        self.rebuild()
+
+    def content(self) -> str:
+        return "**Orientation**\nChoose the leaderboard layout."
+
+    def embed(self) -> discord.Embed:
+        scrim = repository.get(self.scrim_id)
+        config = repository.get_server_config(self.guild_id)
+        is_gold = getattr(config, "license_type", "Standard") == "Gold"
+        current = (
+            scrim.leaderboard_orientation
+            if scrim is not None
+            else DEFAULT_LEADERBOARD_ORIENTATION
+        )
+        if current == "horizontal" and not is_gold:
+            current = "vertical"
+        description = f"Current setting: **{current.title()}**."
+        if not is_gold:
+            description += "\nHorizontal orientation requires Gold."
+        return discord.Embed(
+            title="Leaderboard Orientation",
+            description=description,
+            color=discord.Color.blurple(),
+        )
+
+    def rebuild(self) -> None:
+        self.clear_items()
+        scrim = repository.get(self.scrim_id)
+        config = repository.get_server_config(self.guild_id)
+        is_gold = getattr(config, "license_type", "Standard") == "Gold"
+        current = (
+            scrim.leaderboard_orientation
+            if scrim is not None
+            else DEFAULT_LEADERBOARD_ORIENTATION
+        )
+        if current == "horizontal" and not is_gold:
+            current = "vertical"
+        options = [
+            discord.SelectOption(
+                label="Vertical",
+                value="vertical",
+                default=current == "vertical",
+            )
+        ]
+        if is_gold:
+            options.append(
+                discord.SelectOption(
+                    label="Horizontal",
+                    value="horizontal",
+                    default=current == "horizontal",
+                )
+            )
+        selector = discord.ui.Select(
+            placeholder="Choose vertical or horizontal",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+        async def select_callback(interaction: discord.Interaction) -> None:
+            try:
+                repository.update_leaderboard_settings(
+                    self.scrim_id,
+                    self.guild_id,
+                    leaderboard_orientation=selector.values[0],
+                )
+            except (SlotStorageError, ValueError) as error:
+                await interaction.response.send_message(
+                    f"Could not save the orientation: {error}",
+                    ephemeral=True,
+                )
+                return
+            view = LeaderboardScrimEditView(
+                owner_id=self.owner_id,
+                guild_id=self.guild_id,
+                scrim_id=self.scrim_id,
+                background_url=self.background_url,
+            )
+            await interaction.response.edit_message(
+                content=view.content(),
+                embed=view.embed(),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        selector.callback = select_callback
+        self.add_item(selector)
+
+        back_button = discord.ui.Button(
+            label="Back to Leaderboard",
+            emoji="↩️",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+
+        async def back_callback(interaction: discord.Interaction) -> None:
+            view = LeaderboardScrimEditView(
+                owner_id=self.owner_id,
+                guild_id=self.guild_id,
+                scrim_id=self.scrim_id,
+                background_url=self.background_url,
+            )
+            await interaction.response.edit_message(
+                content=view.content(),
+                embed=view.embed(),
+                view=view,
+            )
+
+        back_button.callback = back_callback
+        self.add_item(back_button)
+
+
+async def _store_leaderboard_background(
+    scrim: Scrim,
+    channel: object,
+    payload: bytes,
+) -> str:
+    if not hasattr(channel, "send"):
+        raise ValueError("The current channel cannot host the background image.")
+    try:
+        with Image.open(io.BytesIO(payload)) as source:
+            image_format = source.format
+            if image_format not in {"PNG", "JPEG", "WEBP"}:
+                raise ValueError("Use a PNG, JPG, or WebP image.")
+            if (
+                source.width < 64
+                or source.height < 64
+                or source.width > 16384
+                or source.height > 16384
+                or source.width * source.height > 40_000_000
+            ):
+                raise ValueError(
+                    "Image dimensions must be at least 64×64 and no larger than 40 megapixels."
+                )
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            image.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
+    except (Image.DecompressionBombError, OSError) as error:
+        raise ValueError("That file is not a supported image.") from error
+
+    lock = _leaderboard_background_lock(scrim.id)
+    async with lock:
+        metadata_path = _leaderboard_background_metadata_path(scrim.id)
+        final_path = _leaderboard_background_path(scrim.id)
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        previous_metadata = _read_leaderboard_background_metadata(scrim.id)
+        previous_image = final_path.read_bytes() if final_path.exists() else None
+        temporary_image_path = final_path.with_name(
+            f".{scrim.id}.{secrets.token_hex(4)}.tmp.png"
+        )
+        image.save(temporary_image_path, format="PNG", optimize=True)
+        preview = None
+        try:
+            preview_file = discord.File(
+                temporary_image_path,
+                filename=f"leaderboard-background-{scrim.id}.png",
+            )
+            try:
+                preview = await channel.send(
+                    content=(
+                        "Current leaderboard background for "
+                        f"**{discord.utils.escape_markdown(scrim.name)}**"
+                    ),
+                    file=preview_file,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            finally:
+                preview_file.close()
+            if not preview.attachments:
+                raise RuntimeError(
+                    "Discord did not return the uploaded background link."
+                )
+            os.replace(temporary_image_path, final_path)
+            _write_leaderboard_background_metadata(
+                scrim.id,
+                {
+                    "channel_id": preview.channel.id,
+                    "message_id": preview.id,
+                    "attachment_url": preview.attachments[0].url,
+                },
+            )
+        except Exception:
+            temporary_image_path.unlink(missing_ok=True)
+            if previous_image is None:
+                final_path.unlink(missing_ok=True)
+            else:
+                restore_path = final_path.with_name(
+                    f".{scrim.id}.{secrets.token_hex(4)}.restore.png"
+                )
+                restore_path.write_bytes(previous_image)
+                os.replace(restore_path, final_path)
+            if preview is not None:
+                try:
+                    await preview.delete()
+                except (discord.NotFound, discord.Forbidden):
+                    pass
+            raise
+
+        await _delete_background_preview(previous_metadata)
+        return preview.attachments[0].url
+
+
+@bot.command(name="setres")
+@commands.guild_only()
+async def leaderboard_settings_command(ctx: commands.Context) -> None:
+    """Open the standalone leaderboard settings panel."""
+    all_scrims = repository.list(ctx.guild.id)
+    scrims = _available_leaderboard_scrims(ctx.guild.id, ctx.author)
+    view = LeaderboardSettingsView(
+        owner_id=ctx.author.id,
+        guild_id=ctx.guild.id,
+        scrims=scrims,
+        has_created_scrims=bool(all_scrims),
+    )
+    await ctx.send(
+        content=view.content(),
+        embed=view.embed(),
+        view=view,
+        allowed_mentions=discord.AllowedMentions.none(),
+        delete_after=600,
+    )
+    await delete_command_message(ctx)
 
 
 @bot.command(name="res", aliases=["leaderboard", "lb"])
@@ -3512,12 +4631,12 @@ async def leaderboard_command(ctx: commands.Context) -> None:
 
 HELP_COPY_TEXT = (
     "A.R.C. HELP\n"
-    "STAFF: !setup | !set @Role | !use [Scrim] | !say text | !export | "
+    "STAFF: !setup | !setres | !set @Role | !say text | !export | "
     "!reset\n"
     "SLOTS: !add Team / TAG / @Captain | !confirm 03 04 | !remove 03 | "
     "!open | !close | !remind\n"
     "STATUS: !slots [Scrim] | !update [Scrim] | !res / !lb | "
-    "!resg1-25 slot kills placement\n"
+    f"!resg1-{MAX_MATCHES} slot kills placement\n"
     "ROOM: !idpw room / minutes | !idpwg1-25 room / minutes\n"
     "CAPTAINS: !register Team / TAG [/ @Manager] | "
     "!cap add|transfer|remove @User\n"
@@ -3530,12 +4649,12 @@ def build_help_text() -> str:
     """Return the condensed, Discord-formatted help content."""
     return (
         ">>> **A.R.C. HELP**\n"
-        "**STAFF** `!setup` `!set @Role` `!use [Scrim]` `!say text` "
+        "**STAFF** `!setup` `!setres` `!set @Role` `!say text` "
         "`!export` `!reset`\n"
         "**SLOTS** `!add Team / TAG / @Captain` `!confirm 03 04` "
         "`!remove 03` `!open` `!close` `!remind`\n"
         "**STATUS** `!slots [Scrim]` `!update [Scrim]` `!res`/`!lb` "
-        "`!resg1-25 slot kills placement`\n"
+        f"`!resg1-{MAX_MATCHES} slot kills placement`\n"
         "**ROOM** `!idpw room / minutes` `!idpwg1-25 room / minutes`\n"
         "**CAPTAINS** `!register Team / TAG [/ @Manager]` "
         "`!cap add|transfer|remove @User`\n"
@@ -4176,7 +5295,7 @@ def calculate_leaderboard(scrim: Scrim) -> list[LeaderboardRow]:
                 total_points=total,
             )
         )
-    return sorted(
+    ranked_rows = sorted(
         rows,
         key=lambda row: (
             -row.total_points,
@@ -4185,6 +5304,14 @@ def calculate_leaderboard(scrim: Scrim) -> list[LeaderboardRow]:
             row.slot_number,
         ),
     )
+    team_count = getattr(
+        scrim,
+        "leaderboard_team_count",
+        DEFAULT_LEADERBOARD_TEAM_COUNT,
+    )
+    if team_count not in LEADERBOARD_TEAM_COUNTS:
+        raise ValueError("Invalid leaderboard team count.")
+    return ranked_rows[:team_count]
 
 
 def parse_match_score_lines(
@@ -4260,85 +5387,301 @@ def _fit_font(
     return _load_font(min_size)
 
 
-def _build_reference_leaderboard_image(
+def leaderboard_canvas_dimensions(
+    team_count: int,
+    orientation: str,
+    header_height: int,
+    footer_height: int,
+) -> tuple[int, int]:
+    """Return the exact canvas size for a configured leaderboard."""
+    if team_count not in LEADERBOARD_TEAM_COUNTS:
+        raise ValueError("Choose 16, 18, 20, 22, or 24 teams.")
+    if orientation not in LEADERBOARD_ORIENTATIONS:
+        raise ValueError("Choose a vertical or horizontal layout.")
+    if header_height not in LEADERBOARD_HEADER_HEIGHTS:
+        raise ValueError("Choose a supported header height.")
+    if footer_height not in LEADERBOARD_FOOTER_HEIGHTS:
+        raise ValueError("Choose a supported footer height.")
+    width = (
+        LEADERBOARD_VERTICAL_WIDTH
+        if orientation == "vertical"
+        else LEADERBOARD_HORIZONTAL_WIDTH
+    )
+    visible_rows = (
+        team_count
+        if orientation == "vertical"
+        else (team_count + 1) // 2
+    )
+    height = (
+        2 * LEADERBOARD_OUTER_MARGIN
+        + header_height
+        + LEADERBOARD_SECTION_GAP
+        + LEADERBOARD_TABLE_HEADER_HEIGHT
+        + visible_rows * LEADERBOARD_ROW_HEIGHT
+        + LEADERBOARD_SECTION_GAP
+        + footer_height
+    )
+    return width, height
+
+
+def _build_configured_leaderboard_image(
     scrim: Scrim,
     rows: list[LeaderboardRow],
     *,
-    background_path: Path,
+    background_path: Path = LEADERBOARD_BACKGROUND,
 ) -> io.BytesIO:
-    """Render scored rows into the approved 479x640 reference artwork."""
-    with Image.open(background_path) as source:
-        template = source.convert("RGBA")
+    team_limit = getattr(
+        scrim,
+        "leaderboard_team_count",
+        DEFAULT_LEADERBOARD_TEAM_COUNT,
+    )
+    orientation = getattr(
+        scrim,
+        "leaderboard_orientation",
+        DEFAULT_LEADERBOARD_ORIENTATION,
+    )
+    header_height = getattr(
+        scrim,
+        "leaderboard_header_height",
+        DEFAULT_LEADERBOARD_HEADER_HEIGHT,
+    )
+    footer_height = getattr(
+        scrim,
+        "leaderboard_footer_height",
+        DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
+    )
+    if orientation == "horizontal":
+        config = repository.get_server_config(scrim.guild_id)
+        if getattr(config, "license_type", "Standard") != "Gold":
+            orientation = "vertical"
 
-    width, height = template.size
-    row_height = 22
-    first_row_y = 164
-    visible_rows = 17
-    extra_rows = max(0, len(rows) - visible_rows)
-    footer_top = 553
+    rows = rows[:team_limit]
+    width, height = leaderboard_canvas_dimensions(
+        team_limit,
+        orientation,
+        header_height,
+        footer_height,
+    )
+    with Image.open(background_path) as source_background:
+        background = ImageOps.fit(
+            source_background.convert("RGB"),
+            (width, height),
+            method=Image.Resampling.LANCZOS,
+        ).convert("RGBA")
+    tint = Image.new("RGBA", (width, height), (8, 14, 24, 125))
+    output = Image.alpha_composite(background, tint)
+    draw = ImageDraw.Draw(output, "RGBA")
+    margin = LEADERBOARD_OUTER_MARGIN
+    border = (0, 174, 255)
+    panel = (17, 25, 38)
+    panel_alt = (21, 32, 47)
+    text = (237, 244, 251)
+    muted = (143, 177, 202)
 
-    if extra_rows:
-        # Keep the decorative footer intact while adding more table bands above it.
-        body = template.crop((0, 0, width, footer_top))
-        row_band = template.crop((0, 512, width, 534))
-        footer = template.crop((0, footer_top, width, height))
-        output = Image.new(
-            "RGBA",
-            (width, height + extra_rows * row_height),
-            (0, 0, 0, 0),
-        )
-        output.paste(body, (0, 0))
-        for index in range(extra_rows):
-            output.paste(row_band, (0, footer_top + index * row_height))
-        output.paste(footer, (0, footer_top + extra_rows * row_height))
-        draw = ImageDraw.Draw(output)
-        bottom = footer_top + extra_rows * row_height
-        draw.line((20, bottom, 458, bottom), fill=(119, 91, 42, 255), width=2)
-        draw.line((20, 534, 20, bottom), fill=(119, 91, 42, 255), width=2)
-        draw.line((458, 534, 458, bottom), fill=(119, 91, 42, 255), width=2)
-    else:
-        output = template.copy()
-        draw = ImageDraw.Draw(output)
+    draw.rounded_rectangle(
+        (12, 12, width - 12, height - 12),
+        radius=28,
+        fill=(8, 14, 24, 205),
+        outline=border,
+        width=4,
+    )
+    header_bottom = margin + header_height
+    draw.rounded_rectangle(
+        (margin, margin, width - margin, header_bottom),
+        radius=20,
+        fill=(18, 31, 48, 215),
+        outline=(37, 107, 141),
+        width=2,
+    )
+    draw.text(
+        (width // 2, margin + 24),
+        "A.R.C.  •  LEADERBOARD",
+        font=_load_font(24, mono=True),
+        fill=border,
+        anchor="mt",
+    )
+    scrim_name = str(getattr(scrim, "name", "Leaderboard")).replace("\n", " ").strip()
+    scrim_name = scrim_name or "Leaderboard"
+    name_font = _fit_font(
+        scrim_name,
+        max_width=width - 2 * margin - 80,
+        max_height=max(32, header_height - 86),
+        max_size=52,
+        min_size=18,
+    )
+    name_top = margin + max(48, (header_height - 58) // 2)
+    draw.text(
+        (width // 2, name_top),
+        scrim_name,
+        font=name_font,
+        fill=text,
+        anchor="mt",
+    )
+    draw.text(
+        (width // 2, header_bottom - 14),
+        f"TOP {team_limit} TEAMS  •  {orientation.upper()}",
+        font=_load_font(17, mono=True),
+        fill=muted,
+        anchor="ms",
+    )
 
-    # The approved artwork already contains the title and column headings.
-    scrim_name = str(getattr(scrim, "name", "")).strip()
-    if scrim_name:
-        banner_font = _fit_font(
-            scrim_name,
-            max_width=150,
-            max_height=16,
-            max_size=14,
-            min_size=7,
-        )
-        left, top, right, bottom = draw.textbbox((0, 0), scrim_name, font=banner_font)
-        draw.text(
+    table_top = header_bottom + LEADERBOARD_SECTION_GAP
+    columns = 2 if orientation == "horizontal" else 1
+    column_gap = 24 if columns == 2 else 0
+    column_width = (
+        width - 2 * margin - column_gap * (columns - 1)
+    ) // columns
+    per_column_capacity = (
+        (team_limit + 1) // 2 if columns == 2 else team_limit
+    )
+    split_index = (len(rows) + 1) // 2 if columns == 2 else len(rows)
+    row_font = 21 if columns == 1 else 18
+    header_font = 17 if columns == 1 else 15
+    row_top = table_top + LEADERBOARD_TABLE_HEADER_HEIGHT
+
+    for column_index in range(columns):
+        x = margin + column_index * (column_width + column_gap)
+        draw.rounded_rectangle(
             (
-                239 - ((right - left) // 2) - left,
-                112 - ((bottom - top) // 2) - top,
+                x,
+                table_top,
+                x + column_width,
+                table_top
+                + LEADERBOARD_TABLE_HEADER_HEIGHT
+                + per_column_capacity * LEADERBOARD_ROW_HEIGHT,
             ),
-            scrim_name,
-            font=banner_font,
-            fill=(231, 207, 163, 255),
+            radius=12,
+            fill=(*panel, 220),
+            outline=(34, 70, 96),
+            width=2,
         )
-
-    row_font = _load_font(11, mono=True)
-    row_fill = (231, 213, 176, 255)
-    for row_index, row in enumerate(rows):
-        y = first_row_y + row_index * row_height
-        rank = row_index + 1
-        draw.text((32, y), str(rank), font=row_font, fill=row_fill)
-        draw.text((76, y), row.team_name[:27], font=row_font, fill=row_fill)
-        draw.text((315, y), str(row.wins), font=row_font, fill=row_fill, anchor="ra")
-        draw.text(
-            (360, y),
-            str(row.placement_points),
-            font=row_font,
-            fill=row_fill,
-            anchor="ra",
+        draw.rounded_rectangle(
+            (
+                x + 2,
+                table_top + 2,
+                x + column_width - 2,
+                table_top + LEADERBOARD_TABLE_HEADER_HEIGHT,
+            ),
+            radius=10,
+            fill=(13, 39, 57, 225),
         )
-        draw.text((406, y), str(row.kills), font=row_font, fill=row_fill, anchor="ra")
-        draw.text((451, y), str(row.total_points), font=row_font, fill=row_fill, anchor="ra")
+        if columns == 2:
+            column_rows = (
+                rows[:split_index]
+                if column_index == 0
+                else rows[split_index:]
+            )
+            rank_start = 0 if column_index == 0 else split_index
+        else:
+            column_rows = rows
+            rank_start = 0
 
+        rank_x = x + 22
+        team_x = x + (74 if columns == 1 else 62)
+        wins_x = x + column_width - (390 if columns == 1 else 330)
+        kills_x = x + column_width - (280 if columns == 1 else 245)
+        place_x = x + column_width - (160 if columns == 1 else 135)
+        total_x = x + column_width - 20
+        header_y = table_top + 22
+        for label, label_x, anchor in (
+            ("#", rank_x, "la"),
+            ("TEAM", team_x, "la"),
+            ("W", wins_x, "ra"),
+            ("KILLS", kills_x, "ra"),
+            ("PLACE", place_x, "ra"),
+            ("TOTAL", total_x, "ra"),
+        ):
+            draw.text(
+                (label_x, header_y),
+                label,
+                font=_load_font(header_font, mono=True),
+                fill=border,
+                anchor=anchor,
+            )
+        for row_index in range(per_column_capacity):
+            y = row_top + row_index * LEADERBOARD_ROW_HEIGHT
+            if row_index % 2 == 1:
+                draw.rectangle(
+                    (x + 3, y, x + column_width - 3, y + LEADERBOARD_ROW_HEIGHT),
+                    fill=(*panel_alt, 220),
+                )
+            draw.line(
+                (
+                    x + 14,
+                    y + LEADERBOARD_ROW_HEIGHT - 1,
+                    x + column_width - 14,
+                    y + LEADERBOARD_ROW_HEIGHT - 1,
+                ),
+                fill=(37, 58, 76),
+                width=1,
+            )
+            if row_index >= len(column_rows):
+                continue
+            row = column_rows[row_index]
+            rank = rank_start + row_index + 1
+            team_max_width = wins_x - team_x - 20
+            team_font = _fit_font(
+                row.team_name,
+                max_width=max(80, team_max_width),
+                max_height=LEADERBOARD_ROW_HEIGHT - 8,
+                max_size=row_font,
+                min_size=13,
+            )
+            text_y = y + LEADERBOARD_ROW_HEIGHT // 2
+            draw.text(
+                (rank_x, text_y),
+                f"{rank:02d}",
+                font=_load_font(row_font, mono=True),
+                fill=muted,
+                anchor="lm",
+            )
+            draw.text(
+                (team_x, text_y),
+                row.team_name,
+                font=team_font,
+                fill=text,
+                anchor="lm",
+            )
+            for value, value_x in (
+                (row.wins, wins_x),
+                (row.kills, kills_x),
+                (row.placement_points, place_x),
+                (row.total_points, total_x),
+            ):
+                draw.text(
+                    (value_x, text_y),
+                    str(value),
+                    font=_load_font(row_font, mono=True),
+                    fill=text,
+                    anchor="rm",
+                )
+
+    footer_top = (
+        row_top
+        + per_column_capacity * LEADERBOARD_ROW_HEIGHT
+        + LEADERBOARD_SECTION_GAP
+    )
+    footer_bottom = height - margin
+    draw.rounded_rectangle(
+        (margin, footer_top, width - margin, footer_bottom),
+        radius=18,
+        fill=(15, 25, 38, 215),
+        outline=(37, 107, 141),
+        width=2,
+    )
+    draw.text(
+        (width // 2, (footer_top + footer_bottom) // 2),
+        f"{len(rows)} TEAMS RANKED  •  {scrim_name}",
+        font=_fit_font(
+            f"{len(rows)} TEAMS RANKED  •  {scrim_name}",
+            max_width=width - 2 * margin - 60,
+            max_height=footer_bottom - footer_top - 18,
+            max_size=22,
+            min_size=13,
+        ),
+        fill=muted,
+        anchor="mm",
+    )
     buffer = io.BytesIO()
     output.convert("RGB").save(buffer, format="PNG", optimize=True)
     buffer.seek(0)
@@ -4349,165 +5692,21 @@ def build_leaderboard_image(
     scrim: Scrim,
     rows: list[LeaderboardRow] | None = None,
     *,
-    background_path: Path = LEADERBOARD_BACKGROUND,
+    background_path: Path | None = None,
 ) -> io.BytesIO:
-    """Render a leaderboard by repeating a middle background slice."""
+    """Render the configured leaderboard as a PNG image."""
     if rows is None:
         rows = calculate_leaderboard(scrim)
-
-    using_reference_background = (
-        background_path.resolve() == LEADERBOARD_BACKGROUND.resolve()
+    selected_background = (
+        background_path
+        if background_path is not None
+        else _current_leaderboard_background_path(scrim)
     )
-    two_columns = (
-        getattr(scrim, "leaderboard_layout", "1_col") == "2_col"
-        and getattr(repository.get_server_config(scrim.guild_id), "license_type", "Standard")
-        == "Gold"
+    return _build_configured_leaderboard_image(
+        scrim,
+        rows,
+        background_path=selected_background,
     )
-    if using_reference_background and not two_columns:
-        return _build_reference_leaderboard_image(
-            scrim,
-            rows,
-            background_path=background_path,
-        )
-    if using_reference_background and two_columns:
-        # The approved artwork is a single-column composition. Preserve the
-        # existing Gold two-column mode on its original wide template.
-        background_path = LEGACY_LEADERBOARD_BACKGROUND
-
-    with Image.open(background_path) as source:
-        base = source.convert("RGBA")
-    width, height = base.size
-    header_height = min(240, height)
-    footer_height = min(200, max(0, height - header_height))
-    body_slice_height = min(100, max(1, height - header_height - footer_height))
-    header = base.crop((0, 0, width, header_height))
-    footer = base.crop((0, height - footer_height, width, height))
-    body_slice_top = header_height + max(
-        0, (height - header_height - footer_height - body_slice_height) // 2
-    )
-    body_slice = base.crop(
-        (0, body_slice_top, width, body_slice_top + body_slice_height)
-    )
-
-    row_height = 38 if two_columns else 48
-    title_area_height = 112
-    body_padding = title_area_height + 64
-    rows_per_column = (len(rows) + 1) // 2 if two_columns else len(rows)
-    body_height = max(
-        body_slice_height,
-        body_padding + (rows_per_column + 1) * row_height,
-    )
-    output = Image.new("RGBA", (width, header_height + body_height + footer_height))
-    output.paste(header, (0, 0))
-    for y in range(header_height, header_height + body_height, body_slice_height):
-        output.paste(body_slice, (0, y))
-    output.paste(footer, (0, header_height + body_height))
-
-    draw = ImageDraw.Draw(output)
-    header_font = _load_font(20, mono=True)
-    row_font = _load_font(20, mono=True)
-    title_font = _load_font(42)
-    title = "LEADERBOARD"
-    title_left, title_top, title_right, title_bottom = draw.textbbox(
-        (0, 0), title, font=title_font
-    )
-    draw.text(
-        (
-            (width - (title_right - title_left)) // 2 - title_left,
-            18 - title_top,
-        ),
-        title,
-        font=title_font,
-        fill=(235, 245, 255, 255),
-    )
-    title_left = 72
-    title_top = header_height + 12
-    title_width = width - (title_left * 2)
-    title_height = title_area_height - 24
-    scrim_name = str(getattr(scrim, "name", "Leaderboard")).strip() or "Leaderboard"
-    scrim_font = _fit_font(
-        scrim_name,
-        max_width=title_width,
-        max_height=title_height,
-    )
-    name_left, name_top, name_right, name_bottom = draw.textbbox(
-        (0, 0), scrim_name, font=scrim_font
-    )
-    name_width = name_right - name_left
-    name_height = name_bottom - name_top
-    draw.text(
-        (
-            title_left + (title_width - name_width) // 2 - name_left,
-            title_top + (title_height - name_height) // 2 - name_top,
-        ),
-        scrim_name,
-        font=scrim_font,
-        fill=(245, 248, 255, 255),
-    )
-    table_top = header_height + title_area_height + 12
-    table_left = 52
-    table_right = width - 52
-    table_bottom = table_top + (rows_per_column + 1) * row_height + 18
-    draw.rectangle(
-        (table_left, table_top - 16, table_right, table_bottom),
-        fill=(8, 14, 20, 220),
-        outline=(0, 174, 255, 210),
-        width=2,
-    )
-    draw.line(
-        (table_left, table_top + 30, table_right, table_top + 30),
-        fill=(0, 174, 255, 170),
-        width=2,
-    )
-    column_count = 2 if two_columns else 1
-    split_index = (len(rows) + 1) // 2
-    for column_index in range(column_count):
-        column_rows = (
-            rows[:split_index]
-            if two_columns and column_index == 0
-            else rows[split_index:]
-            if two_columns
-            else rows
-        )
-        x = table_left + 12 + column_index * (width // 2)
-        draw.text(
-            (x, table_top),
-            "# Team Name Win Kills Place Total",
-            font=header_font,
-            fill=(120, 190, 255, 255),
-        )
-        for row_index, row in enumerate(column_rows):
-            rank = (
-                row_index + 1
-                if not two_columns or column_index == 0
-                else (len(rows) + 1) // 2 + row_index + 1
-            )
-            line = (
-                f"{rank:>2}   {row.team_name[:15]:<15} "
-                f"{row.wins:>4}   {row.kills:>5}   "
-                f"{row.placement_points:>5}   {row.total_points:>5}"
-            )
-            draw.text(
-                (x, table_top + (row_index + 1) * row_height),
-                line,
-                font=row_font,
-                fill=(245, 248, 255, 255),
-            )
-            draw.line(
-                (
-                    table_left + column_index * (width // 2) + 10,
-                    table_top + (row_index + 2) * row_height - 5,
-                    table_left + (column_index + 1) * (width // 2) - 10,
-                    table_top + (row_index + 2) * row_height - 5,
-                ),
-                fill=(45, 91, 120, 125),
-                width=1,
-            )
-
-    buffer = io.BytesIO()
-    output.convert("RGB").save(buffer, format="PNG", optimize=True)
-    buffer.seek(0)
-    return buffer
 
 
 class SlotsScrimSelectView(discord.ui.View):
@@ -4632,19 +5831,9 @@ async def show_slots(ctx: commands.Context, *, name: str | None = None) -> None:
         await send_slot_status_embed(ctx, scrim)
         return
 
-    current_category_id = getattr(ctx.channel, "category_id", None)
-    matching_scrims = [
-        scrim
-        for scrim in active_scrims
-        if current_category_id is not None
-        and current_category_id in await scrim_category_ids(scrim)
-    ]
-    if matching_scrims:
-        await send_slot_status_embed(ctx, matching_scrims[0])
-        return
-
-    if len(active_scrims) == 1:
-        await send_slot_status_embed(ctx, active_scrims[0])
+    channel_scrim = resolve_channel_scrim(ctx)
+    if channel_scrim is not None:
+        await send_slot_status_embed(ctx, channel_scrim)
         return
 
     view = SlotsScrimSelectView(
@@ -4789,29 +5978,16 @@ async def update_slots_command(
             await send_private_command_feedback(ctx, "The slot board has been updated.")
         return
 
-    selected = resolve_selected_scrim(ctx)
-    if selected is not None:
-        if not member_is_staff(ctx.author, selected):
+    channel_scrim = resolve_channel_scrim(ctx)
+    if channel_scrim is not None:
+        if not member_is_staff(ctx.author, channel_scrim):
             await send_private_command_feedback(
                 ctx,
                 "You must have the authorized Staff role to update this board.",
                 silent=True,
             )
             return
-        if await publish_scrim(selected):
-            await send_private_command_feedback(ctx, "The slot board has been updated.")
-        return
-
-    if len(active_scrims) == 1:
-        scrim = active_scrims[0]
-        if not member_is_staff(ctx.author, scrim):
-            await send_private_command_feedback(
-                ctx,
-                "You must have the authorized staff role to update this board.",
-                silent=True,
-            )
-            return
-        if await publish_scrim(scrim):
+        if await publish_scrim(channel_scrim):
             await send_private_command_feedback(ctx, "The slot board has been updated.")
         return
 
