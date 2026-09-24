@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from PIL import Image
+from PIL import Image, ImageDraw
 from main import (
     LeaderboardRow,
     LeaderboardOrientationView,
@@ -16,6 +16,8 @@ from main import (
     LEADERBOARD_BACKGROUND,
     LEADERBOARD_ROW_HEIGHT,
     _current_leaderboard_background_path,
+    _fit_scrim_title,
+    _load_font,
     _read_leaderboard_background_metadata,
     _restore_default_leaderboard_background,
     _write_leaderboard_background_metadata,
@@ -38,6 +40,16 @@ from slot_storage import SlotStateStore
 
 
 class LeaderboardConfigurationTests(unittest.TestCase):
+    def test_leaderboard_font_loader_uses_montserrat_weight_variants(self):
+        for weight, expected_style in (
+            (400, "Regular"),
+            (700, "Bold"),
+            (800, "ExtraBold"),
+        ):
+            with self.subTest(weight=weight):
+                font = _load_font(24, weight=weight)
+                self.assertEqual(font.getname(), ("Montserrat", expected_style))
+
     def test_results_publication_uses_template_and_missing_rank_defaults(self):
         scrim = SimpleNamespace(
             id="a" * 16,
@@ -415,6 +427,27 @@ class LeaderboardScrimNameRenderingTests(unittest.TestCase):
                         f"Missing default-background scrim name for "
                         f"{team_count} teams, {orientation} layout",
                     )
+
+    def test_scrim_title_uses_max_size_for_short_names_and_shrinks_long_names(self):
+        draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        long_name = "A Very Long Scrim Name That Needs To Fit"
+        short_title, short_font = _fit_scrim_title(
+            draw,
+            "BETA",
+            max_width=600,
+            max_height=164,
+        )
+        fitted_long_title, long_font = _fit_scrim_title(
+            draw,
+            long_name,
+            max_width=600,
+            max_height=164,
+        )
+
+        self.assertEqual(short_title, "BETA")
+        self.assertEqual(short_font.size, 80)
+        self.assertEqual(fitted_long_title, long_name)
+        self.assertLess(long_font.size, short_font.size)
 
     def test_custom_background_does_not_render_scrim_name(self):
         scrim = self.make_scrim("Example Scrim")

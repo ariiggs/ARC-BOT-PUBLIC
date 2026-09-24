@@ -59,6 +59,14 @@ SUPPORT_SERVER_URL = "https://discord.gg/S8uaGEJGv8"
 LEADERBOARD_BACKGROUND = (
     Path(__file__).parent / "assets" / "leaderboard-background.png"
 )
+LEADERBOARD_FONT_PATH = (
+    Path(__file__).parent / "assets" / "fonts" / "Montserrat[wght].ttf"
+)
+LEADERBOARD_FONT_VARIATIONS = {
+    400: "Regular",
+    700: "Bold",
+    800: "ExtraBold",
+}
 LEADERBOARD_BACKGROUND_UPLOAD_DIR = (
     Path(__file__).parent / "data" / "leaderboard-backgrounds"
 )
@@ -5655,22 +5663,15 @@ def parse_match_score_lines(
     return scores
 
 
-def _load_font(size: int, *, mono: bool = False):
-    candidates = (
-        (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-            "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
-        )
-        if mono
-        else (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-        )
-    )
-    for path in candidates:
-        if Path(path).exists():
-            return ImageFont.truetype(path, size)
-    return ImageFont.load_default()
+def _load_font(size: int, *, weight: int = 400):
+    """Load a requested Montserrat weight from the bundled variable font."""
+    font = ImageFont.truetype(str(LEADERBOARD_FONT_PATH), size)
+    variation_name = LEADERBOARD_FONT_VARIATIONS.get(weight)
+    if variation_name is None:
+        font.set_variation_by_axes([weight])
+    else:
+        font.set_variation_by_name(variation_name)
+    return font
 
 
 def _fit_font(
@@ -5680,15 +5681,16 @@ def _fit_font(
     max_height: int,
     max_size: int = 64,
     min_size: int = 12,
+    weight: int = 400,
 ):
-    """Choose the largest regular font that fits inside the scrim-name banner."""
+    """Choose the largest requested Montserrat weight that fits its area."""
     for size in range(max_size, min_size - 1, -1):
-        font = _load_font(size)
+        font = _load_font(size, weight=weight)
         probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
         left, top, right, bottom = probe.textbbox((0, 0), text, font=font)
         if right - left <= max_width and bottom - top <= max_height:
             return font
-    return _load_font(min_size)
+    return _load_font(min_size, weight=weight)
 
 
 def _fit_scrim_title(
@@ -5701,15 +5703,16 @@ def _fit_scrim_title(
     """Fit a scrim name into the built-in background's title area."""
     title = scrim_name.strip()
     if not title or max_width <= 0 or max_height <= 0:
-        return "", _load_font(12)
+        return "", _load_font(12, weight=800)
 
     def font_for(value: str):
         return _fit_font(
             value,
             max_width=max_width,
             max_height=max_height,
-            max_size=40,
+            max_size=80,
             min_size=12,
+            weight=800,
         )
 
     font = font_for(title)
@@ -5717,7 +5720,7 @@ def _fit_scrim_title(
     if bounds[2] - bounds[0] <= max_width:
         return title, font
 
-    minimum_font = _load_font(12)
+    minimum_font = _load_font(12, weight=800)
     while title:
         title = title[:-1].rstrip()
         candidate = f"{title}…"
@@ -5821,7 +5824,7 @@ def _build_configured_leaderboard_image(
         timezone_for_name(getattr(scrim, "timezone", "UTC"))
     ).strftime("%d %b %Y").upper()
     date_center_y = margin + header_height // 2
-    date_font = _load_font(18, mono=True)
+    date_font = _load_font(18, weight=400)
     date_bbox = draw.textbbox((0, 0), date_label, font=date_font)
     date_width = date_bbox[2] - date_bbox[0] + 32
     draw.rounded_rectangle(
@@ -5930,7 +5933,7 @@ def _build_configured_leaderboard_image(
             draw.text(
                 (label_x, header_y),
                 label,
-                font=_load_font(header_font, mono=True),
+                font=_load_font(header_font, weight=400),
                 fill=border,
                 anchor=anchor,
             )
@@ -5962,12 +5965,13 @@ def _build_configured_leaderboard_image(
                 max_height=LEADERBOARD_ROW_HEIGHT - 8,
                 max_size=row_font,
                 min_size=13,
+                weight=700,
             )
             text_y = y + LEADERBOARD_ROW_HEIGHT // 2
             draw.text(
                 (rank_x, text_y),
                 f"{rank:02d}",
-                font=_load_font(row_font, mono=True),
+                font=_load_font(row_font, weight=400),
                 fill=muted,
                 anchor="lm",
             )
@@ -5987,7 +5991,7 @@ def _build_configured_leaderboard_image(
                 draw.text(
                     (value_x, text_y),
                     str(value),
-                    font=_load_font(row_font, mono=True),
+                    font=_load_font(row_font, weight=700),
                     fill=text,
                     anchor="rm",
                 )
