@@ -84,3 +84,129 @@ mtime_ms = 1790097944253
 storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/27c17ce5-dc62-4715-a7c4-7e1d9820c23d/70ee9847-bdce-4fcd-ab38-462d33c7e143"
 storage_version_token = "1790097957073812"
 content_type = "application/octet-stream"
+
+[[outputs]]
+id = "ec9B1jA1f1iPEX48VEYXq"
+uri = "file://exports/A.R.C.-Public-workspace.zip"
+type = "unspecified"
+title = "A.R.C. Public workspace copy"
+description = "Import-ready ZIP copy of the A.R.C. Public project. Upload this at replit.com/import to create a separate Replit workspace."
+logical_id = "39be4602-0793-4cc2-b657-892abb0d8501"
+content_hash = "sha256:c0acaa107c60ddcaf923327ed9ec0c8298bbc59b8074e5df07fcc2326d324a12"
+size = 7703807
+mtime_ms = 1790107106951
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/39be4602-0793-4cc2-b657-892abb0d8501/74cc4a83-86c9-4429-bf3c-fceb0b9f2072"
+storage_version_token = "1790107113265436"
+content_type = "application/octet-stream"
+
+[[outputs]]
+id = "p7HUgB-So78IAL36-biA4"
+uri = "file://exports/A.R.C.-Beta-GitHub-upload.zip"
+type = "unspecified"
+title = "Updated A.R.C. Beta GitHub package"
+description = "Updated source package with !say <message> included in the custom !help menu. Upload these files to the beta GitHub repository, then redeploy Bot-Hosting."
+logical_id = "857b0ccb-8325-4f3c-a1e3-158d81716459"
+content_hash = "sha256:dc9adae0540482c88c4817c26500a826cff9ecdc711eef44f3fe7c6e96045f97"
+size = 80059
+mtime_ms = 1790114674551
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/857b0ccb-8325-4f3c-a1e3-158d81716459/ae011de7-0153-426e-a404-e6ab6897a83b"
+storage_version_token = "1790114680073520"
+content_type = "application/octet-stream"
+
+[[outputs]]
+id = "QXRpTaNUunXhGWdudc2kb"
+uri = "file://attached_assets/leaderboard-preview.png"
+type = "image"
+title = "Aperçu du leaderboard nettoyé"
+description = "Aperçu local non publié : fond gris foncé, bleu électrique, titre LEADERBOARD, en-tête dynamique et lignes générées par les données du bot."
+logical_id = "993c9fe5-ed67-40f3-b9b2-7cf914e0c424"
+content_hash = "sha256:f61242d8dc4d71a9dc51e69b06a4f403b9df9f1da51ff850f481ffcb81c43396"
+size = 35842
+mtime_ms = 1790154634248
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/993c9fe5-ed67-40f3-b9b2-7cf914e0c424/654ca0bf-05b4-44da-a392-4d5901b2a622"
+storage_version_token = "1790154635293269"
+content_type = "image/png"
+
+[[outputs]]
+id = "Z3O6c0bhmCasF8pEKpVtq"
+uri = "file://attached_assets/leaderboard-fictitious-example.png"
+type = "image"
+title = "Exemple leaderboard avec équipes fictives"
+description = "Exemple local non publié avec huit équipes, quatre matchs, kills, placements, victoires et scores calculés dynamiquement."
+logical_id = "7a61b80a-32c8-459f-8451-d8650ecb3e1f"
+content_hash = "sha256:e06b10df8ecf5c948ec5a3cba18518f8b021937bcb4d0c6b0b6851a17b4bd451"
+size = 59885
+mtime_ms = 1790154658883
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/7a61b80a-32c8-459f-8451-d8650ecb3e1f/7f9fb79b-5f48-41da-ac4a-550409b52ff5"
+storage_version_token = "1790154659595593"
+content_type = "image/png"
+
+[[outputs]]
+id = "DP0pNqvYnBKl3ahjNgUUj"
+uri = "file://attached_assets/leaderboard-design-example.png"
+type = "image"
+title = "Aperçu avec le design de référence"
+description = "Exemple local non publié : grand titre LEADERBOARD, nom du scrim, panneau structuré, huit équipes fictives et scores calculés dynamiquement."
+logical_id = "8402a560-5924-4c5d-8994-13b0ca5cd188"
+content_hash = "sha256:44469a6705a972ca163fd0239eb70462cb33d3d525c88624a25269fde30747e9"
+size = 55928
+mtime_ms = 1790154744243
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/8402a560-5924-4c5d-8994-13b0ca5cd188/e2cd00f3-1396-461c-a95f-3ebd3e3ee640"
+storage_version_token = "1790154756176838"
+content_type = "image/png"
+
+[[outputs]]
+id = "wMoO-eRc6AgZXYv8eZCt8"
+uri = "file://attached_assets/leaderboard-empty-template.png"
+type = "image"
+title = "Modèle leaderboard vide"
+description = "Aperçu local non publié : fond gris foncé, cadre bleu électrique et seul le titre LEADERBOARD."
+logical_id = "ddf9bdf7-7f90-4f74-9bfb-b9ca75b8399f"
+content_hash = "sha256:da4a9000b49c008f5c5fb903f44f0a2bfa7840a279999a95a39f3e1f1b46e6bd"
+size = 17560
+mtime_ms = 1790154803686
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/ddf9bdf7-7f90-4f74-9bfb-b9ca75b8399f/35e9d7ed-b6c7-49ca-878b-560cbe492bdd"
+storage_version_token = "1790154804431358"
+content_type = "image/png"
+
+[[outputs]]
+id = "wPOOgGjQR9mk_6goo8hEx"
+uri = "file://attached_assets/leaderboard-empty-reference-recreated.png"
+type = "image"
+title = "Leaderboard vide recréé"
+description = "Recréation autonome de la référence : seul le titre LEADERBOARD reste visible, avec la structure vide du tableau et le style gris foncé/bleu électrique."
+logical_id = "65b07f8d-57ed-4866-8733-77d576bebe6c"
+content_hash = "sha256:eaf4384373a31a44f4669e2048f1776f67dd8ab29d0a739acc79eab8469250cf"
+size = 12278
+mtime_ms = 1790154904326
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/65b07f8d-57ed-4866-8733-77d576bebe6c/08146291-ec9f-442c-ae7d-78988a75c5b0"
+storage_version_token = "1790154916624481"
+content_type = "image/png"
+
+[[outputs]]
+id = "G6fzcEMgsFEmk35Q9rqA1"
+uri = "file://attached_assets/leaderboard-empty-exact-reference.png"
+type = "image"
+title = "Leaderboard vide — design original conservé"
+description = "Même design que la référence jointe, avec l’en-tête du tableau conservé et toutes les lignes vidées. Aucun changement au bot ni publication."
+logical_id = "351afd7d-a24c-4f53-a3f5-329217336b5c"
+content_hash = "sha256:907445655a9482afe0c893e2a9f7afc2b4eb104fbd55ad5673820b26b5139078"
+size = 173804
+mtime_ms = 1790155048650
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/351afd7d-a24c-4f53-a3f5-329217336b5c/13154d82-0539-4ff9-a5e5-331eb31931f0"
+storage_version_token = "1790155062403529"
+content_type = "image/png"
+
+[[outputs]]
+id = "3zfO7DaXX9bKbtuGzJUJw"
+uri = "file://attached_assets/leaderboard-empty-no-branding-final.png"
+type = "image"
+title = "Leaderboard vide sans logos ni footer"
+description = "Même design et mêmes proportions que la référence : logos du haut, PMNC, texte du sous-titre et logos du footer retirés ; titre, bandeau noir vide et tableau conservés."
+logical_id = "c3e435e6-a03b-47e7-a8ca-5a0a4b32014a"
+content_hash = "sha256:d176e2059eacb0f62d23e4d80fc99cb84fcb5a5f41a1d3f494b14a15367d075e"
+size = 145640
+mtime_ms = 1790156714128
+storage_uri = "gcs://replit-rams-assets-archer/rams/assets/repl:89449fcb-e542-4853-ab34-395c161669a2/c3e435e6-a03b-47e7-a8ca-5a0a4b32014a/e605a896-5ae0-4a57-89b8-802acd864e35"
+storage_version_token = "1790156730012751"
+content_type = "image/png"

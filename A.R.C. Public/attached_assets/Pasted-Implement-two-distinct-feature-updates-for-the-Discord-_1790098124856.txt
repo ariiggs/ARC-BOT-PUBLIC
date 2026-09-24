@@ -1,0 +1,51 @@
+Implement two distinct feature updates for the Discord bot: overhauling the `!idpwg[X]` command logic and adding anti-spam protection to the slot management UI.
+
+### UPDATE 1: `!idpwg[1-32]` Command Overhaul
+Update the `!idpwg[1-32]` dynamic command aliases with conditional argument parsing (FIXED vs DYNAMIC) and a clean, dynamic output format. Leave the legacy `!idpw` base behavior unchanged.
+
+1. **Conditional Argument Parsing (`*args`):**
+   - The command must accept `*args` to handle variable inputs based on the database `pw_type`.
+   - Query the DB for the scrim's `pw_type`.
+   - **If FIXED:** 
+     - Expect 2 arguments: `room_id`, `minutes`.
+     - Fetch `password` from the `fixed_pw` column in the DB.
+     - If `len(args) != 2`, return an ephemeral error: "❌ Format: `!idpwgX <room_id> <minutes>`"
+   - **If DYNAMIC:**
+     - Expect 3 arguments: `room_id`, `password`, `minutes`.
+     - If `len(args) != 3`, return an ephemeral error: "❌ Format: `!idpwgX <room_id> <pw> <minutes>`"
+
+2. **Dynamic Format & Conditional Fields:**
+   Format the final output message strictly as follows (no embed, plain text with Markdown):
+
+   **Match {game_number}**
+   {conditional_map_line}
+   **ID :** `{room_id}`
+   **PW :** {password}
+   **Start :** {start_time}
+   {conditional_mention}
+
+   - **Match Header:** The target game number extracted from the alias (e.g., "Match 1").
+   - **Map Line:** Check the DB `maps` string. IF a map exists for index `{game_number} - 1`, display `Map : {map_name}`. IF NOT, omit this line entirely (no blank spaces).
+   - **ID & PW:** Display the extracted `room_id` inside inline code blocks, and the `password` determined in Step 1.
+   - **Start Time:** `Current Time + minutes`, formatted in `HH:mm` respecting the scrim's configured `timezone`.
+   - **Role Mention:** IF a Confirmed/Scrim role is set in the DB, append the `@Role` ping at the very bottom. IF NOT, omit it.
+
+3. **Database Counter Sync:**
+   - Update `current_match_counter` in the DB to `{game_number} + 1` to keep the base `!idpw` command perfectly synchronized.
+
+---
+
+### UPDATE 2: "Confirm" Button Anti-Spam
+Update the "Confirm" button callback in the slot management UI to prevent captains from spamming it.
+
+1. **State Check on Button Click:**
+   - When a user clicks the "Confirm" button, immediately query the SQLite database to check the current status of their slot.
+   - If the slot is ALREADY marked as "Pending" (awaiting staff validation) or "Confirmed" (already validated by staff), abort the confirmation process.
+
+2. **Ephemeral Anti-Spam Message:**
+   - If the condition above is met, reply to the interaction with an ephemeral message (`interaction.response.send_message(..., ephemeral=True)`).
+   - Message content: "⏳ You have already confirmed your slot. Please wait for the staff to validate it."
+   - Ensure this does not overwrite or break the main UI message.
+
+3. **Normal Execution Flow:**
+   - If the slot is in its initial unconfirmed state, proceed normally with the existing logic (updating the database to "Pending", notifying staff, etc.).

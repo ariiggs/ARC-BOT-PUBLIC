@@ -1,0 +1,34 @@
+Update the existing `!add` command to dynamically handle both single-team and bulk multi-team registrations using a unified parsing logic and an interactive confirmation UI.
+
+1. **Command Signature:** 
+   Change the command definition to capture all input as a single string argument.
+   `@commands.command(name="add") async def add(ctx, *, entries: str)`
+
+2. **Dynamic Parsing Logic:**
+   - Split the `entries` string by line breaks to handle single or multiple lines: `lines = entries.strip().split('\n')`.
+   - Create empty lists to store `valid_entries` and `error_entries`.
+   - Loop through each line in `lines`. Skip any empty lines.
+   - For each line, split it using the `/` character: `parts = line.split('/')`.
+   - If `len(parts) != 3`, add the line to `error_entries` (Reason: Invalid format).
+   - If valid, strip whitespaces and extract the data: 
+     `team_name = parts[0].strip()`
+     `slot_number = int(parts[1].strip())`
+     `captain_mention = parts[2].strip()` (Extract the raw numeric ID from the mention `<@ID>`).
+   - Check the SQLite database to see if `slot_number` is already occupied. If it is, add to `error_entries` (Reason: Slot Taken).
+   - If everything is correct, append a dictionary with the extracted data to `valid_entries`.
+
+3. **Draft Embed (Validation Sas - Anti-Error):**
+   - Do NOT insert anything into the database yet.
+   - Generate a `discord.Embed` summarizing the pending action: "🔍 **Registration Preview**".
+   - Iterate through `valid_entries` and add them to the embed description with a green checkmark: `✅ Slot {slot}: {team_name} (Cap: <@{captain_id}>)`.
+   - Iterate through `error_entries` and append them with a warning: `⚠️ Failed: {original_line} - {Reason}`.
+
+4. **Interactive UI View (discord.ui):**
+   - Create a `discord.ui.View` containing two buttons: 
+     - Button 1: ✅ Confirm (Style: Success)
+     - Button 2: ❌ Cancel (Style: Danger)
+   - Send the Draft Embed and the View to the channel.
+
+5. **Callback Execution:**
+   - **On Confirm (✅):** Loop through `valid_entries`. Insert/Update the SQLite database with the team data and assign the `CAPTAIN_ROLE_ID` to the respective user IDs. Edit the original embed to show "✅ **Registration Completed Successfully.**" and disable the buttons.
+   - **On Cancel (❌):** Edit the embed to say "❌ **Registration Cancelled.** No changes were made." and disable the buttons.

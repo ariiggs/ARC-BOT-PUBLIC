@@ -1,0 +1,26 @@
+Mets à jour le code du bot pour refondre complètement la commande !setup et le système de gestion des scrims avec les spécifications exactes suivantes :
+
+Restreindre la commande !setup et la gestion des scrims STRICTEMENT aux Administrateurs du serveur.
+Lorsqu'un administrateur lance !setup (pour créer ou configurer un scrim), le bot doit demander (via un formulaire ou des étapes interactives) les éléments suivants :
+Le nom du scrim / tournoi (qui servira de titre en haut des slots).
+Le rôle staff autorisé à gérer ce scrim (autre que les admins).
+Le salon textuel public pour les slots.
+Le salon textuel privé pour le staff.
+Le salon textuel pour les logs.
+Gestion des accès des managers : Lorsque le staff utilise une commande ou un bouton pour ajouter une équipe ("add"), le bot doit automatiquement attribuer ou autoriser l'accès au salon des slots pour le manager (la personne mentionnée), lui permettant ainsi de voir et d'interagir (via des boutons ✅ / ❌) pour confirmer ou annuler son slot.
+Logique d'affichage des salons :
+Dans le salon staff, le panneau de contrôle interactif ne doit s'afficher/s'actualiser que lorsque la commande de gestion/setup est utilisée.
+Dans le salon staff, une copie en temps réel du message des slots doit être visible, accompagnée des messages de mise à jour/demandes d'action des managers qui doivent y rester épinglés ou affichés en dessous jusqu'à ce qu'un membre du staff les traite.
+Salon de logs : Toutes les actions importantes (ajout d'équipe, confirmation, annulation avec le symbole 🔴, suppression, validation staff) doivent envoyer un log propre et daté dans le salon des logs configuré.
+Assure-toi que les slots vont de 03 à 25, que le symbole 🔴 est bien utilisé pour les slots annulés/libérés, et que le système multi-scrims persiste correctement.
+& Intègre ces 3 fonctionnalités majeures au bot de gestion des scrims PUBG Mobile :
+
+Commandes de contrôle d'ouverture/fermeture (!open et !close) :
+Utilisables uniquement par le staff autorisé et uniquement dans le salon des slots.
+!open : Fait apparaître ou active les boutons d'interaction (Confirm / Cancel) pour les managers sur les slots.
+!close : Fait disparaître ou désactive ces boutons, permettant au staff de décider manuellement quand les inscriptions/confirmations sont ouvertes ou fermées.
+Salon "Scrims History" (Archives) :
+Ajoute un paramètre de salon d'historique lors du !setup.
+Lorsque les slots sont validés ou qu'un scrim se termine/évolue, une copie propre de l'état final des slots les plus récents doit y être envoyée automatiquement pour que le staff conserve une trace indélébile.
+Confirmation sur la gestion de la liste d'attente :
+Pas de gestion automatique de liste d'attente pour le moment (laissée de côté pour une future version), la gestion reste purement manuelle par le staff.

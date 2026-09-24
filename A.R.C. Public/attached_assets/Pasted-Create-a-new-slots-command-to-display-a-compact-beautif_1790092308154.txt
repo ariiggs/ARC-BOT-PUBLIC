@@ -1,0 +1,37 @@
+Create a new `!slots` command to display a compact, beautiful Embed summarizing the slot statuses for a specific scrim. Implement smart fallback logic, role-based restrictions, and specific status merging logic.
+
+1. **Permission Check (`!set` Manager Role):**
+   - Before running any logic, check if `ctx.author` has the Manager role configured for the server (fetch this role ID from the database/config).
+   - If the user lacks this role, return an ephemeral error: "❌ You do not have permission to use this command."
+
+2. **Smart Scrim Detection & Routing:**
+   - Detect the `ctx.channel.category_id` and query the SQLite database to see if it matches an active scrim.
+   - **IF MATCH FOUND:** Proceed automatically with this Scrim ID.
+   - **IF NO MATCH FOUND (Used outside the scrim category):**
+     - Query the database for ALL active scrims in `ctx.guild.id`.
+     - *If 0 scrims:* Return an ephemeral error "❌ No active scrims found."
+     - *If exactly 1 scrim:* Proceed automatically with this single Scrim ID (command is usable anywhere).
+     - *If >1 scrims:* Send an ephemeral message with a `discord.ui.Select` dropdown menu prompting the user to choose a scrim.
+
+3. **Dropdown Menu Callback (For the >1 scrims scenario):**
+   - Once the user selects a scrim from the dropdown, immediately DELETE the dropdown message (or edit the interaction to remove the View) and proceed to generate the Embed for the chosen Scrim ID.
+
+4. **Calculate and Merge Slot Statistics (CRITICAL LOGIC):**
+   - Fetch all registered/configured slots for the determined Scrim ID.
+   - Calculate raw counts for Free, Reserved, Pending, and Confirmed slots.
+   - **Merge Rule:** Add the "Pending" count to the "Confirmed" count. Do NOT display a separate "Pending" row in the Embed. 
+   - *Example:* If there are 3 Pending and 10 Confirmed, the final "Confirmed" display value must be 13.
+
+5. **Dynamic Emoji Retrieval:**
+   - Do NOT use hardcoded emojis. Fetch the custom emojis configured for this scrim's statuses (Free, Reserved, Confirmed) from the database so they match the main UI seamlessly.
+
+6. **Design a Compact, Beautiful Embed:**
+   - Title: "📊 Slot Status - [Scrim Name]"
+   - Color: Match the bot's theme (e.g., Blurple or dark grey).
+   - Display the list STRICTLY in this order: Free, Reserved, Confirmed.
+   - Ensure the output looks exactly like this format:
+     > **Total Slots:** 20
+     > 
+     > {dynamic_free_emoji} **Free:** 5
+     > {dynamic_reserved_emoji} **Reserved:** 2
+     > {dynamic_confirmed_emoji} **Confirmed:** 13
