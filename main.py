@@ -3623,16 +3623,24 @@ async def _record_match_scores(
             silent=False,
         )
         return
-    scores = parse_match_score_lines(
-        input_string,
-        match_number=match_number,
-        scrim=scrim,
-    )
+    try:
+        scores = parse_match_score_lines(
+            input_string,
+            match_number=match_number,
+            scrim=scrim,
+        )
+    except ValueError as error:
+        await send_private_command_feedback(
+            ctx,
+            f"❌ {error} Nothing was saved.",
+            silent=False,
+        )
+        return
     if not scores:
         await send_private_command_feedback(
             ctx,
             f"❌ No valid scores found for Match {match_number}. "
-            "Use one `slot kills placement` entry per line.",
+            "Use one `slot kills` entry per rank, best team first.",
             silent=False,
         )
         return
@@ -5614,7 +5622,7 @@ HELP_COPY_TEXT = (
     "SLOTS: !add Team / TAG / @Captain | !confirm 03 04 | !remove 03 | "
     "!open | !close | !remind\n"
     "STATUS: !slots [Scrim] | !update [Scrim] | !res / !lb | "
-    f"!resg1-{MAX_MATCHES} slot kills placement\n"
+    f"!resg1-{MAX_MATCHES} slot kills (best team first, one line per rank)\n"
     "ROOM: !idpw room / minutes | !idpwg1-25 room / minutes\n"
     "CAPTAINS: !register Team / TAG [/ @Manager] | "
     "!cap add|transfer|remove @User\n"
@@ -5632,7 +5640,8 @@ def build_help_text() -> str:
         "**SLOTS** `!add Team / TAG / @Captain` `!confirm 03 04` "
         "`!remove 03` `!open` `!close` `!remind`\n"
         "**STATUS** `!slots [Scrim]` `!update [Scrim]` `!res`/`!lb` "
-        f"`!resg1-{MAX_MATCHES} slot kills placement`\n"
+        f"`!resg1-{MAX_MATCHES} slot kills` "
+        "(best team first, one line per rank)\n"
         "**ROOM** `!idpw room / minutes` `!idpwg1-25 room / minutes`\n"
         "**CAPTAINS** `!register Team / TAG [/ @Manager]` "
         "`!cap add|transfer|remove @User`\n"
@@ -6604,25 +6613,63 @@ def parse_match_score_lines(
     match_number: int,
     scrim: Scrim,
 ) -> list[MatchScore]:
-    """Parse `slot kills placement` lines, ignoring malformed entries."""
+    """Parse ordered `slot kills` lines or legacy explicit-placement lines."""
     scores: list[MatchScore] = []
     seen_slots: set[int] = set()
-    for line in str(input_string).splitlines():
+    lines = [
+        (line_number, line.strip())
+        for line_number, line in enumerate(str(input_string).splitlines(), start=1)
+        if line.strip()
+    ]
+    if not lines:
+        return scores
+
+    field_counts = {len(line.split()) for _, line in lines}
+    if not field_counts.issubset({2, 3}):
+        invalid_line = next(
+            line_number
+            for line_number, line in lines
+            if len(line.split()) not in {2, 3}
+        )
+        raise ValueError(
+            f"Line {invalid_line} must contain `slot kills` "
+            "or legacy `slot kills placement`."
+        )
+    if len(field_counts) != 1:
+        raise ValueError(
+            "Do not mix ordered `slot kills` lines with legacy "
+            "`slot kills placement` lines."
+        )
+
+    ordered_by_line = field_counts == {2}
+    for placement, (line_number, line) in enumerate(lines, start=1):
         parts = line.split()
-        if len(parts) != 3:
-            continue
         try:
-            slot_number, kills, placement = (int(part) for part in parts)
+            values = [int(part) for part in parts]
         except ValueError:
-            continue
+            raise ValueError(
+                f"Line {line_number} must contain only whole numbers."
+            ) from None
+        if ordered_by_line:
+            slot_number, kills = values
+        else:
+            slot_number, kills, placement = values
+        if slot_number in seen_slots:
+            raise ValueError(
+                f"Line {line_number} repeats slot {slot_number}."
+            )
         if (
-            slot_number in seen_slots
-            or slot_number not in scrim.slots
+            slot_number not in scrim.slots
             or scrim.slots[slot_number].status == STATUS_AVAILABLE
-            or kills < 0
-            or placement < 1
         ):
-            continue
+            raise ValueError(
+                f"Line {line_number} uses slot {slot_number}, "
+                "which is not assigned to a team."
+            )
+        if kills < 0:
+            raise ValueError(f"Line {line_number} has a negative kill count.")
+        if placement < 1:
+            raise ValueError(f"Line {line_number} has an invalid placement.")
         seen_slots.add(slot_number)
         scores.append(
             MatchScore(
