@@ -2556,32 +2556,34 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                                 LEADERBOARD_HORIZONTAL_ROW_TEXT_VERTICAL_OFFSET
                             )
                         self.assertEqual(xy[1], expected_y)
+                        column = (
+                            0
+                            if columns == 1 or rank <= per_column_capacity
+                            else 1
+                        )
+                        rank_left, rank_right = rank_field_ranges[column]
+                        expected_ink_center = (rank_left + rank_right) / 2
                         if columns == 2:
-                            column = (
-                                0 if rank <= per_column_capacity else 1
-                            )
-                            rank_left, rank_right = rank_field_ranges[column]
-                            expected_ink_center = (
-                                (rank_left + rank_right) / 2
-                                + LEADERBOARD_HORIZONTAL_RANK_CELL_CENTER_OFFSETS[
+                            expected_ink_center += (
+                                LEADERBOARD_HORIZONTAL_RANK_CELL_CENTER_OFFSETS[
                                     column
                                 ]
                             )
-                            bbox = ImageDraw.Draw(
-                                Image.new("RGB", (1, 1))
-                            ).textbbox(
-                                (0, 0),
-                                str(rank),
-                                font=font,
-                                anchor=anchor,
-                            )
-                            actual_ink_center = xy[0] + (
-                                bbox[0] + bbox[2]
-                            ) / 2
-                            self.assertAlmostEqual(
-                                actual_ink_center,
-                                expected_ink_center,
-                            )
+                        bbox = ImageDraw.Draw(
+                            Image.new("RGB", (1, 1))
+                        ).textbbox(
+                            (0, 0),
+                            str(rank),
+                            font=font,
+                            anchor=anchor,
+                        )
+                        actual_ink_center = xy[0] + (
+                            bbox[0] + bbox[2]
+                        ) / 2
+                        self.assertAlmostEqual(
+                            actual_ink_center,
+                            expected_ink_center,
+                        )
                     self.assertIn("Team 01", rendered_text)
                     self.assertEqual(rendered_text.count("Team 01"), 1)
                     self.assertNotIn("TEAM", rendered_text)
@@ -2738,7 +2740,21 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     rank_call = next(
                         call for call in text_calls if call[0] == "1"
                     )
-                    self.assertEqual(rank_call[1], (centers[0], 312))
+                    rank_bbox = ImageDraw.Draw(
+                        Image.new("RGB", (1, 1))
+                    ).textbbox(
+                        (0, 0),
+                        rank_call[0],
+                        font=rank_call[3],
+                        anchor=rank_call[2],
+                    )
+                    self.assertAlmostEqual(
+                        rank_call[1][0]
+                        + (rank_bbox[0] + rank_bbox[2]) / 2,
+                        centers[0],
+                    )
+                    self.assertEqual(rank_call[1][1], 312)
+                    self.assertEqual(rank_call[2], "mm")
 
     def test_long_team_name_shrinks_and_stays_inside_its_field(self):
         fitted_text, font = _fit_leaderboard_cell_text(

@@ -8890,22 +8890,19 @@ def _build_configured_leaderboard_image(
                 max_size=row_font,
                 weight=LEADERBOARD_ROW_FONT_WEIGHT,
             )
-            rank_x = field_centers[0]
+            rank_cell_center = field_centers[0]
             if columns == 2:
-                rank_cell_center = (
-                    rank_x
-                    + LEADERBOARD_HORIZONTAL_RANK_CELL_CENTER_OFFSETS[
-                        column_index
-                    ]
+                rank_cell_center += (
+                    LEADERBOARD_HORIZONTAL_RANK_CELL_CENTER_OFFSETS[column_index]
                 )
-                rank_bbox = draw.textbbox(
-                    (0, 0),
-                    rank_text,
-                    font=rank_font,
-                    anchor="mm",
-                )
-                rank_ink_center_offset = (rank_bbox[0] + rank_bbox[2]) / 2
-                rank_x = rank_cell_center - rank_ink_center_offset
+            rank_bbox = draw.textbbox(
+                (0, 0),
+                rank_text,
+                font=rank_font,
+                anchor="mm",
+            )
+            rank_ink_center_offset = (rank_bbox[0] + rank_bbox[2]) / 2
+            rank_x = rank_cell_center - rank_ink_center_offset
             draw.text(
                 (rank_x, text_y),
                 rank_text,
