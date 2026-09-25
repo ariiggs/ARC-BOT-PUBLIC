@@ -471,6 +471,38 @@ async def delete_command_message(ctx: commands.Context) -> bool:
         return False
 
 
+async def delete_message_or_clear(
+    message: discord.Message | None,
+    *,
+    log_context: str,
+    fallback_content: str | None = None,
+) -> bool:
+    """Remove a completed interaction message, clearing it if deletion fails."""
+    if message is None:
+        return False
+    delete = getattr(message, "delete", None)
+    if delete is None:
+        return False
+    try:
+        await delete()
+        return True
+    except discord.NotFound:
+        return True
+    except discord.HTTPException:
+        logger.exception("Could not delete %s.", log_context)
+        if fallback_content is not None:
+            try:
+                await message.edit(
+                    content=fallback_content,
+                    embed=None,
+                    view=None,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                logger.exception("Could not clear %s.", log_context)
+        return False
+
+
 async def send_private_command_feedback(
     ctx: commands.Context,
     content: str,
@@ -990,11 +1022,16 @@ class StaffScrimSelectView(ExpiringView):
 
             selected_id = select.values[0]
             if selected_id not in self.scrim_ids:
+                self.stop()
                 await interaction.response.send_message(
                     "That scrim selection is no longer available.",
                     ephemeral=True,
                 )
-                self.stop()
+                await delete_message_or_clear(
+                    getattr(interaction, "message", None),
+                    log_context="stale Staff scrim selector",
+                    fallback_content="This command selector has ended.",
+                )
                 return
 
             scrim = repository.get(selected_id)
@@ -1003,31 +1040,42 @@ class StaffScrimSelectView(ExpiringView):
                 or scrim.guild_id != self.guild_id
                 or not is_active(scrim)
             ):
+                self.stop()
                 await interaction.response.send_message(
                     "That scrim is no longer active.",
                     ephemeral=True,
                 )
-                self.stop()
+                await delete_message_or_clear(
+                    getattr(interaction, "message", None),
+                    log_context="inactive Staff scrim selector",
+                    fallback_content="This command selector has ended.",
+                )
                 return
             if not member_is_staff(interaction.user, scrim):
+                self.stop()
                 await interaction.response.send_message(
                     "You do not have the authorized Staff role for this scrim.",
                     ephemeral=True,
                 )
-                self.stop()
+                await delete_message_or_clear(
+                    getattr(interaction, "message", None),
+                    log_context="unauthorized Staff scrim selector",
+                    fallback_content="This command selector has ended.",
+                )
                 return
 
             disable_view_items(self)
             self.stop()
-            await interaction.response.edit_message(
-                content=(
-                    f"✅ Running this command for "
-                    f"**{discord.utils.escape_markdown(scrim.name)}**."
-                ),
-                view=self,
-            )
-            setattr(self.ctx, "_staff_scrim_override", scrim)
             try:
+                await interaction.response.send_message(
+                    content=(
+                        f"✅ Running this command for "
+                        f"**{discord.utils.escape_markdown(scrim.name)}**."
+                    ),
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                setattr(self.ctx, "_staff_scrim_override", scrim)
                 command = self.command
                 if command is None:
                     await interaction.followup.send(
@@ -1047,6 +1095,11 @@ class StaffScrimSelectView(ExpiringView):
                     delattr(self.ctx, "_staff_scrim_override")
                 except AttributeError:
                     pass
+                await delete_message_or_clear(
+                    getattr(interaction, "message", None),
+                    log_context="completed Staff scrim selector",
+                    fallback_content="This command selector has ended.",
+                )
 
         select.callback = callback
         self.add_item(select)
@@ -1560,10 +1613,14 @@ class OperationalMessageView(ExpiringView):
             if not await self.interaction_check(interaction):
                 return
             self.stop()
-            await interaction.response.edit_message(
-                content="Operational message panel closed.",
-                embed=None,
-                view=None,
+            await interaction.response.send_message(
+                "Operational message panel closed.",
+                ephemeral=True,
+            )
+            await delete_message_or_clear(
+                getattr(interaction, "message", None),
+                log_context="closed operational-message panel",
+                fallback_content="This operational-message panel has ended.",
             )
 
         reset_button.callback = reset_callback
@@ -4214,38 +4271,37 @@ class MatchScoreSubmissionReviewView(ExpiringView):
             or _match_scores_snapshot(scrim, self.match_number)
             != self.baseline_scores
         ):
-            self.completed = True
-            disable_view_items(self)
-            self.stop()
-            await interaction.response.edit_message(
-                content=(
+            await interaction.response.send_message(
+                (
                     "This review is out of date because teams or saved scores "
                     "changed. No proposed scores were saved. Run the command "
                     "again to review the current data."
                 ),
-                embed=None,
-                view=self,
+                ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await self.close(
+                "This score review is out of date.",
+                message=getattr(interaction, "message", None),
             )
             return None
         return scrim
 
-    async def close(self, content: str) -> None:
+    async def close(
+        self,
+        content: str,
+        *,
+        message: discord.Message | None = None,
+    ) -> None:
         self.completed = True
         self.editing = False
         disable_view_items(self)
         self.stop()
-        if self.message is None:
-            return
-        try:
-            await self.message.edit(
-                content=content,
-                embed=None,
-                view=self,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except discord.HTTPException:
-            logger.exception("Could not close the Match %s score review.", self.match_number)
+        await delete_message_or_clear(
+            self.message or message,
+            log_context=f"Match {self.match_number} score review",
+            fallback_content=content,
+        )
 
     async def on_timeout(self) -> None:
         if self.completed:
@@ -4311,16 +4367,20 @@ class MatchScoreSubmissionReviewView(ExpiringView):
         self.editing = False
         disable_view_items(self)
         self.stop()
-        await interaction.response.edit_message(
+        await interaction.response.send_message(
             content=(
                 f"✅ Scores saved for Match {self.match_number}: "
                 f"Processed {processed} teams (reviewed by "
                 f"<@{interaction.user.id}>). Use `!res` when you are ready "
                 "to publish the leaderboard image."
             ),
-            embed=None,
-            view=self,
+            ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await delete_message_or_clear(
+            self.message or getattr(interaction, "message", None),
+            log_context=f"completed Match {self.match_number} score review",
+            fallback_content="This score review has been completed.",
         )
 
     @discord.ui.button(
@@ -4370,14 +4430,18 @@ class MatchScoreSubmissionReviewView(ExpiringView):
         self.editing = False
         disable_view_items(self)
         self.stop()
-        await interaction.response.edit_message(
+        await interaction.response.send_message(
             content=(
                 "Score entry cancelled. No proposed scores were saved; "
                 "previously saved results remain unchanged."
             ),
-            embed=None,
-            view=self,
+            ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await delete_message_or_clear(
+            self.message or getattr(interaction, "message", None),
+            log_context=f"cancelled Match {self.match_number} score review",
+            fallback_content="This score review was cancelled.",
         )
 
 
@@ -5728,10 +5792,14 @@ class LeaderboardSettingsView(LeaderboardPanelView):
 
         async def close_callback(interaction: discord.Interaction) -> None:
             self.stop()
-            await interaction.response.edit_message(
-                content="Leaderboard settings closed.",
-                embed=None,
-                view=None,
+            await interaction.response.send_message(
+                "Leaderboard settings closed.",
+                ephemeral=True,
+            )
+            await delete_message_or_clear(
+                getattr(interaction, "message", None),
+                log_context="closed leaderboard settings panel",
+                fallback_content="This leaderboard settings panel has ended.",
             )
 
         close_button.callback = close_callback
@@ -5867,6 +5935,7 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
             scrim_id=scrim_id,
         )
         self.background_url = background_url
+        self.background_upload_active = False
         self.rebuild()
 
     def content(self) -> str:
@@ -5981,128 +6050,145 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         )
 
         async def background_callback(interaction: discord.Interaction) -> None:
-            await interaction.response.send_message(
-                (
-                    "To replace this background, send one image attachment in "
-                    f"this channel and mention {bot.user.mention}. "
-                    "Accepted formats: PNG, JPG, or WebP; maximum size: 8 MB. "
-                    "You have 2 minutes."
-                ),
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            if self.background_upload_active:
+                await interaction.response.send_message(
+                    "A background upload is already waiting for this panel.",
+                    ephemeral=True,
+                )
+                return
+            self.background_upload_active = True
+            upload_message = None
             bot_user = bot.user
 
-            def upload_check(message: discord.Message) -> bool:
-                return (
-                    message.author.id == self.owner_id
-                    and message.channel.id == interaction.channel_id
-                    and (
-                        bool(message.attachments)
-                        or (
-                            bot_user is not None
-                            and bot_user in message.mentions
+            try:
+                await interaction.response.send_message(
+                    (
+                        "To replace this background, send one image attachment in "
+                        f"this channel and mention {bot_user.mention if bot_user else 'the bot'}. "
+                        "Accepted formats: PNG, JPG, or WebP; maximum size: 8 MB. "
+                        "You have 2 minutes."
+                    ),
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+                def upload_check(message: discord.Message) -> bool:
+                    return (
+                        message.author.id == self.owner_id
+                        and message.channel.id == interaction.channel_id
+                        and (
+                            bool(message.attachments)
+                            or (
+                                bot_user is not None
+                                and bot_user in message.mentions
+                            )
                         )
                     )
-                )
 
-            try:
-                upload_message = await bot.wait_for(
-                    "message",
-                    check=upload_check,
-                    timeout=120,
-                )
-            except asyncio.TimeoutError:
-                await interaction.followup.send(
-                    "Background upload timed out. Use the Background button to try again.",
-                    ephemeral=True,
-                )
-                return
+                try:
+                    upload_message = await bot.wait_for(
+                        "message",
+                        check=upload_check,
+                        timeout=120,
+                    )
+                except asyncio.TimeoutError:
+                    await interaction.followup.send(
+                        "Background upload timed out. Use the Background button to try again.",
+                        ephemeral=True,
+                    )
+                    return
 
-            if bot_user is None or bot_user not in upload_message.mentions:
-                await interaction.followup.send(
-                    "Please mention this bot in the message that contains the image.",
-                    ephemeral=True,
-                )
-                return
-            if len(upload_message.attachments) != 1:
-                await interaction.followup.send(
-                    "Attach exactly one image file.",
-                    ephemeral=True,
-                )
-                return
-            attachment = upload_message.attachments[0]
-            if attachment.size > MAX_LEADERBOARD_BACKGROUND_UPLOAD_BYTES:
-                await interaction.followup.send(
-                    "That image is larger than the 8 MB limit.",
-                    ephemeral=True,
-                )
-                return
+                if bot_user is None or bot_user not in upload_message.mentions:
+                    await interaction.followup.send(
+                        "Please mention this bot in the message that contains the image.",
+                        ephemeral=True,
+                    )
+                    return
+                if len(upload_message.attachments) != 1:
+                    await interaction.followup.send(
+                        "Attach exactly one image file.",
+                        ephemeral=True,
+                    )
+                    return
+                attachment = upload_message.attachments[0]
+                if attachment.size > MAX_LEADERBOARD_BACKGROUND_UPLOAD_BYTES:
+                    await interaction.followup.send(
+                        "That image is larger than the 8 MB limit.",
+                        ephemeral=True,
+                    )
+                    return
 
-            try:
-                payload = await attachment.read()
-                if len(payload) > MAX_LEADERBOARD_BACKGROUND_UPLOAD_BYTES:
-                    raise ValueError("That image is larger than the 8 MB limit.")
-                scrim = repository.get(self.scrim_id)
-                if (
-                    scrim is None
-                    or scrim.guild_id != self.guild_id
-                    or not is_active(scrim)
-                    or not member_can_configure_scrim(
-                        interaction.user,
+                try:
+                    payload = await attachment.read()
+                    if len(payload) > MAX_LEADERBOARD_BACKGROUND_UPLOAD_BYTES:
+                        raise ValueError("That image is larger than the 8 MB limit.")
+                    scrim = repository.get(self.scrim_id)
+                    if (
+                        scrim is None
+                        or scrim.guild_id != self.guild_id
+                        or not is_active(scrim)
+                        or not member_can_configure_scrim(
+                            interaction.user,
+                            scrim,
+                        )
+                    ):
+                        raise ValueError(
+                            "You no longer have access to this leaderboard."
+                        )
+                    background_url = await _store_leaderboard_background(
                         scrim,
+                        upload_message.channel,
+                        payload,
                     )
-                ):
-                    raise ValueError(
-                        "You no longer have access to this leaderboard."
+                    updated_view = LeaderboardScrimEditView(
+                        owner_id=self.owner_id,
+                        guild_id=self.guild_id,
+                        scrim_id=self.scrim_id,
+                        background_url=background_url,
                     )
-                background_url = await _store_leaderboard_background(
-                    scrim,
-                    upload_message.channel,
-                    payload,
-                )
-                updated_view = LeaderboardScrimEditView(
-                    owner_id=self.owner_id,
-                    guild_id=self.guild_id,
-                    scrim_id=self.scrim_id,
-                    background_url=background_url,
-                )
-                await interaction.message.edit(
-                    content=(
-                        "**Edit Leaderboard**\n"
-                        "Background saved. Changes are saved automatically."
-                    ),
-                    embed=updated_view.embed(),
-                    view=updated_view,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-                await interaction.followup.send(
-                    "Background saved.",
-                    ephemeral=True,
-                )
-            except LeaderboardBackgroundDimensionsError as error:
-                view = LeaderboardBlueprintOfferView(
-                    owner_id=self.owner_id,
-                    guild_id=self.guild_id,
-                    scrim_id=self.scrim_id,
-                )
-                await interaction.followup.send(
-                    (
-                        f"Normalized image size: **{error.actual[0]} × "
-                        f"{error.actual[1]} px**. Required for this profile: "
-                        f"**{error.required[0]} × {error.required[1]} px**. "
-                        "Would you like the matching blank canvas and the "
-                        f"{leaderboard_blueprint_reference_label(scrim)}?"
-                    ),
-                    view=view,
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except (OSError, ValueError, discord.HTTPException) as error:
-                await interaction.followup.send(
-                    f"Could not save that background: {error}",
-                    ephemeral=True,
-                )
+                    await interaction.message.edit(
+                        content=(
+                            "**Edit Leaderboard**\n"
+                            "Background saved. Changes are saved automatically."
+                        ),
+                        embed=updated_view.embed(),
+                        view=updated_view,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    await interaction.followup.send(
+                        "Background saved.",
+                        ephemeral=True,
+                    )
+                except LeaderboardBackgroundDimensionsError as error:
+                    view = LeaderboardBlueprintOfferView(
+                        owner_id=self.owner_id,
+                        guild_id=self.guild_id,
+                        scrim_id=self.scrim_id,
+                    )
+                    await interaction.followup.send(
+                        (
+                            f"Normalized image size: **{error.actual[0]} × "
+                            f"{error.actual[1]} px**. Required for this profile: "
+                            f"**{error.required[0]} × {error.required[1]} px**. "
+                            "Would you like the matching blank canvas and the "
+                            f"{leaderboard_blueprint_reference_label(scrim)}?"
+                        ),
+                        view=view,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except (OSError, ValueError, discord.HTTPException) as error:
+                    await interaction.followup.send(
+                        f"Could not save that background: {error}",
+                        ephemeral=True,
+                    )
+            finally:
+                self.background_upload_active = False
+                if upload_message is not None:
+                    await delete_message_or_clear(
+                        upload_message,
+                        log_context="processed leaderboard background upload",
+                    )
 
         background_button.callback = background_callback
         self.add_item(background_button)
@@ -7137,15 +7223,19 @@ class IncompleteResultsReviewView(ExpiringView):
             self.completed = True
             disable_view_items(self)
             self.stop()
-            await interaction.response.edit_message(
-                content=(
+            await interaction.response.send_message(
+                (
                     "Teams or saved scores changed after this warning. "
                     "Nothing was published. Run `!res` again to review the "
                     "current results."
                 ),
-                embed=None,
-                view=self,
+                ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await delete_message_or_clear(
+                self.message or getattr(interaction, "message", None),
+                log_context="stale incomplete-results review",
+                fallback_content="This incomplete-results review is out of date.",
             )
             return None
         if self.completed:
@@ -7162,17 +7252,11 @@ class IncompleteResultsReviewView(ExpiringView):
         self.completed = True
         disable_view_items(self)
         self.stop()
-        if self.message is None:
-            return
-        try:
-            await self.message.edit(
-                content=self.timeout_notice,
-                embed=None,
-                view=self,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except discord.HTTPException:
-            logger.exception("Could not retire incomplete-results review.")
+        await delete_message_or_clear(
+            self.message,
+            log_context="expired incomplete-results review",
+            fallback_content="This incomplete-results review expired.",
+        )
 
     @discord.ui.button(
         label="Publish anyway",
@@ -7221,16 +7305,11 @@ class IncompleteResultsReviewView(ExpiringView):
         self.completed = True
         disable_view_items(self)
         self.stop()
-        if self.message is not None:
-            try:
-                await self.message.edit(
-                    content="✅ Incomplete results were published above.",
-                    embed=None,
-                    view=self,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except discord.HTTPException:
-                logger.exception("Could not close the results publication review.")
+        await delete_message_or_clear(
+            self.message or getattr(interaction, "message", None),
+            log_context="completed incomplete-results review",
+            fallback_content="This incomplete-results review is complete.",
+        )
         await interaction.followup.send(
             "The leaderboard was published. It is marked as incomplete.",
             ephemeral=True,
@@ -7251,11 +7330,15 @@ class IncompleteResultsReviewView(ExpiringView):
         self.completed = True
         disable_view_items(self)
         self.stop()
-        await interaction.response.edit_message(
-            content="Cancelled. No leaderboard was published.",
-            embed=None,
-            view=self,
+        await interaction.response.send_message(
+            "Cancelled. No leaderboard was published.",
+            ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await delete_message_or_clear(
+            self.message or getattr(interaction, "message", None),
+            log_context="cancelled incomplete-results review",
+            fallback_content="This incomplete-results review was cancelled.",
         )
 
 
@@ -7464,6 +7547,7 @@ class HelpView(ExpiringView):
         )
         self.copy_text_button.disabled = True
         self.timeout_notice = "⏱️ This help panel expired. Run `!help` again."
+        self.message: discord.Message | None = None
         category_select = discord.ui.Select(
             placeholder="Choose a help category...",
             min_values=1,
@@ -7496,6 +7580,14 @@ class HelpView(ExpiringView):
 
         category_select.callback = select_category
         self.add_item(category_select)
+
+    async def on_timeout(self) -> None:
+        disable_view_items(self)
+        await delete_message_or_clear(
+            self.message,
+            log_context="expired help panel",
+            fallback_content="This help panel expired.",
+        )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
@@ -7540,9 +7632,14 @@ class HelpView(ExpiringView):
         button: discord.ui.Button,
     ) -> None:
         self.stop()
-        await interaction.response.edit_message(
-            content="Help closed.",
-            view=None,
+        await interaction.response.send_message(
+            "Help closed.",
+            ephemeral=True,
+        )
+        await delete_message_or_clear(
+            getattr(interaction, "message", None),
+            log_context="closed help panel",
+            fallback_content="This help panel has ended.",
         )
 
 
@@ -7761,10 +7858,12 @@ class AuthAdminPanelView(DurableView):
                 )
 
             async def close_panel(interaction: discord.Interaction) -> None:
-                await interaction.response.edit_message(
-                    content="Authorization panel closed.",
-                    embed=None,
-                    view=None,
+                self.stop()
+                await interaction.response.defer()
+                await delete_message_or_clear(
+                    self.message or getattr(interaction, "message", None),
+                    log_context="closed authorization panel",
+                    fallback_content="Authorization panel closed.",
                 )
 
             self._add_button(
@@ -7839,11 +7938,11 @@ class AuthAdminPanelView(DurableView):
 
     async def on_timeout(self) -> None:
         disable_view_items(self)
-        if self.message is not None:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
+        await delete_message_or_clear(
+            self.message,
+            log_context="expired authorization panel",
+            fallback_content=self.timeout_notice,
+        )
 
 
 class AuthAddGuildModal(discord.ui.Modal):
@@ -9176,6 +9275,7 @@ class UpdateScrimSelectView(ExpiringView):
         self.owner_id = owner_id
         self.guild_id = guild_id
         self.scrim_ids = {scrim.id for scrim in scrims}
+        self.processing = False
 
         select = discord.ui.Select(
             placeholder="🔄 Select a scrim to update...",
@@ -9211,6 +9311,11 @@ class UpdateScrimSelectView(ExpiringView):
                     ephemeral=True,
                 )
                 self.stop()
+                await delete_message_or_clear(
+                    getattr(interaction, "message", None),
+                    log_context="stale !update selector",
+                    fallback_content="This slot-board selector has ended.",
+                )
                 return
 
             scrim = repository.get(selected_id)
@@ -9224,6 +9329,11 @@ class UpdateScrimSelectView(ExpiringView):
                     ephemeral=True,
                 )
                 self.stop()
+                await delete_message_or_clear(
+                    getattr(interaction, "message", None),
+                    log_context="inactive !update selector",
+                    fallback_content="This slot-board selector has ended.",
+                )
                 return
             if not member_is_staff(interaction.user, scrim):
                 await interaction.response.send_message(
@@ -9231,20 +9341,44 @@ class UpdateScrimSelectView(ExpiringView):
                     ephemeral=True,
                 )
                 self.stop()
+                await delete_message_or_clear(
+                    getattr(interaction, "message", None),
+                    log_context="unauthorized !update selector",
+                    fallback_content="This slot-board selector has ended.",
+                )
                 return
 
-            await interaction.response.defer(ephemeral=True)
-            updated = await publish_scrim(scrim)
-            self.stop()
-            disable_view_items(self)
+            if self.processing:
+                await interaction.response.send_message(
+                    "This slot-board update is already being processed.",
+                    ephemeral=True,
+                )
+                return
+
+            self.processing = True
             try:
-                await interaction.message.edit(view=self)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                logger.exception("Could not close the !update selector.")
+                await interaction.response.defer(ephemeral=True)
+                updated = await publish_scrim(scrim)
+                result_message = (
+                    "The slot board has been updated."
+                    if updated
+                    else "The slot board could not be updated."
+                )
+            except (OSError, ValueError, SlotStorageError, discord.HTTPException):
+                logger.exception(
+                    "Could not update the slot board for scrim %s.", scrim.id
+                )
+                result_message = "The slot board could not be updated."
+            finally:
+                self.stop()
+                disable_view_items(self)
+                await delete_message_or_clear(
+                    getattr(interaction, "message", None),
+                    log_context="completed !update selector",
+                    fallback_content="This slot-board update has ended.",
+                )
             await interaction.followup.send(
-                "The slot board has been updated."
-                if updated
-                else "The slot board could not be updated.",
+                result_message,
                 ephemeral=True,
             )
 
@@ -9677,6 +9811,7 @@ class AddRegistrationView(DurableView):
         self.error_entries = error_entries
         self.message: discord.Message | None = None
         self.completed = False
+        self.processing = False
         if not valid_entries:
             self.confirm_button.disabled = True
 
@@ -9713,60 +9848,87 @@ class AddRegistrationView(DurableView):
         return embed
 
     async def on_timeout(self) -> None:
-        disable_view_items(self)
-        if self.message is not None:
-            try:
-                await self.message.edit(
-                    embed=self.final_embed(
-                        "⏱️ Registration Preview Expired",
-                        color=discord.Color.orange(),
-                        extra_lines=["No changes were made."],
-                    ),
-                    view=self,
-                )
-            except discord.HTTPException:
-                pass
-
-    async def _finish_cancel(self, interaction: discord.Interaction) -> None:
+        if self.completed or self.processing:
+            return
         self.completed = True
         disable_view_items(self)
-        await interaction.response.edit_message(
-            embed=self.final_embed(
-                "❌ Registration Cancelled",
-                color=discord.Color.red(),
-                extra_lines=["No changes were made."],
-            ),
-            view=self,
-        )
         self.stop()
+        await delete_message_or_clear(
+            self.message,
+            log_context="expired registration preview",
+            fallback_content="This registration preview expired. No changes were made.",
+        )
+
+    async def _finish_cancel(self, interaction: discord.Interaction) -> None:
+        if self.completed or self.processing:
+            await interaction.response.send_message(
+                "This registration preview is already being processed.",
+                ephemeral=True,
+            )
+            return
+        self.completed = True
+        disable_view_items(self)
+        self.stop()
+        await interaction.response.send_message(
+            "Registration cancelled. No changes were made.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await delete_message_or_clear(
+            self.message or getattr(interaction, "message", None),
+            log_context="cancelled registration preview",
+            fallback_content="This registration preview was cancelled.",
+        )
 
     async def _finish_confirm(self, interaction: discord.Interaction) -> None:
-        if self.completed:
+        if self.completed or self.processing:
             await interaction.response.send_message(
                 "This registration preview has already been processed.",
                 ephemeral=True,
             )
             return
 
-        snapshots, unavailable, access_failures, board_refreshed = (
-            await apply_add_entries(self.scrim, self.valid_entries)
-        )
+        self.processing = True
+        try:
+            snapshots, unavailable, access_failures, board_refreshed = (
+                await apply_add_entries(self.scrim, self.valid_entries)
+            )
+        except Exception:
+            self.processing = False
+            logger.exception(
+                "Could not finish the registration preview for scrim %s.",
+                self.scrim.id,
+            )
+            await interaction.response.send_message(
+                "Registration could not be completed. Check the current slot board "
+                "and try again.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
         if unavailable:
             self.completed = True
             disable_view_items(self)
-            await interaction.response.edit_message(
+            self.stop()
+            await interaction.response.send_message(
                 embed=self.final_embed(
                     "⚠️ Registration Not Completed",
                     color=discord.Color.orange(),
                     extra_lines=["No changes were made.", *unavailable],
                 ),
-                view=self,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
-            self.stop()
+            await delete_message_or_clear(
+                self.message or getattr(interaction, "message", None),
+                log_context="unavailable registration preview",
+                fallback_content="This registration preview is no longer available.",
+            )
             return
 
         self.completed = True
         disable_view_items(self)
+        self.stop()
         result_lines = [
             f"✅ Slot {snapshot.number:02d}: "
             f"{discord.utils.escape_mentions(snapshot.team_name)} "
@@ -9783,15 +9945,20 @@ class AddRegistrationView(DurableView):
         result_lines.extend(
             f"⚠️ Skipped: {error}" for error in self.error_entries
         )
-        await interaction.response.edit_message(
+        await interaction.response.send_message(
             embed=self.final_embed(
                 "✅ Registration Completed Successfully",
                 color=discord.Color.green(),
                 extra_lines=result_lines,
             ),
-            view=self,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
-        self.stop()
+        await delete_message_or_clear(
+            self.message or getattr(interaction, "message", None),
+            log_context="completed registration preview",
+            fallback_content="This registration preview has been completed.",
+        )
 
     @discord.ui.button(
         label="Confirm",
@@ -10013,6 +10180,7 @@ class CaptainSlotSelectView(discord.ui.View):
         self.action = action
         self.target_user = target_user
         self.message: discord.Message | None = None
+        self.processing = False
         self.assignments = {
             captain_slot_id(scrim, slot): (scrim, slot, position, slot.assignment_id)
             for scrim, slot, position in assignments
@@ -10038,6 +10206,12 @@ class CaptainSlotSelectView(discord.ui.View):
                     ephemeral=True,
                 )
                 return
+            if self.processing:
+                await interaction.response.send_message(
+                    "This slot command is already being processed.",
+                    ephemeral=True,
+                )
+                return
             if interaction.guild is None or interaction.guild.id != self.guild_id:
                 await interaction.response.send_message(
                     "This selector is not valid in this server.",
@@ -10048,11 +10222,16 @@ class CaptainSlotSelectView(discord.ui.View):
             selected_id = select.values[0]
             captured = self.assignments.get(selected_id)
             if captured is None:
-                await interaction.response.edit_message(
-                    content="This slot selection is no longer available.",
-                    view=None,
-                )
                 self.stop()
+                await interaction.response.send_message(
+                    "This slot selection is no longer available.",
+                    ephemeral=True,
+                )
+                await delete_message_or_clear(
+                    self.message or getattr(interaction, "message", None),
+                    log_context="stale captain slot selector",
+                    fallback_content="This slot selector has ended.",
+                )
                 return
 
             captured_scrim, captured_slot, _position, captured_generation = captured
@@ -10072,11 +10251,16 @@ class CaptainSlotSelectView(discord.ui.View):
                 or current[1] is not captured_slot
                 or current[1].assignment_id != captured_generation
             ):
-                await interaction.response.edit_message(
-                    content="This slot assignment changed before the command was applied.",
-                    view=None,
-                )
                 self.stop()
+                await interaction.response.send_message(
+                    "This slot assignment changed before the command was applied.",
+                    ephemeral=True,
+                )
+                await delete_message_or_clear(
+                    self.message or getattr(interaction, "message", None),
+                    log_context="changed captain slot selector",
+                    fallback_content="This slot selector has ended.",
+                )
                 return
 
             if not cap_channel_is_allowed(
@@ -10086,6 +10270,12 @@ class CaptainSlotSelectView(discord.ui.View):
                     CAP_CHANNEL_RESTRICTION_MESSAGE,
                     ephemeral=True,
                 )
+                self.stop()
+                await delete_message_or_clear(
+                    self.message or getattr(interaction, "message", None),
+                    log_context="invalid-channel captain slot selector",
+                    fallback_content="This slot selector has ended.",
+                )
                 return
             if not cap_role_is_allowed(
                 interaction.user, self.guild_id, captured_scrim
@@ -10094,37 +10284,66 @@ class CaptainSlotSelectView(discord.ui.View):
                     CAP_ROLE_RESTRICTION_MESSAGE,
                     ephemeral=True,
                 )
+                self.stop()
+                await delete_message_or_clear(
+                    self.message or getattr(interaction, "message", None),
+                    log_context="unauthorized captain slot selector",
+                    fallback_content="This slot selector has ended.",
+                )
                 return
 
-            success, message = await execute_cap_action(
-                self.action,
-                self.ctx,
-                self.target_user,
-                current,
-            )
-            if success:
-                content = (
-                    f"✅ Command successfully applied to Slot "
-                    f"{captured_slot.number} ({captured_slot.team_name})."
-                )
-            else:
-                content = message or "The command could not be applied to this slot."
-            await interaction.response.edit_message(content=content, view=None)
+            self.processing = True
             self.stop()
+            try:
+                try:
+                    success, message = await execute_cap_action(
+                        self.action,
+                        self.ctx,
+                        self.target_user,
+                        current,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not execute the captain command for slot %s.",
+                        captured_slot.number,
+                    )
+                    content = (
+                        "The command could not be applied. Check this slot before "
+                        "trying again."
+                    )
+                else:
+                    if success:
+                        content = (
+                            f"✅ Command successfully applied to Slot "
+                            f"{captured_slot.number} ({captured_slot.team_name})."
+                        )
+                    else:
+                        content = (
+                            message
+                            or "The command could not be applied to this slot."
+                        )
+                await interaction.response.send_message(
+                    content,
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            finally:
+                await delete_message_or_clear(
+                    self.message or getattr(interaction, "message", None),
+                    log_context="completed captain slot selector",
+                    fallback_content="This slot command has ended.",
+                )
 
         select.callback = callback
         self.add_item(select)
 
     async def on_timeout(self) -> None:
         disable_view_items(self)
-        if self.message is not None:
-            try:
-                await self.message.edit(
-                    content="This slot selector has expired.",
-                    view=self,
-                )
-            except discord.HTTPException:
-                pass
+        await delete_message_or_clear(
+            self.message,
+            log_context="expired captain slot selector",
+            fallback_content="This slot selector has expired.",
+        )
 
 
 async def send_captain_slot_selector(
