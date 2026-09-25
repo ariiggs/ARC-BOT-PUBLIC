@@ -3662,6 +3662,668 @@ async def _record_match_scores(
     )
 
 
+class MatchScoreCorrectionView(discord.ui.View):
+    """Let the command owner choose one assigned team to correct."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        channel_id: int,
+        scrim: Scrim,
+        match_number: int,
+        slots: list[Slot],
+    ) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.scrim_id = scrim.id
+        self.match_number = match_number
+        self.slot_assignment_ids = {
+            slot.number: slot.assignment_id for slot in slots
+        }
+        self.message: discord.Message | None = None
+        self.expired = False
+
+        selector = discord.ui.Select(
+            placeholder="Choose the slot/team to correct...",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=f"Slot {slot.number:02d} · {slot.team_name}"[:100],
+                    value=str(slot.number),
+                    description=f"Tag: {slot.tag}"[:100] if slot.tag else None,
+                )
+                for slot in slots
+            ],
+        )
+
+        async def select_callback(interaction: discord.Interaction) -> None:
+            if self.expired or self.is_finished():
+                await interaction.response.send_message(
+                    "This score correction has expired. Run the command again.",
+                    ephemeral=True,
+                )
+                return
+            scrim = await self.authorized_scrim(interaction)
+            if scrim is None:
+                return
+            try:
+                slot_number = int(selector.values[0])
+            except (IndexError, ValueError):
+                await interaction.response.send_message(
+                    "That slot selection is invalid.",
+                    ephemeral=True,
+                )
+                return
+            slot = scrim.slots.get(slot_number)
+            if (
+                slot_number not in self.slot_assignment_ids
+                or slot is None
+                or slot.status == STATUS_AVAILABLE
+                or not slot.team_name
+                or slot.assignment_id
+                != self.slot_assignment_ids[slot_number]
+            ):
+                await interaction.response.send_message(
+                    "That team changed after this correction menu opened. "
+                    "Run the command again and choose the current team.",
+                    ephemeral=True,
+                )
+                return
+            current_score = scrim.match_scores.get(
+                (self.match_number, slot_number)
+            )
+            await interaction.response.send_modal(
+                MatchScoreCorrectionModal(
+                    self,
+                    slot,
+                    default_score=current_score,
+                    baseline_score=current_score,
+                )
+            )
+
+        selector.callback = select_callback
+        self.add_item(selector)
+
+    async def authorized_scrim(
+        self,
+        interaction: discord.Interaction,
+    ) -> Scrim | None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This score correction belongs to another staff member.",
+                ephemeral=True,
+            )
+            return None
+        if (
+            getattr(interaction.guild, "id", None) != self.guild_id
+            or interaction.channel_id != self.channel_id
+        ):
+            await interaction.response.send_message(
+                "This score correction is only valid in its original server "
+                "and channel.",
+                ephemeral=True,
+            )
+            return None
+        if self.expired:
+            await interaction.response.send_message(
+                "This score correction has expired. Run the command again.",
+                ephemeral=True,
+            )
+            return None
+
+        scrim = repository.get(self.scrim_id)
+        if (
+            scrim is None
+            or scrim.guild_id != self.guild_id
+            or not is_active(scrim)
+            or not member_is_staff(interaction.user, scrim)
+        ):
+            await interaction.response.send_message(
+                "You no longer have access to this scrim's score correction.",
+                ephemeral=True,
+            )
+            return None
+        if self.match_number > scrim.max_matches:
+            await interaction.response.send_message(
+                "That match is no longer configured for this scrim.",
+                ephemeral=True,
+            )
+            return None
+        return scrim
+
+    async def finish(self, content: str) -> None:
+        disable_view_items(self)
+        self.stop()
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=content,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not close the score correction selector.")
+
+    async def on_timeout(self) -> None:
+        self.expired = True
+        disable_view_items(self)
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=(
+                    f"Score correction expired. Run `!editres "
+                    f"{self.match_number}` to start again."
+                ),
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not expire the score correction selector.")
+
+
+class MatchScoreCorrectionModal(discord.ui.Modal):
+    """Collect a proposed correction, then require a review confirmation."""
+
+    def __init__(
+        self,
+        correction_view: MatchScoreCorrectionView,
+        slot: Slot,
+        *,
+        default_score: MatchScore | None = None,
+        baseline_score: MatchScore | None = None,
+        source_review: MatchScoreCorrectionReviewView | None = None,
+    ) -> None:
+        super().__init__(
+            title=f"Correct Match {correction_view.match_number} Result",
+            timeout=300,
+        )
+        self.correction_view = correction_view
+        self.slot_number = slot.number
+        self.slot_assignment_id = slot.assignment_id
+        self.slot_team_name = slot.team_name
+        self.baseline_score = baseline_score
+        self.source_review = source_review
+        self.placement_input = discord.ui.TextInput(
+            label="New placement / rank",
+            placeholder="For example: 1",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=3,
+        )
+        self.kills_input = discord.ui.TextInput(
+            label="New kills",
+            placeholder="For example: 6",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=5,
+        )
+        if default_score is not None:
+            self.placement_input.default = str(default_score.placement)
+            self.kills_input.default = str(default_score.kills)
+        self.add_item(self.placement_input)
+        self.add_item(self.kills_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if self.source_review is not None and self.source_review.completed:
+            await interaction.response.send_message(
+                "This score review was already processed. Run the command "
+                "again if another correction is needed.",
+                ephemeral=True,
+            )
+            return
+        scrim = await self.correction_view.authorized_scrim(interaction)
+        if scrim is None:
+            return
+        slot = scrim.slots.get(self.slot_number)
+        if (
+            slot is None
+            or slot.status == STATUS_AVAILABLE
+            or slot.assignment_id != self.slot_assignment_id
+            or slot.team_name != self.slot_team_name
+        ):
+            await interaction.response.send_message(
+                "That team changed before the correction was submitted. "
+                "Run the command again and select the current team.",
+                ephemeral=True,
+            )
+            return
+
+        current_score = scrim.match_scores.get(
+            (self.correction_view.match_number, self.slot_number)
+        )
+        if current_score != self.baseline_score:
+            await interaction.response.send_message(
+                "This team's saved score changed while the form was open. "
+                "No correction was saved. Run the command again to review "
+                "the current score.",
+                ephemeral=True,
+            )
+            if self.source_review is not None:
+                await self.source_review.close_as_stale()
+            return
+
+        rank_text = self.placement_input.value.strip()
+        kills_text = self.kills_input.value.strip()
+        if (
+            re.fullmatch(r"[0-9]+", rank_text) is None
+            or re.fullmatch(r"[0-9]+", kills_text) is None
+        ):
+            await interaction.response.send_message(
+                "Placement and kills must be whole numbers.",
+                ephemeral=True,
+            )
+            return
+        placement = int(rank_text)
+        kills = int(kills_text)
+        if placement < 1:
+            await interaction.response.send_message(
+                "Placement must be at least 1.",
+                ephemeral=True,
+            )
+            return
+
+        proposed_score = MatchScore(
+            self.correction_view.match_number,
+            self.slot_number,
+            kills,
+            placement,
+        )
+        review = MatchScoreCorrectionReviewView(
+            correction_view=self.correction_view,
+            slot=slot,
+            previous_score=current_score,
+            proposed_score=proposed_score,
+        )
+        await interaction.response.send_message(
+            embed=review.embed(),
+            view=review,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await review.capture_message(interaction)
+        if self.source_review is not None:
+            await self.source_review.close_as_edited()
+        else:
+            await self.correction_view.finish(
+                f"Match {self.correction_view.match_number} correction "
+                "proposal ready. Review the private recap and confirm to save."
+            )
+
+
+class MatchScoreCorrectionReviewView(discord.ui.View):
+    """Review a score correction before saving its single-team upsert."""
+
+    def __init__(
+        self,
+        *,
+        correction_view: MatchScoreCorrectionView,
+        slot: Slot,
+        previous_score: MatchScore | None,
+        proposed_score: MatchScore,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.correction_view = correction_view
+        self.match_number = correction_view.match_number
+        self.slot_number = slot.number
+        self.slot_assignment_id = slot.assignment_id
+        self.team_name = slot.team_name
+        self.previous_score = previous_score
+        self.proposed_score = proposed_score
+        self.completed = False
+        self.message: discord.Message | None = None
+
+    def embed(self) -> discord.Embed:
+        team_name = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(self.team_name)
+        )
+        current_result = (
+            "No result recorded"
+            if self.previous_score is None
+            else (
+                f"Rank **{self.previous_score.placement}** · "
+                f"**{self.previous_score.kills}** kills"
+            )
+        )
+        proposed_result = (
+            f"Rank **{self.proposed_score.placement}** · "
+            f"**{self.proposed_score.kills}** kills"
+        )
+        embed = discord.Embed(
+            title=f"Review score correction · Match {self.match_number}",
+            description=(
+                "No score has been changed yet. Confirm to save this "
+                "correction, edit the values, or cancel."
+            ),
+            color=discord.Color.orange(),
+        )
+        embed.add_field(
+            name="Team",
+            value=f"Slot {self.slot_number:02d} · {team_name}",
+            inline=False,
+        )
+        embed.add_field(
+            name="Current result",
+            value=current_result,
+            inline=True,
+        )
+        embed.add_field(
+            name="Proposed result",
+            value=proposed_result,
+            inline=True,
+        )
+        embed.set_footer(
+            text="Confirm saves · Edit reopens the form · Cancel discards"
+        )
+        return embed
+
+    async def capture_message(self, interaction: discord.Interaction) -> None:
+        try:
+            self.message = await interaction.original_response()
+        except discord.HTTPException:
+            logger.exception("Could not retain the score correction review.")
+
+    async def current_scrim_and_slot(
+        self,
+        interaction: discord.Interaction,
+    ) -> tuple[Scrim, Slot] | None:
+        if self.completed:
+            await interaction.response.send_message(
+                "This score review has already been processed.",
+                ephemeral=True,
+            )
+            return None
+        scrim = await self.correction_view.authorized_scrim(interaction)
+        if scrim is None:
+            return None
+        slot = scrim.slots.get(self.slot_number)
+        current_score = scrim.match_scores.get(
+            (self.match_number, self.slot_number)
+        )
+        if (
+            slot is None
+            or slot.status == STATUS_AVAILABLE
+            or slot.assignment_id != self.slot_assignment_id
+            or slot.team_name != self.team_name
+            or current_score != self.previous_score
+        ):
+            self.completed = True
+            disable_view_items(self)
+            self.stop()
+            await interaction.response.edit_message(
+                content=(
+                    "This team or score changed after the recap was created. "
+                    "No correction was saved. Run "
+                    f"`!editres {self.match_number}` to review the current data."
+                ),
+                embed=None,
+                view=self,
+            )
+            return None
+        return scrim, slot
+
+    async def close_as_edited(self) -> None:
+        await self.close(
+            "This recap was replaced by the newer edited proposal. "
+            "Review the latest recap before confirming."
+        )
+
+    async def close_as_stale(self) -> None:
+        await self.close(
+            "This recap is out of date. No correction was saved. "
+            f"Run `!editres {self.match_number}` to review the current data."
+        )
+
+    async def close(self, content: str) -> None:
+        self.completed = True
+        disable_view_items(self)
+        self.stop()
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=content,
+                embed=None,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not close the score correction recap.")
+
+    async def on_timeout(self) -> None:
+        if self.completed:
+            return
+        self.completed = True
+        disable_view_items(self)
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content="Score correction review expired. No change was saved.",
+                embed=None,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not expire the score correction recap.")
+
+    @discord.ui.button(
+        label="Confirm",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+    )
+    async def confirm_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        result = await self.current_scrim_and_slot(interaction)
+        if result is None:
+            return
+        scrim, _slot = result
+        try:
+            repository.upsert_match_scores(
+                scrim.id,
+                scrim.guild_id,
+                self.match_number,
+                [self.proposed_score],
+            )
+        except ValueError as error:
+            await interaction.response.send_message(
+                f"❌ {error}",
+                ephemeral=True,
+            )
+            return
+        except SlotStorageError:
+            logger.exception(
+                "Could not save a score correction for scrim %s.",
+                scrim.id,
+            )
+            await interaction.response.send_message(
+                "The correction could not be saved. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        self.completed = True
+        disable_view_items(self)
+        self.stop()
+        await interaction.response.edit_message(
+            content=(
+                f"✅ Corrected Match {self.match_number} for "
+                f"Slot {self.slot_number:02d} · {self.team_name}: "
+                f"rank {self.proposed_score.placement}, "
+                f"{self.proposed_score.kills} kills. "
+                "Other teams' scores were left unchanged."
+            ),
+            embed=None,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(
+        label="Edit",
+        emoji="✏️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def edit_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        result = await self.current_scrim_and_slot(interaction)
+        if result is None:
+            return
+        _scrim, slot = result
+        await interaction.response.send_modal(
+            MatchScoreCorrectionModal(
+                self.correction_view,
+                slot,
+                default_score=self.proposed_score,
+                baseline_score=self.previous_score,
+                source_review=self,
+            )
+        )
+
+    @discord.ui.button(
+        label="Choose another team",
+        emoji="👥",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def choose_another_team_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        result = await self.current_scrim_and_slot(interaction)
+        if result is None:
+            return
+        scrim, _slot = result
+        assigned_slots = [
+            slot
+            for slot in scrim.slots.values()
+            if slot.status != STATUS_AVAILABLE and slot.team_name
+        ]
+        new_view = MatchScoreCorrectionView(
+            owner_id=self.correction_view.owner_id,
+            guild_id=scrim.guild_id,
+            channel_id=self.correction_view.channel_id,
+            scrim=scrim,
+            match_number=self.match_number,
+            slots=assigned_slots,
+        )
+        new_view.message = interaction.message
+        self.completed = True
+        disable_view_items(self)
+        self.stop()
+        await interaction.response.edit_message(
+            content=f"Choose a team to correct for Match {self.match_number}:",
+            embed=None,
+            view=new_view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(
+        label="Cancel",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+    )
+    async def cancel_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.completed:
+            await interaction.response.send_message(
+                "This score review has already been processed.",
+                ephemeral=True,
+            )
+            return
+        self.completed = True
+        disable_view_items(self)
+        self.stop()
+        await interaction.response.edit_message(
+            content="Correction cancelled. No score was changed.",
+            embed=None,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+async def _start_match_score_correction(
+    ctx: commands.Context,
+    match_number: int,
+) -> None:
+    scrim = await require_staff_scrim(ctx)
+    if scrim is None:
+        return
+    if not 1 <= match_number <= scrim.max_matches:
+        await send_private_command_feedback(
+            ctx,
+            f"❌ Match number must be between 1 and {scrim.max_matches}.",
+            silent=False,
+        )
+        return
+    assigned_slots = [
+        slot
+        for slot in scrim.slots.values()
+        if slot.status != STATUS_AVAILABLE and slot.team_name
+    ]
+    if not assigned_slots:
+        await send_private_command_feedback(
+            ctx,
+            "❌ There are no assigned teams to correct for this scrim.",
+            silent=False,
+        )
+        return
+
+    view = MatchScoreCorrectionView(
+        owner_id=ctx.author.id,
+        guild_id=scrim.guild_id,
+        channel_id=ctx.channel.id,
+        scrim=scrim,
+        match_number=match_number,
+        slots=assigned_slots,
+    )
+    try:
+        view.message = await ctx.send(
+            f"Choose the team to correct for Match {match_number}:",
+            view=view,
+            delete_after=300,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        logger.exception(
+            "Could not show the score correction selector for scrim %s.",
+            scrim.id,
+        )
+    finally:
+        await delete_command_message(ctx)
+
+
+@bot.command(name="editres")
+async def edit_match_score_command(
+    ctx: commands.Context,
+    match_number: str = "",
+) -> None:
+    """Correct one team's rank and kills without re-entering the match."""
+    match_number = match_number.strip()
+    if re.fullmatch(r"[0-9]+", match_number) is None:
+        await send_private_command_feedback(
+            ctx,
+            "Use `!editres <match number>`, for example `!editres 2`.",
+            silent=False,
+        )
+        return
+    await _start_match_score_correction(ctx, int(match_number))
+
+
 def _register_specific_score_commands() -> None:
     for match_number in range(1, MAX_MATCHES + 1):
         def make_score_handler(game_number: int):
@@ -5623,6 +6285,7 @@ HELP_COPY_TEXT = (
     "!open | !close | !remind\n"
     "STATUS: !slots [Scrim] | !update [Scrim] | !res / !lb | "
     f"!resg1-{MAX_MATCHES} slot kills (best team first; omit missed teams)\n"
+    "!editres <match> (choose team, enter rank and kills)\n"
     "ROOM: !idpw room / minutes | !idpwg1-25 room / minutes\n"
     "CAPTAINS: !register Team / TAG [/ @Manager] | "
     "!cap add|transfer|remove @User\n"
@@ -5641,7 +6304,8 @@ def build_help_text() -> str:
         "`!remove 03` `!open` `!close` `!remind`\n"
         "**STATUS** `!slots [Scrim]` `!update [Scrim]` `!res`/`!lb` "
         f"`!resg1-{MAX_MATCHES} slot kills` "
-        "(best team first; omit missed teams)\n"
+        "(best team first; omit missed teams) "
+        "`!editres <match>` (choose team, enter rank and kills)\n"
         "**ROOM** `!idpw room / minutes` `!idpwg1-25 room / minutes`\n"
         "**CAPTAINS** `!register Team / TAG [/ @Manager]` "
         "`!cap add|transfer|remove @User`\n"
