@@ -6788,8 +6788,7 @@ async def leaderboard_command(ctx: commands.Context) -> None:
 
 HELP_COPY_TEXT = (
     "A.R.C. HELP\n"
-    "STAFF: !setup | !setres | !set @Role | !say text | !export | "
-    "!reset\n"
+    "STAFF: !setup | !setres | !set @Role | !say text | !reset\n"
     "SLOTS: !add Team / TAG / @Captain | !confirm 03 04 | !remove 03 | "
     "!open | !close | !remind\n"
     "STATUS: !slots [Scrim] | !update [Scrim] | !res / !lb "
@@ -6810,7 +6809,7 @@ def build_help_text() -> str:
     return (
         ">>> **A.R.C. HELP**\n"
         "**STAFF** `!setup` `!setres` `!set @Role` `!say text` "
-        "`!export` `!reset`\n"
+        "`!reset`\n"
         "**SLOTS** `!add Team / TAG / @Captain` `!confirm 03 04` "
         "`!remove 03` `!open` `!close` `!remind`\n"
         "**STATUS** `!slots [Scrim]` `!update [Scrim]` "
@@ -8606,170 +8605,6 @@ async def say_message(ctx: commands.Context, *, message: str) -> None:
             "Could not publish staff announcement in channel %s.",
             ctx.channel.id,
         )
-
-
-def build_export_messages(scrim: Scrim) -> list[str]:
-    """Build copy-friendly code blocks with captain IDs for every assigned team."""
-    blocks = []
-    for slot in sorted(scrim.slots.values(), key=lambda item: item.number):
-        if (
-            slot.status == STATUS_AVAILABLE
-            or not slot.team_name
-            or slot.manager_id is None
-        ):
-            continue
-        team_name = " ".join(slot.team_name.split()).replace("```", "")
-        tag = (
-            " ".join(slot.tag.split()).replace("```", "")
-            if slot.tag
-            else f"S{slot.number:02d}"
-        )
-        captain_ids = [f"<@{slot.manager_id}>"]
-        if slot.captain_2_id is not None:
-            captain_ids.append(f"<@{slot.captain_2_id}>")
-        blocks.append(f"```text\n{team_name} {tag} {' '.join(captain_ids)}\n```")
-
-    return blocks
-
-
-class ExportScrimSelectView(discord.ui.View):
-    """Let staff choose which active scrim should be exported."""
-
-    def __init__(
-        self,
-        *,
-        owner_id: int,
-        guild_id: int,
-        scrims: list[Scrim],
-    ) -> None:
-        super().__init__(timeout=120)
-        self.owner_id = owner_id
-        self.guild_id = guild_id
-        self.scrim_ids = {scrim.id for scrim in scrims}
-
-        select = discord.ui.Select(
-            placeholder="📂 Select a Scrim to export...",
-            min_values=1,
-            max_values=1,
-            options=[
-                discord.SelectOption(
-                    label=scrim.name[:100],
-                    value=scrim.id,
-                )
-                for scrim in scrims
-            ],
-        )
-
-        async def callback(interaction: discord.Interaction) -> None:
-            if interaction.user.id != self.owner_id:
-                await interaction.response.send_message(
-                    "This scrim selector belongs to another user.",
-                    ephemeral=True,
-                )
-                return
-            if interaction.guild is None or interaction.guild.id != self.guild_id:
-                await interaction.response.send_message(
-                    "This selector is not valid in this server.",
-                    ephemeral=True,
-                )
-                return
-            if not member_is_staff_in_guild(interaction.user, self.guild_id):
-                await interaction.response.send_message(
-                    "You do not have permission to export scrims.",
-                    ephemeral=True,
-                )
-                self.stop()
-                return
-
-            selected_id = select.values[0]
-            if selected_id not in self.scrim_ids:
-                await interaction.response.send_message(
-                    "That scrim selection is no longer available.",
-                    ephemeral=True,
-                )
-                self.stop()
-                return
-
-            scrim = repository.get(selected_id)
-            if (
-                scrim is None
-                or scrim.guild_id != self.guild_id
-                or scrim.deleted
-            ):
-                await interaction.response.send_message(
-                    "That scrim is no longer available.",
-                    ephemeral=True,
-                )
-                self.stop()
-                return
-
-            messages = build_export_messages(scrim)
-            if not messages:
-                await interaction.response.send_message(
-                    "No teams are registered.",
-                    ephemeral=True,
-                )
-                self.stop()
-                return
-
-            try:
-                await interaction.response.send_message(
-                    messages[0],
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-                for message in messages[1:]:
-                    await interaction.followup.send(
-                        message,
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-            except discord.HTTPException:
-                logger.exception("Could not export teams for scrim %s.", scrim.id)
-            finally:
-                self.stop()
-
-        select.callback = callback
-        self.add_item(select)
-
-
-@bot.command(name="export")
-@commands.guild_only()
-async def export_teams(ctx: commands.Context) -> None:
-    """Show a server-wide scrim selector and export the selected scrim."""
-    if ctx.guild is None:
-        return
-    if not member_is_staff_in_guild(ctx.author, ctx.guild.id):
-        await send_private_command_feedback(
-            ctx,
-            "You do not have permission to export scrims.",
-            silent=True,
-        )
-        return
-
-    scrims = repository.list(ctx.guild.id)
-    if not scrims:
-        await send_private_command_feedback(
-            ctx,
-            "No active scrims are configured for this server.",
-        )
-        return
-
-    view = ExportScrimSelectView(
-        owner_id=ctx.author.id,
-        guild_id=ctx.guild.id,
-        scrims=scrims,
-    )
-    try:
-        await ctx.send(
-            "📂 Select a scrim to export:",
-            view=view,
-            delete_after=120,
-        )
-    except discord.HTTPException:
-        logger.exception("Could not show the scrim export selector.")
-    finally:
-        await delete_command_message(ctx)
 
 
 @dataclass

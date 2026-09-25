@@ -71,8 +71,6 @@ scrim reprend son nom. Les autres scrims restent inchangés.
   (propriétaire ou rôle Bot Manager configuré avec `!set`).
 - `!say Registration Open` : publier une annonce avec le bot dans le salon
   courant, sans exposer l'identité du membre du staff.
-- `!export` : exporter chaque équipe du scrim actif dans un bloc de code
-  individuel avec l'ID brut de son manager, prêt à copier vers un autre bot.
 - `!add Team name / TAG / @Captain` : ajouter au premier slot libre.
   Plusieurs lignes permettent une inscription en masse ; chaque équipe reçoit
   automatiquement le prochain slot disponible. L'ancien format

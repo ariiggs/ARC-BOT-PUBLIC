@@ -97,7 +97,6 @@ affiche la même liste sans les contrôles publics.
 !slots [Nom du scrim]
 !sub
 !say Registration Open
-!export
 !add Team name / TAG / @Captain
 Team Alpha / 1 / @Captain1
 Team Bravo / 2 / @Captain2

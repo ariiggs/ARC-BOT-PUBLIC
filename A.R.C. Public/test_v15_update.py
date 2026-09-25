@@ -76,6 +76,8 @@ class V15UpdateTests(unittest.TestCase):
         self.assertIn("!cap add|transfer|remove @User", help_text)
         self.assertIn(f"!resg1-{MAX_MATCHES} slot kills placement", help_text)
         self.assertIn(f"!resg1-{MAX_MATCHES} slot kills placement", HELP_COPY_TEXT)
+        self.assertNotIn("!export", help_text)
+        self.assertNotIn("!export", HELP_COPY_TEXT)
         self.assertIn("!setres", HELP_COPY_TEXT)
         self.assertNotIn("```", help_text)
         self.assertLessEqual(len(help_text), 1000)
@@ -84,6 +86,11 @@ class V15UpdateTests(unittest.TestCase):
         self.assertIsNotNone(bot.get_command("idpwg1"))
         self.assertIsNotNone(bot.get_command("idpwg25"))
         self.assertIsNone(bot.get_command("idpwg32"))
+        self.assertIsNone(bot.get_command("export"))
+
+    def test_removed_export_command_is_absent_from_help(self):
+        self.assertNotIn("!export", build_help_text())
+        self.assertNotIn("!export", HELP_COPY_TEXT)
 
     def test_dynamic_idpw_configuration_persists_without_a_fixed_password(self):
         with tempfile.TemporaryDirectory() as directory:

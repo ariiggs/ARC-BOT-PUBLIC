@@ -82,6 +82,12 @@ LEADERBOARD_SECTION_GAP = 10
 LEADERBOARD_TABLE_HEADER_HEIGHT = 64
 LEADERBOARD_VERTICAL_ROW_HEIGHT = 60
 LEADERBOARD_HORIZONTAL_ROW_HEIGHT = 80
+LEADERBOARD_VERTICAL_ROW_FONT_SIZE = 21
+LEADERBOARD_HORIZONTAL_ROW_FONT_SIZE = 32
+LEADERBOARD_ROW_FONT_WEIGHT = 700
+LEADERBOARD_DATE_FONT_SIZE = 36
+LEADERBOARD_TEAM_NAME_LEFT_PADDING = 12
+STANDARD_LEADERBOARD_TEAM_COUNT = 20
 LEADERBOARD_FIELD_BASE_WIDTHS = (48, 500, 120, 120, 120, 116)
 
 
@@ -3617,35 +3623,1177 @@ async def _record_match_scores(
             silent=False,
         )
         return
-    scores = parse_match_score_lines(
-        input_string,
-        match_number=match_number,
-        scrim=scrim,
-    )
-    if not scores:
+    if match_number < 1:
         await send_private_command_feedback(
             ctx,
-            f"❌ No valid scores found for Match {match_number}. "
-            "Use one `slot kills placement` entry per line.",
+            "❌ Match number must be at least 1.",
             silent=False,
         )
         return
+    progress_message: discord.Message | None = None
     try:
-        processed = repository.upsert_match_scores(
-            scrim.id,
-            scrim.guild_id,
+        try:
+            progress_message = await ctx.send(
+                "⏳ Preparing the score review…",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception(
+                "Could not show score-review progress for scrim %s.",
+                scrim.id,
+            )
+
+        async def update_prompt(
+            content: str,
+            *,
+            embed: discord.Embed | None = None,
+            view: discord.ui.View | None = None,
+        ) -> discord.Message | None:
+            if progress_message is not None:
+                try:
+                    await progress_message.edit(
+                        content=content,
+                        embed=embed,
+                        view=view,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return progress_message
+                except discord.HTTPException:
+                    logger.exception(
+                        "Could not update score review for scrim %s.",
+                        scrim.id,
+                    )
+            try:
+                return await ctx.send(
+                    content,
+                    embed=embed,
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                logger.exception(
+                    "Could not send score review for scrim %s.",
+                    scrim.id,
+                )
+                return None
+
+        normalized_input = normalize_score_submission_text(
+            input_string,
             match_number,
-            scores,
         )
-    except ValueError as error:
-        await send_private_command_feedback(ctx, f"❌ {error}", silent=False)
-        return
-    await send_private_command_feedback(
-        ctx,
-        f"✅ Scores saved for Match {match_number}: "
-        f"Processed {processed} teams.",
-        silent=False,
+        try:
+            scores = parse_match_score_lines(
+                normalized_input,
+                match_number=match_number,
+                scrim=scrim,
+            )
+        except ValueError as error:
+            await update_prompt(f"❌ {error} Nothing was saved.")
+            return
+        if not scores:
+            await update_prompt(
+                f"❌ No valid scores found for Match {match_number}. "
+                "Use one `slot kills` entry per rank, best team first. "
+                "Nothing was saved."
+            )
+            return
+
+        review = MatchScoreSubmissionReviewView(
+            owner_id=ctx.author.id,
+            guild_id=scrim.guild_id,
+            channel_id=ctx.channel.id,
+            scrim=scrim,
+            match_number=match_number,
+            scores=scores,
+            raw_input=normalized_input,
+        )
+        review.message = await update_prompt(
+            "Review the rank order and kills below. **Nothing has been saved.**",
+            embed=review.embed(),
+            view=review,
+        )
+    finally:
+        await delete_command_message(ctx)
+
+
+def normalize_score_submission_text(
+    input_string: str,
+    match_number: int,
+) -> str:
+    """Allow the edit form to accept either score lines or a full !resgN command."""
+    lines = str(input_string).splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        command = re.fullmatch(
+            rf"!?resg{match_number}(?:\s+(.*))?",
+            line.strip(),
+            flags=re.IGNORECASE,
+        )
+        if command is not None:
+            if command.group(1):
+                lines[index] = command.group(1)
+            else:
+                lines.pop(index)
+        break
+    return "\n".join(lines).strip()
+
+
+def _match_scores_snapshot(scrim: Scrim, match_number: int) -> tuple:
+    return tuple(
+        (score.slot_number, score.kills, score.placement)
+        for score in sorted(
+            (
+                score
+                for score in getattr(scrim, "match_scores", {}).values()
+                if score.match_number == match_number
+            ),
+            key=lambda score: score.slot_number,
+        )
     )
+
+
+class MatchScoreSubmissionReviewView(discord.ui.View):
+    """Confirm or edit a complete match result set before it is saved."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        channel_id: int,
+        scrim: Scrim,
+        match_number: int,
+        scores: list[MatchScore],
+        raw_input: str,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.scrim_id = scrim.id
+        self.match_number = match_number
+        self.scores = tuple(scores)
+        self.raw_input = raw_input.strip()
+        self.assignment_generation = assignment_fingerprint(scrim)
+        self.baseline_scores = _match_scores_snapshot(scrim, match_number)
+        self.team_names = {
+            score.slot_number: scrim.slots[score.slot_number].team_name
+            for score in scores
+        }
+        self.message: discord.Message | None = None
+        self.completed = False
+        self.editing = False
+        self.processing = False
+
+    def embed(self) -> discord.Embed:
+        score_lines = []
+        for score in sorted(self.scores, key=lambda item: item.placement):
+            team_name = discord.utils.escape_markdown(
+                discord.utils.escape_mentions(
+                    self.team_names.get(score.slot_number, "Unknown team")
+                )
+            )
+            score_lines.append(
+                f"**{score.placement:02d}.** Slot {score.slot_number:02d} · "
+                f"{team_name} — **{score.kills}** kills"
+            )
+        embed = discord.Embed(
+            title=f"Review Match {self.match_number} results",
+            description=(
+                "Check the rank order and kills before saving. "
+                f"Confirm replaces the previous complete result set for Match "
+                f"{self.match_number}; teams omitted here will be removed.\n\n"
+                + "\n".join(score_lines)
+            ),
+            color=discord.Color.orange(),
+        )
+        embed.set_footer(
+            text="No scores have been saved · Confirm saves · Edit changes the command"
+        )
+        return embed
+
+    async def authorized_scrim(
+        self,
+        interaction: discord.Interaction,
+    ) -> Scrim | None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This score review belongs to another staff member.",
+                ephemeral=True,
+            )
+            return None
+        if (
+            getattr(interaction.guild, "id", None) != self.guild_id
+            or interaction.channel_id != self.channel_id
+        ):
+            await interaction.response.send_message(
+                "This score review is only valid in its original server and channel.",
+                ephemeral=True,
+            )
+            return None
+        if self.completed:
+            await interaction.response.send_message(
+                "This score review has already been processed.",
+                ephemeral=True,
+            )
+            return None
+
+        scrim = repository.get(self.scrim_id)
+        if (
+            scrim is None
+            or scrim.guild_id != self.guild_id
+            or not is_active(scrim)
+            or not member_is_staff(interaction.user, scrim)
+        ):
+            await interaction.response.send_message(
+                "You no longer have access to this scrim's score review.",
+                ephemeral=True,
+            )
+            return None
+        if not 1 <= self.match_number <= scrim.max_matches:
+            await interaction.response.send_message(
+                "That match is no longer configured for this scrim.",
+                ephemeral=True,
+            )
+            return None
+        return scrim
+
+    async def current_scrim(
+        self,
+        interaction: discord.Interaction,
+    ) -> Scrim | None:
+        scrim = await self.authorized_scrim(interaction)
+        if scrim is None:
+            return None
+        if (
+            assignment_fingerprint(scrim) != self.assignment_generation
+            or _match_scores_snapshot(scrim, self.match_number)
+            != self.baseline_scores
+        ):
+            self.completed = True
+            disable_view_items(self)
+            self.stop()
+            await interaction.response.edit_message(
+                content=(
+                    "This review is out of date because teams or saved scores "
+                    "changed. No proposed scores were saved. Run the command "
+                    "again to review the current data."
+                ),
+                embed=None,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return None
+        return scrim
+
+    async def close(self, content: str) -> None:
+        self.completed = True
+        self.editing = False
+        disable_view_items(self)
+        self.stop()
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=content,
+                embed=None,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not close the Match %s score review.", self.match_number)
+
+    async def on_timeout(self) -> None:
+        if self.completed:
+            return
+        await self.close(
+            f"Match {self.match_number} score review expired. "
+            "No proposed scores were saved."
+        )
+
+    @discord.ui.button(
+        label="Confirm",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+    )
+    async def confirm_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.editing:
+            await interaction.response.send_message(
+                "Finish or cancel the edit form before confirming this review.",
+                ephemeral=True,
+            )
+            return
+        if self.processing:
+            await interaction.response.send_message(
+                "This score review is already being processed.",
+                ephemeral=True,
+            )
+            return
+        scrim = await self.current_scrim(interaction)
+        if scrim is None:
+            return
+        self.processing = True
+        try:
+            processed = repository.replace_match_scores(
+                scrim.id,
+                scrim.guild_id,
+                self.match_number,
+                list(self.scores),
+            )
+        except ValueError as error:
+            self.processing = False
+            await interaction.response.send_message(
+                f"❌ {error} Nothing was saved.",
+                ephemeral=True,
+            )
+            return
+        except SlotStorageError:
+            self.processing = False
+            logger.exception(
+                "Could not save submitted scores for scrim %s.",
+                scrim.id,
+            )
+            await interaction.response.send_message(
+                "The scores could not be saved. Nothing was changed; please try again.",
+                ephemeral=True,
+            )
+            return
+
+        self.completed = True
+        self.editing = False
+        disable_view_items(self)
+        self.stop()
+        await interaction.response.edit_message(
+            content=(
+                f"✅ Scores saved for Match {self.match_number}: "
+                f"Processed {processed} teams. Use `!res` when you are ready "
+                "to publish the leaderboard image."
+            ),
+            embed=None,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(
+        label="Edit",
+        emoji="✏️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def edit_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.processing:
+            await interaction.response.send_message(
+                "This score review is already being processed.",
+                ephemeral=True,
+            )
+            return
+        scrim = await self.current_scrim(interaction)
+        if scrim is None:
+            return
+        self.editing = True
+        await interaction.response.send_modal(
+            MatchScoreSubmissionEditModal(self)
+        )
+
+    @discord.ui.button(
+        label="Cancel",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+    )
+    async def cancel_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.processing:
+            await interaction.response.send_message(
+                "This score review is already being processed.",
+                ephemeral=True,
+            )
+            return
+        if await self.authorized_scrim(interaction) is None:
+            return
+        self.completed = True
+        self.editing = False
+        disable_view_items(self)
+        self.stop()
+        await interaction.response.edit_message(
+            content=(
+                "Score entry cancelled. No proposed scores were saved; "
+                "previously saved results remain unchanged."
+            ),
+            embed=None,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class MatchScoreSubmissionEditModal(discord.ui.Modal):
+    """Let staff edit the pasted !resgN command before confirming it."""
+
+    def __init__(self, source_review: MatchScoreSubmissionReviewView) -> None:
+        super().__init__(
+            title=f"Edit Match {source_review.match_number} score command",
+            timeout=300,
+        )
+        self.source_review = source_review
+        default_command = (
+            f"!resg{source_review.match_number}\n{source_review.raw_input}"
+        )
+        self.command_input = discord.ui.TextInput(
+            label="Paste or edit the full command",
+            placeholder=f"!resg{source_review.match_number} then one slot kills line per rank",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=4000,
+            default=default_command[:4000],
+        )
+        self.add_item(self.command_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        source_review = self.source_review
+        if source_review.completed or not source_review.editing:
+            await interaction.response.send_message(
+                "This score review is no longer available. Run the command again.",
+                ephemeral=True,
+            )
+            return
+        scrim = await source_review.authorized_scrim(interaction)
+        if scrim is None:
+            return
+        if (
+            assignment_fingerprint(scrim) != source_review.assignment_generation
+            or _match_scores_snapshot(scrim, source_review.match_number)
+            != source_review.baseline_scores
+        ):
+            await interaction.response.send_message(
+                "Teams or saved results changed while the edit form was open. "
+                "Nothing was saved; run the command again.",
+                ephemeral=True,
+            )
+            await source_review.close(
+                "This review became out of date while the edit form was open. "
+                "No proposed scores were saved."
+            )
+            return
+        normalized_input = normalize_score_submission_text(
+            self.command_input.value,
+            source_review.match_number,
+        )
+        try:
+            scores = parse_match_score_lines(
+                normalized_input,
+                match_number=source_review.match_number,
+                scrim=scrim,
+            )
+        except ValueError as error:
+            await interaction.response.send_message(
+                f"❌ {error} Nothing was saved. Reopen Edit to try again.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        if not scores:
+            await interaction.response.send_message(
+                "❌ No valid scores found. Nothing was saved. Reopen Edit to try again.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        review = MatchScoreSubmissionReviewView(
+            owner_id=source_review.owner_id,
+            guild_id=scrim.guild_id,
+            channel_id=source_review.channel_id,
+            scrim=scrim,
+            match_number=source_review.match_number,
+            scores=scores,
+            raw_input=normalized_input,
+        )
+        await interaction.response.send_message(
+            "Review the edited scores below. **Nothing has been saved.**",
+            embed=review.embed(),
+            view=review,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        try:
+            review.message = await interaction.original_response()
+        except discord.HTTPException:
+            logger.exception("Could not retain the edited Match %s review.", review.match_number)
+        await source_review.close(
+            "This score review was replaced by the edited proposal below. "
+            "It did not save any scores."
+        )
+
+
+class MatchScoreCorrectionView(discord.ui.View):
+    """Let the command owner choose one assigned team to correct."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        channel_id: int,
+        scrim: Scrim,
+        match_number: int,
+        slots: list[Slot],
+    ) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.scrim_id = scrim.id
+        self.match_number = match_number
+        self.slot_assignment_ids = {
+            slot.number: slot.assignment_id for slot in slots
+        }
+        self.message: discord.Message | None = None
+        self.expired = False
+
+        selector = discord.ui.Select(
+            placeholder="Choose the slot/team to correct...",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=f"Slot {slot.number:02d} · {slot.team_name}"[:100],
+                    value=str(slot.number),
+                    description=f"Tag: {slot.tag}"[:100] if slot.tag else None,
+                )
+                for slot in slots
+            ],
+        )
+
+        async def select_callback(interaction: discord.Interaction) -> None:
+            if self.expired or self.is_finished():
+                await interaction.response.send_message(
+                    "This score correction has expired. Run the command again.",
+                    ephemeral=True,
+                )
+                return
+            scrim = await self.authorized_scrim(interaction)
+            if scrim is None:
+                return
+            try:
+                slot_number = int(selector.values[0])
+            except (IndexError, ValueError):
+                await interaction.response.send_message(
+                    "That slot selection is invalid.",
+                    ephemeral=True,
+                )
+                return
+            slot = scrim.slots.get(slot_number)
+            if (
+                slot_number not in self.slot_assignment_ids
+                or slot is None
+                or slot.status == STATUS_AVAILABLE
+                or not slot.team_name
+                or slot.assignment_id
+                != self.slot_assignment_ids[slot_number]
+            ):
+                await interaction.response.send_message(
+                    "That team changed after this correction menu opened. "
+                    "Run the command again and choose the current team.",
+                    ephemeral=True,
+                )
+                return
+            current_score = scrim.match_scores.get(
+                (self.match_number, slot_number)
+            )
+            await interaction.response.send_modal(
+                MatchScoreCorrectionModal(
+                    self,
+                    slot,
+                    default_score=current_score,
+                    baseline_score=current_score,
+                )
+            )
+
+        selector.callback = select_callback
+        self.add_item(selector)
+
+    async def authorized_scrim(
+        self,
+        interaction: discord.Interaction,
+    ) -> Scrim | None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This score correction belongs to another staff member.",
+                ephemeral=True,
+            )
+            return None
+        if (
+            getattr(interaction.guild, "id", None) != self.guild_id
+            or interaction.channel_id != self.channel_id
+        ):
+            await interaction.response.send_message(
+                "This score correction is only valid in its original server "
+                "and channel.",
+                ephemeral=True,
+            )
+            return None
+        if self.expired:
+            await interaction.response.send_message(
+                "This score correction has expired. Run the command again.",
+                ephemeral=True,
+            )
+            return None
+
+        scrim = repository.get(self.scrim_id)
+        if (
+            scrim is None
+            or scrim.guild_id != self.guild_id
+            or not is_active(scrim)
+            or not member_is_staff(interaction.user, scrim)
+        ):
+            await interaction.response.send_message(
+                "You no longer have access to this scrim's score correction.",
+                ephemeral=True,
+            )
+            return None
+        if self.match_number > scrim.max_matches:
+            await interaction.response.send_message(
+                "That match is no longer configured for this scrim.",
+                ephemeral=True,
+            )
+            return None
+        return scrim
+
+    async def finish(self, content: str) -> None:
+        disable_view_items(self)
+        self.stop()
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=content,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not close the score correction selector.")
+
+    async def on_timeout(self) -> None:
+        self.expired = True
+        disable_view_items(self)
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=(
+                    f"Score correction expired. Run `!editres "
+                    f"{self.match_number}` to start again."
+                ),
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not expire the score correction selector.")
+
+
+class MatchScoreCorrectionModal(discord.ui.Modal):
+    """Collect a proposed correction, then require a review confirmation."""
+
+    def __init__(
+        self,
+        correction_view: MatchScoreCorrectionView,
+        slot: Slot,
+        *,
+        default_score: MatchScore | None = None,
+        baseline_score: MatchScore | None = None,
+        source_review: MatchScoreCorrectionReviewView | None = None,
+    ) -> None:
+        super().__init__(
+            title=f"Correct Match {correction_view.match_number} Result",
+            timeout=300,
+        )
+        self.correction_view = correction_view
+        self.slot_number = slot.number
+        self.slot_assignment_id = slot.assignment_id
+        self.slot_team_name = slot.team_name
+        self.baseline_score = baseline_score
+        self.source_review = source_review
+        self.placement_input = discord.ui.TextInput(
+            label="New placement / rank",
+            placeholder="For example: 1",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=3,
+        )
+        self.kills_input = discord.ui.TextInput(
+            label="New kills",
+            placeholder="For example: 6",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=5,
+        )
+        if default_score is not None:
+            self.placement_input.default = str(default_score.placement)
+            self.kills_input.default = str(default_score.kills)
+        self.add_item(self.placement_input)
+        self.add_item(self.kills_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if self.source_review is not None and self.source_review.completed:
+            await interaction.response.send_message(
+                "This score review was already processed. Run the command "
+                "again if another correction is needed.",
+                ephemeral=True,
+            )
+            return
+        scrim = await self.correction_view.authorized_scrim(interaction)
+        if scrim is None:
+            return
+        slot = scrim.slots.get(self.slot_number)
+        if (
+            slot is None
+            or slot.status == STATUS_AVAILABLE
+            or slot.assignment_id != self.slot_assignment_id
+            or slot.team_name != self.slot_team_name
+        ):
+            await interaction.response.send_message(
+                "That team changed before the correction was submitted. "
+                "Run the command again and select the current team.",
+                ephemeral=True,
+            )
+            return
+
+        current_score = scrim.match_scores.get(
+            (self.correction_view.match_number, self.slot_number)
+        )
+        if current_score != self.baseline_score:
+            await interaction.response.send_message(
+                "This team's saved score changed while the form was open. "
+                "No correction was saved. Run the command again to review "
+                "the current score.",
+                ephemeral=True,
+            )
+            if self.source_review is not None:
+                await self.source_review.close_as_stale()
+            return
+
+        rank_text = self.placement_input.value.strip()
+        kills_text = self.kills_input.value.strip()
+        if (
+            re.fullmatch(r"[0-9]+", rank_text) is None
+            or re.fullmatch(r"[0-9]+", kills_text) is None
+        ):
+            await interaction.response.send_message(
+                "Placement and kills must be whole numbers.",
+                ephemeral=True,
+            )
+            return
+        placement = int(rank_text)
+        kills = int(kills_text)
+        if placement < 1:
+            await interaction.response.send_message(
+                "Placement must be at least 1.",
+                ephemeral=True,
+            )
+            return
+
+        proposed_score = MatchScore(
+            self.correction_view.match_number,
+            self.slot_number,
+            kills,
+            placement,
+        )
+        review = MatchScoreCorrectionReviewView(
+            correction_view=self.correction_view,
+            slot=slot,
+            previous_score=current_score,
+            proposed_score=proposed_score,
+        )
+        await interaction.response.send_message(
+            embed=review.embed(),
+            view=review,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await review.capture_message(interaction)
+        if self.source_review is not None:
+            await self.source_review.close_as_edited()
+        else:
+            await self.correction_view.finish(
+                f"Match {self.correction_view.match_number} correction "
+                "proposal ready. Review the private recap and confirm to save."
+            )
+
+
+class MatchScoreCorrectionReviewView(discord.ui.View):
+    """Review a score correction before saving its single-team upsert."""
+
+    def __init__(
+        self,
+        *,
+        correction_view: MatchScoreCorrectionView,
+        slot: Slot,
+        previous_score: MatchScore | None,
+        proposed_score: MatchScore,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.correction_view = correction_view
+        self.match_number = correction_view.match_number
+        self.slot_number = slot.number
+        self.slot_assignment_id = slot.assignment_id
+        self.team_name = slot.team_name
+        self.previous_score = previous_score
+        self.proposed_score = proposed_score
+        self.completed = False
+        self.message: discord.Message | None = None
+
+    def embed(self) -> discord.Embed:
+        team_name = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(self.team_name)
+        )
+        current_result = (
+            "No result recorded"
+            if self.previous_score is None
+            else (
+                f"Rank **{self.previous_score.placement}** · "
+                f"**{self.previous_score.kills}** kills"
+            )
+        )
+        proposed_result = (
+            f"Rank **{self.proposed_score.placement}** · "
+            f"**{self.proposed_score.kills}** kills"
+        )
+        embed = discord.Embed(
+            title=f"Review score correction · Match {self.match_number}",
+            description=(
+                "No score has been changed yet. Confirm to save this "
+                "correction, edit the values, or cancel."
+            ),
+            color=discord.Color.orange(),
+        )
+        embed.add_field(
+            name="Team",
+            value=f"Slot {self.slot_number:02d} · {team_name}",
+            inline=False,
+        )
+        embed.add_field(
+            name="Current result",
+            value=current_result,
+            inline=True,
+        )
+        embed.add_field(
+            name="Proposed result",
+            value=proposed_result,
+            inline=True,
+        )
+        embed.set_footer(
+            text="Confirm saves · Edit reopens the form · Cancel discards"
+        )
+        return embed
+
+    async def capture_message(self, interaction: discord.Interaction) -> None:
+        try:
+            self.message = await interaction.original_response()
+        except discord.HTTPException:
+            logger.exception("Could not retain the score correction review.")
+
+    async def current_scrim_and_slot(
+        self,
+        interaction: discord.Interaction,
+    ) -> tuple[Scrim, Slot] | None:
+        if self.completed:
+            await interaction.response.send_message(
+                "This score review has already been processed.",
+                ephemeral=True,
+            )
+            return None
+        scrim = await self.correction_view.authorized_scrim(interaction)
+        if scrim is None:
+            return None
+        slot = scrim.slots.get(self.slot_number)
+        current_score = scrim.match_scores.get(
+            (self.match_number, self.slot_number)
+        )
+        if (
+            slot is None
+            or slot.status == STATUS_AVAILABLE
+            or slot.assignment_id != self.slot_assignment_id
+            or slot.team_name != self.team_name
+            or current_score != self.previous_score
+        ):
+            self.completed = True
+            disable_view_items(self)
+            self.stop()
+            await interaction.response.edit_message(
+                content=(
+                    "This team or score changed after the recap was created. "
+                    "No correction was saved. Run "
+                    f"`!editres {self.match_number}` to review the current data."
+                ),
+                embed=None,
+                view=self,
+            )
+            return None
+        return scrim, slot
+
+    async def close_as_edited(self) -> None:
+        await self.close(
+            "This recap was replaced by the newer edited proposal. "
+            "Review the latest recap before confirming."
+        )
+
+    async def close_as_stale(self) -> None:
+        await self.close(
+            "This recap is out of date. No correction was saved. "
+            f"Run `!editres {self.match_number}` to review the current data."
+        )
+
+    async def close(self, content: str) -> None:
+        self.completed = True
+        disable_view_items(self)
+        self.stop()
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=content,
+                embed=None,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not close the score correction recap.")
+
+    async def on_timeout(self) -> None:
+        if self.completed:
+            return
+        self.completed = True
+        disable_view_items(self)
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content="Score correction review expired. No change was saved.",
+                embed=None,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not expire the score correction recap.")
+
+    @discord.ui.button(
+        label="Confirm",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+    )
+    async def confirm_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        result = await self.current_scrim_and_slot(interaction)
+        if result is None:
+            return
+        scrim, _slot = result
+        try:
+            repository.upsert_match_scores(
+                scrim.id,
+                scrim.guild_id,
+                self.match_number,
+                [self.proposed_score],
+            )
+        except ValueError as error:
+            await interaction.response.send_message(
+                f"❌ {error}",
+                ephemeral=True,
+            )
+            return
+        except SlotStorageError:
+            logger.exception(
+                "Could not save a score correction for scrim %s.",
+                scrim.id,
+            )
+            await interaction.response.send_message(
+                "The correction could not be saved. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        self.completed = True
+        disable_view_items(self)
+        self.stop()
+        await interaction.response.edit_message(
+            content=(
+                f"✅ Corrected Match {self.match_number} for "
+                f"Slot {self.slot_number:02d} · {self.team_name}: "
+                f"rank {self.proposed_score.placement}, "
+                f"{self.proposed_score.kills} kills. "
+                "Other teams' scores were left unchanged."
+            ),
+            embed=None,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(
+        label="Edit",
+        emoji="✏️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def edit_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        result = await self.current_scrim_and_slot(interaction)
+        if result is None:
+            return
+        _scrim, slot = result
+        await interaction.response.send_modal(
+            MatchScoreCorrectionModal(
+                self.correction_view,
+                slot,
+                default_score=self.proposed_score,
+                baseline_score=self.previous_score,
+                source_review=self,
+            )
+        )
+
+    @discord.ui.button(
+        label="Choose another team",
+        emoji="👥",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def choose_another_team_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        result = await self.current_scrim_and_slot(interaction)
+        if result is None:
+            return
+        scrim, _slot = result
+        assigned_slots = [
+            slot
+            for slot in scrim.slots.values()
+            if slot.status != STATUS_AVAILABLE and slot.team_name
+        ]
+        new_view = MatchScoreCorrectionView(
+            owner_id=self.correction_view.owner_id,
+            guild_id=scrim.guild_id,
+            channel_id=self.correction_view.channel_id,
+            scrim=scrim,
+            match_number=self.match_number,
+            slots=assigned_slots,
+        )
+        new_view.message = interaction.message
+        self.completed = True
+        disable_view_items(self)
+        self.stop()
+        await interaction.response.edit_message(
+            content=f"Choose a team to correct for Match {self.match_number}:",
+            embed=None,
+            view=new_view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(
+        label="Cancel",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+    )
+    async def cancel_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.completed:
+            await interaction.response.send_message(
+                "This score review has already been processed.",
+                ephemeral=True,
+            )
+            return
+        self.completed = True
+        disable_view_items(self)
+        self.stop()
+        await interaction.response.edit_message(
+            content="Correction cancelled. No score was changed.",
+            embed=None,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+async def _start_match_score_correction(
+    ctx: commands.Context,
+    match_number: int,
+) -> None:
+    scrim = await require_staff_scrim(ctx)
+    if scrim is None:
+        return
+    if not 1 <= match_number <= scrim.max_matches:
+        await send_private_command_feedback(
+            ctx,
+            f"❌ Match number must be between 1 and {scrim.max_matches}.",
+            silent=False,
+        )
+        return
+    assigned_slots = [
+        slot
+        for slot in scrim.slots.values()
+        if slot.status != STATUS_AVAILABLE and slot.team_name
+    ]
+    if not assigned_slots:
+        await send_private_command_feedback(
+            ctx,
+            "❌ There are no assigned teams to correct for this scrim.",
+            silent=False,
+        )
+        return
+
+    view = MatchScoreCorrectionView(
+        owner_id=ctx.author.id,
+        guild_id=scrim.guild_id,
+        channel_id=ctx.channel.id,
+        scrim=scrim,
+        match_number=match_number,
+        slots=assigned_slots,
+    )
+    try:
+        view.message = await ctx.send(
+            f"Choose the team to correct for Match {match_number}:",
+            view=view,
+            delete_after=300,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        logger.exception(
+            "Could not show the score correction selector for scrim %s.",
+            scrim.id,
+        )
+    finally:
+        await delete_command_message(ctx)
+
+
+@bot.command(name="editres")
+async def edit_match_score_command(
+    ctx: commands.Context,
+    match_number: str = "",
+) -> None:
+    """Correct one team's rank and kills without re-entering the match."""
+    match_number = match_number.strip()
+    if re.fullmatch(r"[0-9]+", match_number) is None:
+        await send_private_command_feedback(
+            ctx,
+            "Use `!editres <match number>`, for example `!editres 2`.",
+            silent=False,
+        )
+        return
+    await _start_match_score_correction(ctx, int(match_number))
 
 
 def _register_specific_score_commands() -> None:
@@ -3753,18 +4901,40 @@ def _write_leaderboard_background_metadata(
 
 
 def _leaderboard_scrim_profile(scrim: Scrim) -> tuple[str, int]:
-    return (
-        getattr(
-            scrim,
-            "leaderboard_orientation",
-            DEFAULT_LEADERBOARD_ORIENTATION,
-        ),
-        getattr(
-            scrim,
-            "leaderboard_team_count",
-            DEFAULT_LEADERBOARD_TEAM_COUNT,
-        ),
+    orientation = getattr(
+        scrim,
+        "leaderboard_orientation",
+        DEFAULT_LEADERBOARD_ORIENTATION,
     )
+    team_count = getattr(
+        scrim,
+        "leaderboard_team_count",
+        DEFAULT_LEADERBOARD_TEAM_COUNT,
+    )
+    if repository.get_server_license_type(scrim.guild_id) != "Gold":
+        team_count = STANDARD_LEADERBOARD_TEAM_COUNT
+    return orientation, team_count
+
+
+def _leaderboard_profile_accent_color(scrim: Scrim) -> str:
+    orientation, team_count = _leaderboard_scrim_profile(scrim)
+    accent_colors = getattr(scrim, "leaderboard_accent_colors", {})
+    profile_color = (
+        accent_colors.get(f"{orientation}:{team_count}")
+        if isinstance(accent_colors, dict)
+        else None
+    )
+    if isinstance(profile_color, str):
+        return profile_color
+    if not accent_colors:
+        legacy_color = getattr(
+            scrim,
+            "leaderboard_accent_color",
+            DEFAULT_LEADERBOARD_ACCENT_COLOR,
+        )
+        if isinstance(legacy_color, str):
+            return legacy_color
+    return DEFAULT_LEADERBOARD_ACCENT_COLOR
 
 
 def _migrate_legacy_leaderboard_background(scrim: Scrim) -> None:
@@ -3887,6 +5057,14 @@ async def _ensure_leaderboard_background_preview(
             raise ValueError("The current channel cannot host a background preview.")
         background_path = _current_leaderboard_background_path(scrim)
         orientation, team_count = _leaderboard_scrim_profile(scrim)
+        if (
+            background_path == LEADERBOARD_BACKGROUND
+            and not background_path.is_file()
+        ):
+            # The built-in canvas is generated during rendering, not stored as
+            # an uploadable asset. No preview attachment is needed to open the
+            # settings panel.
+            return ""
         profile_suffix = _leaderboard_profile_suffix(
             orientation,
             team_count,
@@ -3905,6 +5083,12 @@ async def _ensure_leaderboard_background_preview(
                 file=preview_file,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+        except discord.HTTPException:
+            logger.exception(
+                "Could not upload leaderboard background preview for %s",
+                scrim.id,
+            )
+            return ""
         finally:
             preview_file.close()
         if not preview.attachments:
@@ -4351,15 +5535,13 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
                 color=discord.Color.red(),
             )
         is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
-        orientation = scrim.leaderboard_orientation
-        if orientation == "horizontal" and not is_gold:
-            orientation = "vertical"
+        orientation, team_count = _leaderboard_scrim_profile(scrim)
         background_metadata = _current_leaderboard_background_metadata(scrim)
         saved_background_url = background_metadata.get("attachment_url")
         profile_background_path = _leaderboard_background_path(
             scrim.id,
-            scrim.leaderboard_orientation,
-            scrim.leaderboard_team_count,
+            orientation,
+            team_count,
         )
         if isinstance(saved_background_url, str) and saved_background_url:
             self.background_url = saved_background_url
@@ -4368,16 +5550,13 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
             background_text = "Custom background saved; preview link unavailable"
         else:
             background_text = "Built-in default background"
-        accent_color = getattr(
-            scrim,
-            "leaderboard_accent_color",
-            DEFAULT_LEADERBOARD_ACCENT_COLOR,
-        )
+        accent_color = _leaderboard_profile_accent_color(scrim)
         embed = discord.Embed(
             title=f"Edit Leaderboard — {discord.utils.escape_markdown(scrim.name)}",
             description=(
-                "Background and text color are saved separately for each "
-                "orientation and team count. Horizontal orientation requires Gold."
+                "Standard is fixed at 20 teams in either orientation. "
+                "Gold can choose the team count. Backgrounds are available "
+                "for each license-available profile."
                 if not is_gold
                 else
                 "Background and text color are saved separately for each "
@@ -4392,7 +5571,7 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         )
         embed.add_field(
             name="Teams to Display",
-            value=str(scrim.leaderboard_team_count),
+            value=str(team_count),
             inline=True,
         )
         embed.add_field(
@@ -4415,13 +5594,25 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
     def rebuild(self) -> None:
         self.clear_items()
         teams_button = discord.ui.Button(
-            label="Teams to Display",
+            label=(
+                "Teams to Display"
+                if repository.get_server_license_type(self.guild_id) == "Gold"
+                else "Teams to Display · Gold"
+            ),
             emoji="🔢",
             style=discord.ButtonStyle.primary,
+            disabled=repository.get_server_license_type(self.guild_id) != "Gold",
             row=0,
         )
 
         async def teams_callback(interaction: discord.Interaction) -> None:
+            if repository.get_server_license_type(self.guild_id) != "Gold":
+                await interaction.response.send_message(
+                    "Standard licenses are locked to 20 teams. "
+                    "Gold licenses can change the team count.",
+                    ephemeral=True,
+                )
+                return
             view = LeaderboardTeamCountView(
                 owner_id=self.owner_id,
                 guild_id=self.guild_id,
@@ -4575,19 +5766,10 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
             label="Orientation",
             emoji="↔️",
             style=discord.ButtonStyle.primary,
-            disabled=(
-                repository.get_server_license_type(self.guild_id) != "Gold"
-            ),
             row=0,
         )
 
         async def orientation_callback(interaction: discord.Interaction) -> None:
-            if repository.get_server_license_type(self.guild_id) != "Gold":
-                await interaction.response.send_message(
-                    "The Orientation control is available only to Gold guilds.",
-                    ephemeral=True,
-                )
-                return
             view = LeaderboardOrientationView(
                 owner_id=self.owner_id,
                 guild_id=self.guild_id,
@@ -4604,24 +5786,18 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         self.add_item(orientation_button)
 
         scrim = repository.get(self.scrim_id)
-        has_custom_background = _leaderboard_background_path(
-            self.scrim_id,
-            getattr(
-                scrim,
-                "leaderboard_orientation",
-                DEFAULT_LEADERBOARD_ORIENTATION,
-            ),
-            getattr(
-                scrim,
-                "leaderboard_team_count",
-                DEFAULT_LEADERBOARD_TEAM_COUNT,
-            ),
-        ).is_file()
+        has_custom_background = False
+        if scrim is not None:
+            orientation, team_count = _leaderboard_scrim_profile(scrim)
+            has_custom_background = _leaderboard_background_path(
+                self.scrim_id,
+                orientation,
+                team_count,
+            ).is_file()
         accent_button = discord.ui.Button(
             label="Text Color",
             emoji="🎨",
             style=discord.ButtonStyle.primary,
-            disabled=not has_custom_background,
             row=1,
         )
 
@@ -4666,8 +5842,7 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
                 return
             if not _leaderboard_background_path(
                 self.scrim_id,
-                scrim.leaderboard_orientation,
-                scrim.leaderboard_team_count,
+                *_leaderboard_scrim_profile(scrim),
             ).is_file():
                 await interaction.response.send_message(
                     "This scrim is already using the default background.",
@@ -4817,17 +5992,17 @@ class LeaderboardAccentColorView(LeaderboardPanelView):
 
     def embed(self) -> discord.Embed:
         scrim = repository.get(self.scrim_id)
-        accent_color = getattr(
-            scrim,
-            "leaderboard_accent_color",
-            DEFAULT_LEADERBOARD_ACCENT_COLOR,
-        )
-        profile = (
-            f"{scrim.leaderboard_orientation.title()} / "
-            f"{scrim.leaderboard_team_count} teams"
+        accent_color = (
+            _leaderboard_profile_accent_color(scrim)
             if scrim is not None
-            else "Current leaderboard profile"
+            else DEFAULT_LEADERBOARD_ACCENT_COLOR
         )
+        orientation, team_count = (
+            _leaderboard_scrim_profile(scrim)
+            if scrim is not None
+            else (DEFAULT_LEADERBOARD_ORIENTATION, DEFAULT_LEADERBOARD_TEAM_COUNT)
+        )
+        profile = f"{orientation.title()} / {team_count} teams"
         return discord.Embed(
             title="Leaderboard Text Color",
             description=(
@@ -4917,16 +6092,6 @@ class LeaderboardAccentColorView(LeaderboardPanelView):
         ):
             await interaction.response.send_message(
                 "You no longer have access to this leaderboard panel.",
-                ephemeral=True,
-            )
-            return
-        if not _leaderboard_background_path(
-            scrim.id,
-            scrim.leaderboard_orientation,
-            scrim.leaderboard_team_count,
-        ).is_file():
-            await interaction.response.send_message(
-                "Upload a custom background before changing generated text color.",
                 ephemeral=True,
             )
             return
@@ -5068,67 +6233,91 @@ class LeaderboardTeamCountView(LeaderboardPanelView):
     def embed(self) -> discord.Embed:
         scrim = repository.get(self.scrim_id)
         current = (
-            scrim.leaderboard_team_count
+            _leaderboard_scrim_profile(scrim)[1]
             if scrim is not None
-            else DEFAULT_LEADERBOARD_TEAM_COUNT
+            else STANDARD_LEADERBOARD_TEAM_COUNT
         )
+        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
         return discord.Embed(
             title="Teams to Display",
-            description=f"Current setting: **{current} teams**.",
+            description=(
+                f"Current setting: **{current} teams**."
+                if is_gold
+                else "Standard licenses are locked to **20 teams**. "
+                "Gold licenses can change this setting."
+            ),
             color=discord.Color.blurple(),
         )
 
     def rebuild(self) -> None:
         self.clear_items()
         scrim = repository.get(self.scrim_id)
+        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
         current = (
-            scrim.leaderboard_team_count
+            _leaderboard_scrim_profile(scrim)[1]
             if scrim is not None
-            else DEFAULT_LEADERBOARD_TEAM_COUNT
+            else STANDARD_LEADERBOARD_TEAM_COUNT
         )
-        selector = discord.ui.Select(
-            placeholder="Choose 16, 18, 20, 22, or 24 teams",
-            min_values=1,
-            max_values=1,
-            options=[
-                discord.SelectOption(
-                    label=f"{count} teams",
-                    value=str(count),
-                    default=count == current,
-                )
-                for count in LEADERBOARD_TEAM_COUNTS
-            ],
-            row=0,
-        )
-
-        async def select_callback(interaction: discord.Interaction) -> None:
-            try:
-                repository.update_leaderboard_settings(
-                    self.scrim_id,
-                    self.guild_id,
-                    leaderboard_team_count=int(selector.values[0]),
-                )
-            except (SlotStorageError, ValueError) as error:
-                await interaction.response.send_message(
-                    f"Could not save the team count: {error}",
-                    ephemeral=True,
-                )
-                return
-            view = LeaderboardScrimEditView(
-                owner_id=self.owner_id,
-                guild_id=self.guild_id,
-                scrim_id=self.scrim_id,
-                background_url=self.background_url,
-            )
-            await interaction.response.edit_message(
-                content=view.content(),
-                embed=view.embed(),
-                view=view,
-                allowed_mentions=discord.AllowedMentions.none(),
+        if is_gold:
+            selector = discord.ui.Select(
+                placeholder="Choose 16, 18, 20, 22, or 24 teams",
+                min_values=1,
+                max_values=1,
+                options=[
+                    discord.SelectOption(
+                        label=f"{count} teams",
+                        value=str(count),
+                        default=count == current,
+                    )
+                    for count in LEADERBOARD_TEAM_COUNTS
+                ],
+                row=0,
             )
 
-        selector.callback = select_callback
-        self.add_item(selector)
+            async def select_callback(interaction: discord.Interaction) -> None:
+                if repository.get_server_license_type(self.guild_id) != "Gold":
+                    await interaction.response.send_message(
+                        "Standard licenses are locked to 20 teams. "
+                        "Gold licenses can change the team count.",
+                        ephemeral=True,
+                    )
+                    return
+                try:
+                    repository.update_leaderboard_settings(
+                        self.scrim_id,
+                        self.guild_id,
+                        leaderboard_team_count=int(selector.values[0]),
+                    )
+                except (SlotStorageError, ValueError) as error:
+                    await interaction.response.send_message(
+                        f"Could not save the team count: {error}",
+                        ephemeral=True,
+                    )
+                    return
+                view = LeaderboardScrimEditView(
+                    owner_id=self.owner_id,
+                    guild_id=self.guild_id,
+                    scrim_id=self.scrim_id,
+                    background_url=self.background_url,
+                )
+                await interaction.response.edit_message(
+                    content=view.content(),
+                    embed=view.embed(),
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+            selector.callback = select_callback
+            self.add_item(selector)
+        else:
+            self.add_item(
+                discord.ui.Button(
+                    label="Locked to 20 Teams",
+                    style=discord.ButtonStyle.secondary,
+                    disabled=True,
+                    row=0,
+                )
+            )
 
         back_button = discord.ui.Button(
             label="Back to Leaderboard",
@@ -5155,7 +6344,7 @@ class LeaderboardTeamCountView(LeaderboardPanelView):
 
 
 class LeaderboardOrientationView(LeaderboardPanelView):
-    """Choose vertical or Gold-only horizontal leaderboard orientation."""
+    """Choose vertical or horizontal leaderboard orientation."""
 
     def __init__(
         self,
@@ -5178,17 +6367,16 @@ class LeaderboardOrientationView(LeaderboardPanelView):
 
     def embed(self) -> discord.Embed:
         scrim = repository.get(self.scrim_id)
-        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
         current = (
             scrim.leaderboard_orientation
             if scrim is not None
             else DEFAULT_LEADERBOARD_ORIENTATION
         )
-        if current == "horizontal" and not is_gold:
-            current = "vertical"
         description = f"Current setting: **{current.title()}**."
-        if not is_gold:
-            description += "\nHorizontal orientation requires Gold."
+        if repository.get_server_license_type(self.guild_id) != "Gold":
+            description += (
+                "\nStandard licenses use 20 teams in either orientation."
+            )
         return discord.Embed(
             title="Leaderboard Orientation",
             description=description,
@@ -5198,29 +6386,23 @@ class LeaderboardOrientationView(LeaderboardPanelView):
     def rebuild(self) -> None:
         self.clear_items()
         scrim = repository.get(self.scrim_id)
-        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
         current = (
             scrim.leaderboard_orientation
             if scrim is not None
             else DEFAULT_LEADERBOARD_ORIENTATION
         )
-        if current == "horizontal" and not is_gold:
-            current = "vertical"
         options = [
             discord.SelectOption(
                 label="Vertical",
                 value="vertical",
                 default=current == "vertical",
-            )
+            ),
+            discord.SelectOption(
+                label="Horizontal",
+                value="horizontal",
+                default=current == "horizontal",
+            ),
         ]
-        if is_gold:
-            options.append(
-                discord.SelectOption(
-                    label="Horizontal",
-                    value="horizontal",
-                    default=current == "horizontal",
-                )
-            )
         selector = discord.ui.Select(
             placeholder="Choose vertical or horizontal",
             min_values=1,
@@ -5547,7 +6729,18 @@ async def leaderboard_command(ctx: commands.Context) -> None:
     scrim = await require_staff_scrim(ctx, allow_public=True)
     if scrim is None:
         return
+    progress_message: discord.Message | None = None
     try:
+        try:
+            progress_message = await ctx.send(
+                "⏳ Working on the leaderboard…",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception(
+                "Could not show leaderboard progress for scrim %s.",
+                scrim.id,
+            )
         rows = calculate_leaderboard(scrim)
         image = build_leaderboard_image(scrim, rows)
         await ctx.send(
@@ -5555,13 +6748,39 @@ async def leaderboard_command(ctx: commands.Context) -> None:
             file=discord.File(image, filename="leaderboard.png"),
             allowed_mentions=discord.AllowedMentions.none(),
         )
-    except (OSError, ValueError) as error:
+        if progress_message is not None:
+            try:
+                await progress_message.delete()
+            except discord.HTTPException:
+                try:
+                    await progress_message.edit(
+                        content="✅ Leaderboard generated above.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except discord.HTTPException:
+                    logger.exception(
+                        "Could not clear leaderboard progress for scrim %s.",
+                        scrim.id,
+                    )
+    except (OSError, ValueError, discord.HTTPException) as error:
         logger.exception("Could not generate leaderboard for scrim %s.", scrim.id)
-        await send_private_command_feedback(
-            ctx,
-            f"❌ The leaderboard could not be generated: {error}",
-            silent=False,
-        )
+        if progress_message is not None:
+            try:
+                await progress_message.edit(
+                    content=f"❌ The leaderboard could not be generated: {error}",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                logger.exception(
+                    "Could not report the leaderboard error for scrim %s.",
+                    scrim.id,
+                )
+        else:
+            await send_private_command_feedback(
+                ctx,
+                f"❌ The leaderboard could not be generated: {error}",
+                silent=False,
+            )
         return
     finally:
         await delete_command_message(ctx)
@@ -5569,12 +6788,14 @@ async def leaderboard_command(ctx: commands.Context) -> None:
 
 HELP_COPY_TEXT = (
     "A.R.C. HELP\n"
-    "STAFF: !setup | !setres | !set @Role | !say text | !export | "
-    "!reset\n"
+    "STAFF: !setup | !setres | !set @Role | !say text | !reset\n"
     "SLOTS: !add Team / TAG / @Captain | !confirm 03 04 | !remove 03 | "
     "!open | !close | !remind\n"
-    "STATUS: !slots [Scrim] | !update [Scrim] | !res / !lb | "
-    f"!resg1-{MAX_MATCHES} slot kills placement\n"
+    "STATUS: !slots [Scrim] | !update [Scrim] | !res / !lb "
+    "(posts leaderboard image)\n"
+    f"!resg1-{MAX_MATCHES} slot kills "
+    "(best team first; omit missed teams; review and confirm to save)\n"
+    "!editres <match> (choose team, enter rank and kills)\n"
     "ROOM: !idpw room / minutes | !idpwg1-25 room / minutes\n"
     "CAPTAINS: !register Team / TAG [/ @Manager] | "
     "!cap add|transfer|remove @User\n"
@@ -5588,11 +6809,14 @@ def build_help_text() -> str:
     return (
         ">>> **A.R.C. HELP**\n"
         "**STAFF** `!setup` `!setres` `!set @Role` `!say text` "
-        "`!export` `!reset`\n"
+        "`!reset`\n"
         "**SLOTS** `!add Team / TAG / @Captain` `!confirm 03 04` "
         "`!remove 03` `!open` `!close` `!remind`\n"
-        "**STATUS** `!slots [Scrim]` `!update [Scrim]` `!res`/`!lb` "
-        f"`!resg1-{MAX_MATCHES} slot kills placement`\n"
+        "**STATUS** `!slots [Scrim]` `!update [Scrim]` "
+        "`!res`/`!lb` (posts leaderboard image) "
+        f"`!resg1-{MAX_MATCHES} slot kills` "
+        "(best team first; omit missed teams; review and confirm to save) "
+        "`!editres <match>` (choose team, enter rank and kills)\n"
         "**ROOM** `!idpw room / minutes` `!idpwg1-25 room / minutes`\n"
         "**CAPTAINS** `!register Team / TAG [/ @Manager]` "
         "`!cap add|transfer|remove @User`\n"
@@ -6493,11 +7717,7 @@ def calculate_leaderboard(scrim: Scrim) -> list[LeaderboardRow]:
             row.slot_number,
         ),
     )
-    team_count = getattr(
-        scrim,
-        "leaderboard_team_count",
-        DEFAULT_LEADERBOARD_TEAM_COUNT,
-    )
+    _, team_count = _leaderboard_scrim_profile(scrim)
     if team_count not in LEADERBOARD_TEAM_COUNTS:
         raise ValueError("Invalid leaderboard team count.")
     return ranked_rows[:team_count]
@@ -6568,25 +7788,63 @@ def parse_match_score_lines(
     match_number: int,
     scrim: Scrim,
 ) -> list[MatchScore]:
-    """Parse `slot kills placement` lines, ignoring malformed entries."""
+    """Parse ordered `slot kills` lines or legacy explicit-placement lines."""
     scores: list[MatchScore] = []
     seen_slots: set[int] = set()
-    for line in str(input_string).splitlines():
+    lines = [
+        (line_number, line.strip())
+        for line_number, line in enumerate(str(input_string).splitlines(), start=1)
+        if line.strip()
+    ]
+    if not lines:
+        return scores
+
+    field_counts = {len(line.split()) for _, line in lines}
+    if not field_counts.issubset({2, 3}):
+        invalid_line = next(
+            line_number
+            for line_number, line in lines
+            if len(line.split()) not in {2, 3}
+        )
+        raise ValueError(
+            f"Line {invalid_line} must contain `slot kills` "
+            "or legacy `slot kills placement`."
+        )
+    if len(field_counts) != 1:
+        raise ValueError(
+            "Do not mix ordered `slot kills` lines with legacy "
+            "`slot kills placement` lines."
+        )
+
+    ordered_by_line = field_counts == {2}
+    for placement, (line_number, line) in enumerate(lines, start=1):
         parts = line.split()
-        if len(parts) != 3:
-            continue
         try:
-            slot_number, kills, placement = (int(part) for part in parts)
+            values = [int(part) for part in parts]
         except ValueError:
-            continue
+            raise ValueError(
+                f"Line {line_number} must contain only whole numbers."
+            ) from None
+        if ordered_by_line:
+            slot_number, kills = values
+        else:
+            slot_number, kills, placement = values
+        if slot_number in seen_slots:
+            raise ValueError(
+                f"Line {line_number} repeats slot {slot_number}."
+            )
         if (
-            slot_number in seen_slots
-            or slot_number not in scrim.slots
+            slot_number not in scrim.slots
             or scrim.slots[slot_number].status == STATUS_AVAILABLE
-            or kills < 0
-            or placement < 1
         ):
-            continue
+            raise ValueError(
+                f"Line {line_number} uses slot {slot_number}, "
+                "which is not assigned to a team."
+            )
+        if kills < 0:
+            raise ValueError(f"Line {line_number} has a negative kill count.")
+        if placement < 1:
+            raise ValueError(f"Line {line_number} has an invalid placement.")
         seen_slots.add(slot_number)
         scores.append(
             MatchScore(
@@ -6822,20 +8080,8 @@ def _build_configured_leaderboard_image(
     *,
     background_path: Path = LEADERBOARD_BACKGROUND,
 ) -> io.BytesIO:
-    team_limit = getattr(
-        scrim,
-        "leaderboard_team_count",
-        DEFAULT_LEADERBOARD_TEAM_COUNT,
-    )
-    orientation = getattr(
-        scrim,
-        "leaderboard_orientation",
-        DEFAULT_LEADERBOARD_ORIENTATION,
-    )
+    orientation, team_limit = _leaderboard_scrim_profile(scrim)
     header_height = DEFAULT_LEADERBOARD_HEADER_HEIGHT
-    if orientation == "horizontal":
-        if repository.get_server_license_type(scrim.guild_id) != "Gold":
-            orientation = "vertical"
 
     rows = rows[:team_limit]
     width, height = leaderboard_canvas_dimensions(
@@ -6849,40 +8095,29 @@ def _build_configured_leaderboard_image(
     )
     margin = LEADERBOARD_OUTER_MARGIN
     text = _leaderboard_accent_rgb(
-        DEFAULT_LEADERBOARD_ACCENT_COLOR
-        if background_path == LEADERBOARD_BACKGROUND
-        else getattr(
-            scrim,
-            "leaderboard_accent_color",
-            DEFAULT_LEADERBOARD_ACCENT_COLOR,
-        )
+        _leaderboard_profile_accent_color(scrim)
     )
 
     table_top = margin + header_height + LEADERBOARD_SECTION_GAP
     draw = ImageDraw.Draw(output, "RGBA")
     date_label = datetime.now(
         timezone_for_name(getattr(scrim, "timezone", "UTC"))
-    ).strftime("%d %b %Y").upper()
-    date_font = _load_font(18, weight=400)
-    date_center_y = margin + header_height // 2
+    ).strftime("%d/%m/%Y")
+    date_font = _load_font(LEADERBOARD_DATE_FONT_SIZE, weight=700)
     draw.text(
-        (width - margin - 75, date_center_y),
+        (width - margin, margin),
         date_label,
         font=date_font,
         fill=text,
-        anchor="mm",
+        anchor="rt",
     )
     if background_path == LEADERBOARD_BACKGROUND:
         scrim_title = str(getattr(scrim, "name", "") or "").strip()
         if scrim_title:
-            date_bbox = draw.textbbox((0, 0), date_label, font=date_font)
-            date_width = date_bbox[2] - date_bbox[0]
-            date_left = width - margin - 75 - date_width // 2
             title_center_x = width // 2
-            title_right_limit = date_left - 24
             title_half_width = min(
                 title_center_x - margin,
-                title_right_limit - title_center_x,
+                width - margin - title_center_x,
             )
             title_font = _fit_font(
                 scrim_title,
@@ -6893,7 +8128,7 @@ def _build_configured_leaderboard_image(
                 weight=LEADERBOARD_BODY_FONT_WEIGHT,
             )
             draw.text(
-                (title_center_x, date_center_y),
+                (title_center_x, margin + header_height // 2),
                 scrim_title,
                 font=title_font,
                 fill=text,
@@ -6914,7 +8149,11 @@ def _build_configured_leaderboard_image(
         (team_limit + 1) // 2 if columns == 2 else team_limit
     )
     split_index = per_column_capacity
-    row_font = 21 if columns == 1 else 18
+    row_font = (
+        LEADERBOARD_HORIZONTAL_ROW_FONT_SIZE
+        if columns == 2
+        else LEADERBOARD_VERTICAL_ROW_FONT_SIZE
+    )
     row_top = table_top + LEADERBOARD_TABLE_HEADER_HEIGHT
 
     for column_index in range(columns):
@@ -6939,10 +8178,10 @@ def _build_configured_leaderboard_image(
             rank = column_index * per_column_capacity + row_index + 1
             rank_text, rank_font = _fit_leaderboard_cell_text(
                 f"{rank:02d}",
-                max_width=field_ranges[0][1] - field_ranges[0][0] - 10,
+                max_width=field_ranges[0][1] - field_ranges[0][0] - 4,
                 max_height=row_height - 8,
                 max_size=row_font,
-                weight=LEADERBOARD_BODY_FONT_WEIGHT,
+                weight=LEADERBOARD_ROW_FONT_WEIGHT,
             )
             draw.text(
                 (field_centers[0], text_y),
@@ -6958,19 +8197,25 @@ def _build_configured_leaderboard_image(
                 row.team_name,
                 max_width=max(
                     1,
-                    field_ranges[1][1] - field_ranges[1][0] - 20,
+                    field_ranges[1][1]
+                    - field_ranges[1][0]
+                    - LEADERBOARD_TEAM_NAME_LEFT_PADDING
+                    - LEADERBOARD_TEAM_NAME_LEFT_PADDING,
                 ),
                 max_height=row_height - 8,
                 max_size=row_font,
                 min_size=8,
-                weight=LEADERBOARD_BODY_FONT_WEIGHT,
+                weight=LEADERBOARD_ROW_FONT_WEIGHT,
             )
             draw.text(
-                (field_centers[1], text_y),
+                (
+                    field_ranges[1][0] + LEADERBOARD_TEAM_NAME_LEFT_PADDING,
+                    text_y,
+                ),
                 team_text,
                 font=team_font,
                 fill=text,
-                anchor="mm",
+                anchor="lm",
             )
             for field_index, value in enumerate(
                 (
@@ -6990,7 +8235,7 @@ def _build_configured_leaderboard_image(
                     ),
                     max_height=row_height - 8,
                     max_size=row_font,
-                    weight=LEADERBOARD_BODY_FONT_WEIGHT,
+                    weight=LEADERBOARD_ROW_FONT_WEIGHT,
                 )
                 draw.text(
                     (field_centers[field_index], text_y),
@@ -7360,170 +8605,6 @@ async def say_message(ctx: commands.Context, *, message: str) -> None:
             "Could not publish staff announcement in channel %s.",
             ctx.channel.id,
         )
-
-
-def build_export_messages(scrim: Scrim) -> list[str]:
-    """Build copy-friendly code blocks with captain IDs for every assigned team."""
-    blocks = []
-    for slot in sorted(scrim.slots.values(), key=lambda item: item.number):
-        if (
-            slot.status == STATUS_AVAILABLE
-            or not slot.team_name
-            or slot.manager_id is None
-        ):
-            continue
-        team_name = " ".join(slot.team_name.split()).replace("```", "")
-        tag = (
-            " ".join(slot.tag.split()).replace("```", "")
-            if slot.tag
-            else f"S{slot.number:02d}"
-        )
-        captain_ids = [f"<@{slot.manager_id}>"]
-        if slot.captain_2_id is not None:
-            captain_ids.append(f"<@{slot.captain_2_id}>")
-        blocks.append(f"```text\n{team_name} {tag} {' '.join(captain_ids)}\n```")
-
-    return blocks
-
-
-class ExportScrimSelectView(discord.ui.View):
-    """Let staff choose which active scrim should be exported."""
-
-    def __init__(
-        self,
-        *,
-        owner_id: int,
-        guild_id: int,
-        scrims: list[Scrim],
-    ) -> None:
-        super().__init__(timeout=120)
-        self.owner_id = owner_id
-        self.guild_id = guild_id
-        self.scrim_ids = {scrim.id for scrim in scrims}
-
-        select = discord.ui.Select(
-            placeholder="📂 Select a Scrim to export...",
-            min_values=1,
-            max_values=1,
-            options=[
-                discord.SelectOption(
-                    label=scrim.name[:100],
-                    value=scrim.id,
-                )
-                for scrim in scrims
-            ],
-        )
-
-        async def callback(interaction: discord.Interaction) -> None:
-            if interaction.user.id != self.owner_id:
-                await interaction.response.send_message(
-                    "This scrim selector belongs to another user.",
-                    ephemeral=True,
-                )
-                return
-            if interaction.guild is None or interaction.guild.id != self.guild_id:
-                await interaction.response.send_message(
-                    "This selector is not valid in this server.",
-                    ephemeral=True,
-                )
-                return
-            if not member_is_staff_in_guild(interaction.user, self.guild_id):
-                await interaction.response.send_message(
-                    "You do not have permission to export scrims.",
-                    ephemeral=True,
-                )
-                self.stop()
-                return
-
-            selected_id = select.values[0]
-            if selected_id not in self.scrim_ids:
-                await interaction.response.send_message(
-                    "That scrim selection is no longer available.",
-                    ephemeral=True,
-                )
-                self.stop()
-                return
-
-            scrim = repository.get(selected_id)
-            if (
-                scrim is None
-                or scrim.guild_id != self.guild_id
-                or scrim.deleted
-            ):
-                await interaction.response.send_message(
-                    "That scrim is no longer available.",
-                    ephemeral=True,
-                )
-                self.stop()
-                return
-
-            messages = build_export_messages(scrim)
-            if not messages:
-                await interaction.response.send_message(
-                    "No teams are registered.",
-                    ephemeral=True,
-                )
-                self.stop()
-                return
-
-            try:
-                await interaction.response.send_message(
-                    messages[0],
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-                for message in messages[1:]:
-                    await interaction.followup.send(
-                        message,
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-            except discord.HTTPException:
-                logger.exception("Could not export teams for scrim %s.", scrim.id)
-            finally:
-                self.stop()
-
-        select.callback = callback
-        self.add_item(select)
-
-
-@bot.command(name="export")
-@commands.guild_only()
-async def export_teams(ctx: commands.Context) -> None:
-    """Show a server-wide scrim selector and export the selected scrim."""
-    if ctx.guild is None:
-        return
-    if not member_is_staff_in_guild(ctx.author, ctx.guild.id):
-        await send_private_command_feedback(
-            ctx,
-            "You do not have permission to export scrims.",
-            silent=True,
-        )
-        return
-
-    scrims = repository.list(ctx.guild.id)
-    if not scrims:
-        await send_private_command_feedback(
-            ctx,
-            "No active scrims are configured for this server.",
-        )
-        return
-
-    view = ExportScrimSelectView(
-        owner_id=ctx.author.id,
-        guild_id=ctx.guild.id,
-        scrims=scrims,
-    )
-    try:
-        await ctx.send(
-            "📂 Select a scrim to export:",
-            view=view,
-            delete_after=120,
-        )
-    except discord.HTTPException:
-        logger.exception("Could not show the scrim export selector.")
-    finally:
-        await delete_command_message(ctx)
 
 
 @dataclass
