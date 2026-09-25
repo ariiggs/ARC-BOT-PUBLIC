@@ -3910,6 +3910,14 @@ async def _ensure_leaderboard_background_preview(
             raise ValueError("The current channel cannot host a background preview.")
         background_path = _current_leaderboard_background_path(scrim)
         orientation, team_count = _leaderboard_scrim_profile(scrim)
+        if (
+            background_path == LEADERBOARD_BACKGROUND
+            and not background_path.is_file()
+        ):
+            # The built-in canvas is generated during rendering, not stored as
+            # an uploadable asset. No preview attachment is needed to open the
+            # settings panel.
+            return ""
         profile_suffix = _leaderboard_profile_suffix(
             orientation,
             team_count,
@@ -3928,6 +3936,12 @@ async def _ensure_leaderboard_background_preview(
                 file=preview_file,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+        except discord.HTTPException:
+            logger.exception(
+                "Could not upload leaderboard background preview for %s",
+                scrim.id,
+            )
+            return ""
         finally:
             preview_file.close()
         if not preview.attachments:
