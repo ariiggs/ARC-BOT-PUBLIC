@@ -45,6 +45,8 @@ from main import (
     LEADERBOARD_SECTION_GAP,
     LEADERBOARD_TABLE_HEADER_HEIGHT,
     LEADERBOARD_TITLE_MAX_FONT_SIZE,
+    LEADERBOARD_HORIZONTAL_RANK_CELL_CENTER_OFFSETS,
+    LEADERBOARD_HORIZONTAL_ROW_TEXT_VERTICAL_OFFSET,
     LEADERBOARD_HORIZONTAL_TEAM_NAME_LEFT_PADDING,
     LEADERBOARD_TEAM_NAME_LEFT_PADDING,
     HEX_COLOR_GENERATOR_URL,
@@ -2355,26 +2357,36 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     rows = calculate_leaderboard(scrim)
                     image_buffer = build_leaderboard_image(scrim, rows)
 
+                columns = 2 if orientation == "horizontal" else 1
+                canvas_width, _ = leaderboard_canvas_dimensions(20, orientation)
+                column_gap = 24 if columns == 2 else 0
+                column_width = (
+                    canvas_width
+                    - 2 * LEADERBOARD_OUTER_MARGIN
+                    - column_gap * (columns - 1)
+                ) // columns
+                rank_field_ranges = []
+                for column in range(columns):
+                    column_left = (
+                        LEADERBOARD_OUTER_MARGIN
+                        + column * (column_width + column_gap)
+                    )
+                    rank_field_ranges.append(
+                        _leaderboard_field_ranges(
+                            column_left,
+                            column_width,
+                            horizontal=columns == 2,
+                        )[0]
+                    )
                 rank_calls = [
                     (int(text), position)
                     for text, position in text_calls
                     if text.isdigit()
                     and 1 <= int(text) <= 20
-                ]
-                rank_columns = {
-                    position[0]
-                    for position in (position for _, position in rank_calls)
-                    if sum(
-                        1
-                        for _, candidate_position in rank_calls
-                        if candidate_position[0] == position[0]
+                    and any(
+                        left <= position[0] < right
+                        for left, right in rank_field_ranges
                     )
-                    >= 10
-                }
-                rank_calls = [
-                    (rank, position)
-                    for rank, position in rank_calls
-                    if position[0] in rank_columns
                 ]
                 self.assertEqual(len(rows), 7)
                 self.assertEqual(
@@ -2418,7 +2430,12 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
                     def record_text(drawer, xy, text, *args, **kwargs):
                         text_calls.append(
-                            (str(text), xy, kwargs.get("anchor"))
+                            (
+                                str(text),
+                                xy,
+                                kwargs.get("anchor"),
+                                kwargs.get("font"),
+                            )
                         )
                         return original_text(drawer, xy, text, *args, **kwargs)
 
@@ -2464,7 +2481,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                         build_leaderboard_image(scrim, rows)
 
                     rendered_text = [
-                        text for text, _, _ in text_calls
+                        text for text, _, _, _ in text_calls
                     ]
                     self.assertRegex(
                         rendered_text[0],
@@ -2486,25 +2503,30 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                         - 2 * LEADERBOARD_OUTER_MARGIN
                         - column_gap * (columns - 1)
                     ) // columns
-                    rank_x_positions = set()
+                    rank_field_ranges = []
                     for column in range(columns):
                         column_left = (
                             LEADERBOARD_OUTER_MARGIN
                             + column * (column_width + column_gap)
                         )
-                        rank_left, rank_right = _leaderboard_field_ranges(
-                            column_left,
-                            column_width,
-                            horizontal=columns == 2,
-                        )[0]
-                        rank_x_positions.add((rank_left + rank_right) / 2)
-                    ranks = [
-                        text
-                        for text, xy, _ in text_calls
-                        if xy[0] in rank_x_positions
-                        and text.isdigit()
+                        rank_field_ranges.append(
+                            _leaderboard_field_ranges(
+                                column_left,
+                                column_width,
+                                horizontal=columns == 2,
+                            )[0]
+                        )
+                    rank_calls = [
+                        (int(text), xy, anchor, font)
+                        for text, xy, anchor, font in text_calls
+                        if text.isdigit()
                         and 1 <= int(text) <= team_count
+                        and any(
+                            left <= xy[0] < right
+                            for left, right in rank_field_ranges
+                        )
                     ]
+                    ranks = [str(rank) for rank, _, _, _ in rank_calls]
                     self.assertEqual(
                         ranks,
                         [
@@ -2512,6 +2534,54 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                             for rank in range(1, team_count + 1)
                         ],
                     )
+                    row_top = 282
+                    row_height = (
+                        LEADERBOARD_HORIZONTAL_ROW_HEIGHT
+                        if columns == 2
+                        else LEADERBOARD_VERTICAL_ROW_HEIGHT
+                    )
+                    for rank, xy, anchor, font in rank_calls:
+                        row_index = (
+                            (rank - 1) % per_column_capacity
+                            if columns == 2
+                            else rank - 1
+                        )
+                        expected_y = (
+                            row_top
+                            + row_index * row_height
+                            + row_height // 2
+                        )
+                        if columns == 2:
+                            expected_y -= (
+                                LEADERBOARD_HORIZONTAL_ROW_TEXT_VERTICAL_OFFSET
+                            )
+                        self.assertEqual(xy[1], expected_y)
+                        if columns == 2:
+                            column = (
+                                0 if rank <= per_column_capacity else 1
+                            )
+                            rank_left, rank_right = rank_field_ranges[column]
+                            expected_ink_center = (
+                                (rank_left + rank_right) / 2
+                                + LEADERBOARD_HORIZONTAL_RANK_CELL_CENTER_OFFSETS[
+                                    column
+                                ]
+                            )
+                            bbox = ImageDraw.Draw(
+                                Image.new("RGB", (1, 1))
+                            ).textbbox(
+                                (0, 0),
+                                str(rank),
+                                font=font,
+                                anchor=anchor,
+                            )
+                            actual_ink_center = xy[0] + (
+                                bbox[0] + bbox[2]
+                            ) / 2
+                            self.assertAlmostEqual(
+                                actual_ink_center,
+                                expected_ink_center,
+                            )
                     self.assertIn("Team 01", rendered_text)
                     self.assertEqual(rendered_text.count("Team 01"), 1)
                     self.assertNotIn("TEAM", rendered_text)
@@ -2585,7 +2655,6 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 centers = [(start + end) / 2 for start, end in ranges]
 
                 for text, field_index, expected_anchor, expected_x in (
-                    ("1", 0, "mm", centers[0]),
                     (
                         "CENTER ME",
                         1,
@@ -2607,6 +2676,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                             call for call in text_calls if call[0] == text
                         )
                         self.assertEqual(call[1][0], expected_x)
+                        self.assertEqual(call[1][1], 312)
                         self.assertEqual(call[2], expected_anchor)
                         self.assertEqual(
                             call[3].size,
@@ -2614,9 +2684,47 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                         )
 
                 if orientation == "horizontal":
+                    right_column_left = (
+                        LEADERBOARD_OUTER_MARGIN + column_width + column_gap
+                    )
+                    right_ranges = _leaderboard_field_ranges(
+                        right_column_left,
+                        column_width,
+                        horizontal=True,
+                    )
+                    rank_ranges = (ranges[0], right_ranges[0])
+                    expected_rank_centers = (
+                        centers[0]
+                        + LEADERBOARD_HORIZONTAL_RANK_CELL_CENTER_OFFSETS[0],
+                        (right_ranges[0][0] + right_ranges[0][1]) / 2
+                        + LEADERBOARD_HORIZONTAL_RANK_CELL_CENTER_OFFSETS[1],
+                    )
+                    self.assertEqual(expected_rank_centers, (69, 1015))
+                    for rank, column in ((1, 0), (9, 1)):
+                        rank_left, rank_right = rank_ranges[column]
+                        call = next(
+                            call
+                            for call in text_calls
+                            if call[0] == str(rank)
+                            and rank_left <= call[1][0] < rank_right
+                        )
+                        bbox = ImageDraw.Draw(
+                            Image.new("RGB", (1, 1))
+                        ).textbbox(
+                            (0, 0),
+                            str(rank),
+                            font=call[3],
+                            anchor=call[2],
+                        )
+                        self.assertAlmostEqual(
+                            call[1][0] + (bbox[0] + bbox[2]) / 2,
+                            expected_rank_centers[column],
+                        )
+                        self.assertEqual(call[1][1], 312)
+                        self.assertEqual(call[2], "mm")
                     self.assertEqual(
                         (
-                            centers[0],
+                            expected_rank_centers[0],
                             ranges[1][0]
                             + LEADERBOARD_HORIZONTAL_TEAM_NAME_LEFT_PADDING,
                             centers[2],
@@ -2624,8 +2732,13 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                             centers[4],
                             centers[5],
                         ),
-                        (68, 132, 534, 650.5, 765, 880),
+                        (69, 132, 534, 650.5, 765, 880),
                     )
+                else:
+                    rank_call = next(
+                        call for call in text_calls if call[0] == "1"
+                    )
+                    self.assertEqual(rank_call[1], (centers[0], 312))
 
     def test_long_team_name_shrinks_and_stays_inside_its_field(self):
         fitted_text, font = _fit_leaderboard_cell_text(
@@ -2781,8 +2894,8 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(team_positions["vertical"]["Team 01"], 312)
-        self.assertEqual(team_positions["horizontal"]["Team 01"], 322)
-        self.assertEqual(team_positions["horizontal"]["Team 09"], 322)
+        self.assertEqual(team_positions["horizontal"]["Team 01"], 312)
+        self.assertEqual(team_positions["horizontal"]["Team 09"], 312)
 
     def test_generated_default_background_does_not_need_static_assets(self):
         missing_background = Path("/missing/leaderboard-background.png")
