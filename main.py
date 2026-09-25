@@ -3623,43 +3623,515 @@ async def _record_match_scores(
             silent=False,
         )
         return
+    if match_number < 1:
+        await send_private_command_feedback(
+            ctx,
+            "❌ Match number must be at least 1.",
+            silent=False,
+        )
+        return
+    progress_message: discord.Message | None = None
     try:
-        scores = parse_match_score_lines(
+        try:
+            progress_message = await ctx.send(
+                "⏳ Preparing the score review…",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception(
+                "Could not show score-review progress for scrim %s.",
+                scrim.id,
+            )
+
+        async def update_prompt(
+            content: str,
+            *,
+            embed: discord.Embed | None = None,
+            view: discord.ui.View | None = None,
+        ) -> discord.Message | None:
+            if progress_message is not None:
+                try:
+                    await progress_message.edit(
+                        content=content,
+                        embed=embed,
+                        view=view,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return progress_message
+                except discord.HTTPException:
+                    logger.exception(
+                        "Could not update score review for scrim %s.",
+                        scrim.id,
+                    )
+            try:
+                return await ctx.send(
+                    content,
+                    embed=embed,
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                logger.exception(
+                    "Could not send score review for scrim %s.",
+                    scrim.id,
+                )
+                return None
+
+        normalized_input = normalize_score_submission_text(
             input_string,
-            match_number=match_number,
-            scrim=scrim,
-        )
-    except ValueError as error:
-        await send_private_command_feedback(
-            ctx,
-            f"❌ {error} Nothing was saved.",
-            silent=False,
-        )
-        return
-    if not scores:
-        await send_private_command_feedback(
-            ctx,
-            f"❌ No valid scores found for Match {match_number}. "
-            "Use one `slot kills` entry per rank, best team first.",
-            silent=False,
-        )
-        return
-    try:
-        processed = repository.replace_match_scores(
-            scrim.id,
-            scrim.guild_id,
             match_number,
-            scores,
         )
-    except ValueError as error:
-        await send_private_command_feedback(ctx, f"❌ {error}", silent=False)
-        return
-    await send_private_command_feedback(
-        ctx,
-        f"✅ Scores saved for Match {match_number}: "
-        f"Processed {processed} teams.",
-        silent=False,
+        try:
+            scores = parse_match_score_lines(
+                normalized_input,
+                match_number=match_number,
+                scrim=scrim,
+            )
+        except ValueError as error:
+            await update_prompt(f"❌ {error} Nothing was saved.")
+            return
+        if not scores:
+            await update_prompt(
+                f"❌ No valid scores found for Match {match_number}. "
+                "Use one `slot kills` entry per rank, best team first. "
+                "Nothing was saved."
+            )
+            return
+
+        review = MatchScoreSubmissionReviewView(
+            owner_id=ctx.author.id,
+            guild_id=scrim.guild_id,
+            channel_id=ctx.channel.id,
+            scrim=scrim,
+            match_number=match_number,
+            scores=scores,
+            raw_input=normalized_input,
+        )
+        review.message = await update_prompt(
+            "Review the rank order and kills below. **Nothing has been saved.**",
+            embed=review.embed(),
+            view=review,
+        )
+    finally:
+        await delete_command_message(ctx)
+
+
+def normalize_score_submission_text(
+    input_string: str,
+    match_number: int,
+) -> str:
+    """Allow the edit form to accept either score lines or a full !resgN command."""
+    lines = str(input_string).splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        command = re.fullmatch(
+            rf"!?resg{match_number}(?:\s+(.*))?",
+            line.strip(),
+            flags=re.IGNORECASE,
+        )
+        if command is not None:
+            if command.group(1):
+                lines[index] = command.group(1)
+            else:
+                lines.pop(index)
+        break
+    return "\n".join(lines).strip()
+
+
+def _match_scores_snapshot(scrim: Scrim, match_number: int) -> tuple:
+    return tuple(
+        (score.slot_number, score.kills, score.placement)
+        for score in sorted(
+            (
+                score
+                for score in getattr(scrim, "match_scores", {}).values()
+                if score.match_number == match_number
+            ),
+            key=lambda score: score.slot_number,
+        )
     )
+
+
+class MatchScoreSubmissionReviewView(discord.ui.View):
+    """Confirm or edit a complete match result set before it is saved."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        channel_id: int,
+        scrim: Scrim,
+        match_number: int,
+        scores: list[MatchScore],
+        raw_input: str,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.scrim_id = scrim.id
+        self.match_number = match_number
+        self.scores = tuple(scores)
+        self.raw_input = raw_input.strip()
+        self.assignment_generation = assignment_fingerprint(scrim)
+        self.baseline_scores = _match_scores_snapshot(scrim, match_number)
+        self.team_names = {
+            score.slot_number: scrim.slots[score.slot_number].team_name
+            for score in scores
+        }
+        self.message: discord.Message | None = None
+        self.completed = False
+        self.editing = False
+        self.processing = False
+
+    def embed(self) -> discord.Embed:
+        score_lines = []
+        for score in sorted(self.scores, key=lambda item: item.placement):
+            team_name = discord.utils.escape_markdown(
+                discord.utils.escape_mentions(
+                    self.team_names.get(score.slot_number, "Unknown team")
+                )
+            )
+            score_lines.append(
+                f"**{score.placement:02d}.** Slot {score.slot_number:02d} · "
+                f"{team_name} — **{score.kills}** kills"
+            )
+        embed = discord.Embed(
+            title=f"Review Match {self.match_number} results",
+            description=(
+                "Check the rank order and kills before saving. "
+                f"Confirm replaces the previous complete result set for Match "
+                f"{self.match_number}; teams omitted here will be removed.\n\n"
+                + "\n".join(score_lines)
+            ),
+            color=discord.Color.orange(),
+        )
+        embed.set_footer(
+            text="No scores have been saved · Confirm saves · Edit changes the command"
+        )
+        return embed
+
+    async def authorized_scrim(
+        self,
+        interaction: discord.Interaction,
+    ) -> Scrim | None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This score review belongs to another staff member.",
+                ephemeral=True,
+            )
+            return None
+        if (
+            getattr(interaction.guild, "id", None) != self.guild_id
+            or interaction.channel_id != self.channel_id
+        ):
+            await interaction.response.send_message(
+                "This score review is only valid in its original server and channel.",
+                ephemeral=True,
+            )
+            return None
+        if self.completed:
+            await interaction.response.send_message(
+                "This score review has already been processed.",
+                ephemeral=True,
+            )
+            return None
+
+        scrim = repository.get(self.scrim_id)
+        if (
+            scrim is None
+            or scrim.guild_id != self.guild_id
+            or not is_active(scrim)
+            or not member_is_staff(interaction.user, scrim)
+        ):
+            await interaction.response.send_message(
+                "You no longer have access to this scrim's score review.",
+                ephemeral=True,
+            )
+            return None
+        if not 1 <= self.match_number <= scrim.max_matches:
+            await interaction.response.send_message(
+                "That match is no longer configured for this scrim.",
+                ephemeral=True,
+            )
+            return None
+        return scrim
+
+    async def current_scrim(
+        self,
+        interaction: discord.Interaction,
+    ) -> Scrim | None:
+        scrim = await self.authorized_scrim(interaction)
+        if scrim is None:
+            return None
+        if (
+            assignment_fingerprint(scrim) != self.assignment_generation
+            or _match_scores_snapshot(scrim, self.match_number)
+            != self.baseline_scores
+        ):
+            self.completed = True
+            disable_view_items(self)
+            self.stop()
+            await interaction.response.edit_message(
+                content=(
+                    "This review is out of date because teams or saved scores "
+                    "changed. No proposed scores were saved. Run the command "
+                    "again to review the current data."
+                ),
+                embed=None,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return None
+        return scrim
+
+    async def close(self, content: str) -> None:
+        self.completed = True
+        self.editing = False
+        disable_view_items(self)
+        self.stop()
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=content,
+                embed=None,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not close the Match %s score review.", self.match_number)
+
+    async def on_timeout(self) -> None:
+        if self.completed:
+            return
+        await self.close(
+            f"Match {self.match_number} score review expired. "
+            "No proposed scores were saved."
+        )
+
+    @discord.ui.button(
+        label="Confirm",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+    )
+    async def confirm_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.editing:
+            await interaction.response.send_message(
+                "Finish or cancel the edit form before confirming this review.",
+                ephemeral=True,
+            )
+            return
+        if self.processing:
+            await interaction.response.send_message(
+                "This score review is already being processed.",
+                ephemeral=True,
+            )
+            return
+        scrim = await self.current_scrim(interaction)
+        if scrim is None:
+            return
+        self.processing = True
+        try:
+            processed = repository.replace_match_scores(
+                scrim.id,
+                scrim.guild_id,
+                self.match_number,
+                list(self.scores),
+            )
+        except ValueError as error:
+            self.processing = False
+            await interaction.response.send_message(
+                f"❌ {error} Nothing was saved.",
+                ephemeral=True,
+            )
+            return
+        except SlotStorageError:
+            self.processing = False
+            logger.exception(
+                "Could not save submitted scores for scrim %s.",
+                scrim.id,
+            )
+            await interaction.response.send_message(
+                "The scores could not be saved. Nothing was changed; please try again.",
+                ephemeral=True,
+            )
+            return
+
+        self.completed = True
+        self.editing = False
+        disable_view_items(self)
+        self.stop()
+        await interaction.response.edit_message(
+            content=(
+                f"✅ Scores saved for Match {self.match_number}: "
+                f"Processed {processed} teams. Use `!res` when you are ready "
+                "to publish the leaderboard image."
+            ),
+            embed=None,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(
+        label="Edit",
+        emoji="✏️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def edit_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.processing:
+            await interaction.response.send_message(
+                "This score review is already being processed.",
+                ephemeral=True,
+            )
+            return
+        scrim = await self.current_scrim(interaction)
+        if scrim is None:
+            return
+        self.editing = True
+        await interaction.response.send_modal(
+            MatchScoreSubmissionEditModal(self)
+        )
+
+    @discord.ui.button(
+        label="Cancel",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+    )
+    async def cancel_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.processing:
+            await interaction.response.send_message(
+                "This score review is already being processed.",
+                ephemeral=True,
+            )
+            return
+        if await self.authorized_scrim(interaction) is None:
+            return
+        self.completed = True
+        self.editing = False
+        disable_view_items(self)
+        self.stop()
+        await interaction.response.edit_message(
+            content=(
+                "Score entry cancelled. No proposed scores were saved; "
+                "previously saved results remain unchanged."
+            ),
+            embed=None,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class MatchScoreSubmissionEditModal(discord.ui.Modal):
+    """Let staff edit the pasted !resgN command before confirming it."""
+
+    def __init__(self, source_review: MatchScoreSubmissionReviewView) -> None:
+        super().__init__(
+            title=f"Edit Match {source_review.match_number} score command",
+            timeout=300,
+        )
+        self.source_review = source_review
+        default_command = (
+            f"!resg{source_review.match_number}\n{source_review.raw_input}"
+        )
+        self.command_input = discord.ui.TextInput(
+            label="Paste or edit the full command",
+            placeholder=f"!resg{source_review.match_number} then one slot kills line per rank",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=4000,
+            default=default_command[:4000],
+        )
+        self.add_item(self.command_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        source_review = self.source_review
+        if source_review.completed or not source_review.editing:
+            await interaction.response.send_message(
+                "This score review is no longer available. Run the command again.",
+                ephemeral=True,
+            )
+            return
+        scrim = await source_review.authorized_scrim(interaction)
+        if scrim is None:
+            return
+        if (
+            assignment_fingerprint(scrim) != source_review.assignment_generation
+            or _match_scores_snapshot(scrim, source_review.match_number)
+            != source_review.baseline_scores
+        ):
+            await interaction.response.send_message(
+                "Teams or saved results changed while the edit form was open. "
+                "Nothing was saved; run the command again.",
+                ephemeral=True,
+            )
+            await source_review.close(
+                "This review became out of date while the edit form was open. "
+                "No proposed scores were saved."
+            )
+            return
+        normalized_input = normalize_score_submission_text(
+            self.command_input.value,
+            source_review.match_number,
+        )
+        try:
+            scores = parse_match_score_lines(
+                normalized_input,
+                match_number=source_review.match_number,
+                scrim=scrim,
+            )
+        except ValueError as error:
+            await interaction.response.send_message(
+                f"❌ {error} Nothing was saved. Reopen Edit to try again.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        if not scores:
+            await interaction.response.send_message(
+                "❌ No valid scores found. Nothing was saved. Reopen Edit to try again.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        review = MatchScoreSubmissionReviewView(
+            owner_id=source_review.owner_id,
+            guild_id=scrim.guild_id,
+            channel_id=source_review.channel_id,
+            scrim=scrim,
+            match_number=source_review.match_number,
+            scores=scores,
+            raw_input=normalized_input,
+        )
+        await interaction.response.send_message(
+            "Review the edited scores below. **Nothing has been saved.**",
+            embed=review.embed(),
+            view=review,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        try:
+            review.message = await interaction.original_response()
+        except discord.HTTPException:
+            logger.exception("Could not retain the edited Match %s review.", review.match_number)
+        await source_review.close(
+            "This score review was replaced by the edited proposal below. "
+            "It did not save any scores."
+        )
 
 
 class MatchScoreCorrectionView(discord.ui.View):
@@ -6257,7 +6729,18 @@ async def leaderboard_command(ctx: commands.Context) -> None:
     scrim = await require_staff_scrim(ctx, allow_public=True)
     if scrim is None:
         return
+    progress_message: discord.Message | None = None
     try:
+        try:
+            progress_message = await ctx.send(
+                "⏳ Working on the leaderboard…",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception(
+                "Could not show leaderboard progress for scrim %s.",
+                scrim.id,
+            )
         rows = calculate_leaderboard(scrim)
         image = build_leaderboard_image(scrim, rows)
         await ctx.send(
@@ -6265,13 +6748,39 @@ async def leaderboard_command(ctx: commands.Context) -> None:
             file=discord.File(image, filename="leaderboard.png"),
             allowed_mentions=discord.AllowedMentions.none(),
         )
-    except (OSError, ValueError) as error:
+        if progress_message is not None:
+            try:
+                await progress_message.delete()
+            except discord.HTTPException:
+                try:
+                    await progress_message.edit(
+                        content="✅ Leaderboard generated above.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except discord.HTTPException:
+                    logger.exception(
+                        "Could not clear leaderboard progress for scrim %s.",
+                        scrim.id,
+                    )
+    except (OSError, ValueError, discord.HTTPException) as error:
         logger.exception("Could not generate leaderboard for scrim %s.", scrim.id)
-        await send_private_command_feedback(
-            ctx,
-            f"❌ The leaderboard could not be generated: {error}",
-            silent=False,
-        )
+        if progress_message is not None:
+            try:
+                await progress_message.edit(
+                    content=f"❌ The leaderboard could not be generated: {error}",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                logger.exception(
+                    "Could not report the leaderboard error for scrim %s.",
+                    scrim.id,
+                )
+        else:
+            await send_private_command_feedback(
+                ctx,
+                f"❌ The leaderboard could not be generated: {error}",
+                silent=False,
+            )
         return
     finally:
         await delete_command_message(ctx)
@@ -6283,8 +6792,10 @@ HELP_COPY_TEXT = (
     "!reset\n"
     "SLOTS: !add Team / TAG / @Captain | !confirm 03 04 | !remove 03 | "
     "!open | !close | !remind\n"
-    "STATUS: !slots [Scrim] | !update [Scrim] | !res / !lb | "
-    f"!resg1-{MAX_MATCHES} slot kills (best team first; omit missed teams)\n"
+    "STATUS: !slots [Scrim] | !update [Scrim] | !res / !lb "
+    "(posts leaderboard image)\n"
+    f"!resg1-{MAX_MATCHES} slot kills "
+    "(best team first; omit missed teams; review and confirm to save)\n"
     "!editres <match> (choose team, enter rank and kills)\n"
     "ROOM: !idpw room / minutes | !idpwg1-25 room / minutes\n"
     "CAPTAINS: !register Team / TAG [/ @Manager] | "
@@ -6302,9 +6813,10 @@ def build_help_text() -> str:
         "`!export` `!reset`\n"
         "**SLOTS** `!add Team / TAG / @Captain` `!confirm 03 04` "
         "`!remove 03` `!open` `!close` `!remind`\n"
-        "**STATUS** `!slots [Scrim]` `!update [Scrim]` `!res`/`!lb` "
+        "**STATUS** `!slots [Scrim]` `!update [Scrim]` "
+        "`!res`/`!lb` (posts leaderboard image) "
         f"`!resg1-{MAX_MATCHES} slot kills` "
-        "(best team first; omit missed teams) "
+        "(best team first; omit missed teams; review and confirm to save) "
         "`!editres <match>` (choose team, enter rank and kills)\n"
         "**ROOM** `!idpw room / minutes` `!idpwg1-25 room / minutes`\n"
         "**CAPTAINS** `!register Team / TAG [/ @Manager]` "
