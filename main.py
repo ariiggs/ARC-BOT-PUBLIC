@@ -78,9 +78,12 @@ MAX_LEADERBOARD_BACKGROUND_UPLOAD_BYTES = 8 * 1024 * 1024
 LEADERBOARD_VERTICAL_WIDTH = 1080
 LEADERBOARD_HORIZONTAL_WIDTH = 1920
 LEADERBOARD_OUTER_MARGIN = 28
-LEADERBOARD_SECTION_GAP = 22
+LEADERBOARD_SECTION_GAP = 10
 LEADERBOARD_TABLE_HEADER_HEIGHT = 64
-LEADERBOARD_ROW_HEIGHT = 48
+LEADERBOARD_VERTICAL_ROW_HEIGHT = 60
+LEADERBOARD_HORIZONTAL_ROW_HEIGHT = 80
+STANDARD_LEADERBOARD_TEAM_COUNT = 20
+LEADERBOARD_FIELD_BASE_WIDTHS = (48, 500, 120, 120, 120, 116)
 
 
 class LeaderboardBackgroundDimensionsError(ValueError):
@@ -3751,18 +3754,40 @@ def _write_leaderboard_background_metadata(
 
 
 def _leaderboard_scrim_profile(scrim: Scrim) -> tuple[str, int]:
-    return (
-        getattr(
-            scrim,
-            "leaderboard_orientation",
-            DEFAULT_LEADERBOARD_ORIENTATION,
-        ),
-        getattr(
-            scrim,
-            "leaderboard_team_count",
-            DEFAULT_LEADERBOARD_TEAM_COUNT,
-        ),
+    orientation = getattr(
+        scrim,
+        "leaderboard_orientation",
+        DEFAULT_LEADERBOARD_ORIENTATION,
     )
+    team_count = getattr(
+        scrim,
+        "leaderboard_team_count",
+        DEFAULT_LEADERBOARD_TEAM_COUNT,
+    )
+    if repository.get_server_license_type(scrim.guild_id) != "Gold":
+        team_count = STANDARD_LEADERBOARD_TEAM_COUNT
+    return orientation, team_count
+
+
+def _leaderboard_profile_accent_color(scrim: Scrim) -> str:
+    orientation, team_count = _leaderboard_scrim_profile(scrim)
+    accent_colors = getattr(scrim, "leaderboard_accent_colors", {})
+    profile_color = (
+        accent_colors.get(f"{orientation}:{team_count}")
+        if isinstance(accent_colors, dict)
+        else None
+    )
+    if isinstance(profile_color, str):
+        return profile_color
+    if not accent_colors:
+        legacy_color = getattr(
+            scrim,
+            "leaderboard_accent_color",
+            DEFAULT_LEADERBOARD_ACCENT_COLOR,
+        )
+        if isinstance(legacy_color, str):
+            return legacy_color
+    return DEFAULT_LEADERBOARD_ACCENT_COLOR
 
 
 def _migrate_legacy_leaderboard_background(scrim: Scrim) -> None:
@@ -4349,15 +4374,13 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
                 color=discord.Color.red(),
             )
         is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
-        orientation = scrim.leaderboard_orientation
-        if orientation == "horizontal" and not is_gold:
-            orientation = "vertical"
+        orientation, team_count = _leaderboard_scrim_profile(scrim)
         background_metadata = _current_leaderboard_background_metadata(scrim)
         saved_background_url = background_metadata.get("attachment_url")
         profile_background_path = _leaderboard_background_path(
             scrim.id,
-            scrim.leaderboard_orientation,
-            scrim.leaderboard_team_count,
+            orientation,
+            team_count,
         )
         if isinstance(saved_background_url, str) and saved_background_url:
             self.background_url = saved_background_url
@@ -4366,16 +4389,13 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
             background_text = "Custom background saved; preview link unavailable"
         else:
             background_text = "Built-in default background"
-        accent_color = getattr(
-            scrim,
-            "leaderboard_accent_color",
-            DEFAULT_LEADERBOARD_ACCENT_COLOR,
-        )
+        accent_color = _leaderboard_profile_accent_color(scrim)
         embed = discord.Embed(
             title=f"Edit Leaderboard — {discord.utils.escape_markdown(scrim.name)}",
             description=(
-                "Background and text color are saved separately for each "
-                "orientation and team count. Horizontal orientation requires Gold."
+                "Standard is fixed at 20 teams in either orientation. "
+                "Gold can choose the team count. Backgrounds are available "
+                "for each license-available profile."
                 if not is_gold
                 else
                 "Background and text color are saved separately for each "
@@ -4390,7 +4410,7 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         )
         embed.add_field(
             name="Teams to Display",
-            value=str(scrim.leaderboard_team_count),
+            value=str(team_count),
             inline=True,
         )
         embed.add_field(
@@ -4413,13 +4433,25 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
     def rebuild(self) -> None:
         self.clear_items()
         teams_button = discord.ui.Button(
-            label="Teams to Display",
+            label=(
+                "Teams to Display"
+                if repository.get_server_license_type(self.guild_id) == "Gold"
+                else "Teams to Display · Gold"
+            ),
             emoji="🔢",
             style=discord.ButtonStyle.primary,
+            disabled=repository.get_server_license_type(self.guild_id) != "Gold",
             row=0,
         )
 
         async def teams_callback(interaction: discord.Interaction) -> None:
+            if repository.get_server_license_type(self.guild_id) != "Gold":
+                await interaction.response.send_message(
+                    "Standard licenses are locked to 20 teams. "
+                    "Gold licenses can change the team count.",
+                    ephemeral=True,
+                )
+                return
             view = LeaderboardTeamCountView(
                 owner_id=self.owner_id,
                 guild_id=self.guild_id,
@@ -4573,19 +4605,10 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
             label="Orientation",
             emoji="↔️",
             style=discord.ButtonStyle.primary,
-            disabled=(
-                repository.get_server_license_type(self.guild_id) != "Gold"
-            ),
             row=0,
         )
 
         async def orientation_callback(interaction: discord.Interaction) -> None:
-            if repository.get_server_license_type(self.guild_id) != "Gold":
-                await interaction.response.send_message(
-                    "The Orientation control is available only to Gold guilds.",
-                    ephemeral=True,
-                )
-                return
             view = LeaderboardOrientationView(
                 owner_id=self.owner_id,
                 guild_id=self.guild_id,
@@ -4602,19 +4625,14 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         self.add_item(orientation_button)
 
         scrim = repository.get(self.scrim_id)
-        has_custom_background = _leaderboard_background_path(
-            self.scrim_id,
-            getattr(
-                scrim,
-                "leaderboard_orientation",
-                DEFAULT_LEADERBOARD_ORIENTATION,
-            ),
-            getattr(
-                scrim,
-                "leaderboard_team_count",
-                DEFAULT_LEADERBOARD_TEAM_COUNT,
-            ),
-        ).is_file()
+        has_custom_background = False
+        if scrim is not None:
+            orientation, team_count = _leaderboard_scrim_profile(scrim)
+            has_custom_background = _leaderboard_background_path(
+                self.scrim_id,
+                orientation,
+                team_count,
+            ).is_file()
         accent_button = discord.ui.Button(
             label="Text Color",
             emoji="🎨",
@@ -4664,8 +4682,7 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
                 return
             if not _leaderboard_background_path(
                 self.scrim_id,
-                scrim.leaderboard_orientation,
-                scrim.leaderboard_team_count,
+                *_leaderboard_scrim_profile(scrim),
             ).is_file():
                 await interaction.response.send_message(
                     "This scrim is already using the default background.",
@@ -4789,7 +4806,7 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
 
 
 class LeaderboardAccentColorView(LeaderboardPanelView):
-    """Choose the generated date, team, and score text color for one scrim."""
+    """Choose the generated date, team, and score text color for one profile."""
 
     def __init__(
         self,
@@ -4815,14 +4832,21 @@ class LeaderboardAccentColorView(LeaderboardPanelView):
 
     def embed(self) -> discord.Embed:
         scrim = repository.get(self.scrim_id)
-        accent_color = getattr(
-            scrim,
-            "leaderboard_accent_color",
-            DEFAULT_LEADERBOARD_ACCENT_COLOR,
+        accent_color = (
+            _leaderboard_profile_accent_color(scrim)
+            if scrim is not None
+            else DEFAULT_LEADERBOARD_ACCENT_COLOR
         )
+        orientation, team_count = (
+            _leaderboard_scrim_profile(scrim)
+            if scrim is not None
+            else (DEFAULT_LEADERBOARD_ORIENTATION, DEFAULT_LEADERBOARD_TEAM_COUNT)
+        )
+        profile = f"{orientation.title()} / {team_count} teams"
         return discord.Embed(
             title="Leaderboard Text Color",
             description=(
+                f"Profile: **{profile}**\n"
                 f"Current color: **{_leaderboard_accent_label(accent_color)}**\n"
                 "This color applies only to generated dates, team names, and "
                 "scores. Table styling stays fixed.\n"
@@ -4913,8 +4937,7 @@ class LeaderboardAccentColorView(LeaderboardPanelView):
             return
         if not _leaderboard_background_path(
             scrim.id,
-            scrim.leaderboard_orientation,
-            scrim.leaderboard_team_count,
+            *_leaderboard_scrim_profile(scrim),
         ).is_file():
             await interaction.response.send_message(
                 "Upload a custom background before changing generated text color.",
@@ -5059,67 +5082,91 @@ class LeaderboardTeamCountView(LeaderboardPanelView):
     def embed(self) -> discord.Embed:
         scrim = repository.get(self.scrim_id)
         current = (
-            scrim.leaderboard_team_count
+            _leaderboard_scrim_profile(scrim)[1]
             if scrim is not None
-            else DEFAULT_LEADERBOARD_TEAM_COUNT
+            else STANDARD_LEADERBOARD_TEAM_COUNT
         )
+        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
         return discord.Embed(
             title="Teams to Display",
-            description=f"Current setting: **{current} teams**.",
+            description=(
+                f"Current setting: **{current} teams**."
+                if is_gold
+                else "Standard licenses are locked to **20 teams**. "
+                "Gold licenses can change this setting."
+            ),
             color=discord.Color.blurple(),
         )
 
     def rebuild(self) -> None:
         self.clear_items()
         scrim = repository.get(self.scrim_id)
+        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
         current = (
-            scrim.leaderboard_team_count
+            _leaderboard_scrim_profile(scrim)[1]
             if scrim is not None
-            else DEFAULT_LEADERBOARD_TEAM_COUNT
+            else STANDARD_LEADERBOARD_TEAM_COUNT
         )
-        selector = discord.ui.Select(
-            placeholder="Choose 16, 18, 20, 22, or 24 teams",
-            min_values=1,
-            max_values=1,
-            options=[
-                discord.SelectOption(
-                    label=f"{count} teams",
-                    value=str(count),
-                    default=count == current,
-                )
-                for count in LEADERBOARD_TEAM_COUNTS
-            ],
-            row=0,
-        )
-
-        async def select_callback(interaction: discord.Interaction) -> None:
-            try:
-                repository.update_leaderboard_settings(
-                    self.scrim_id,
-                    self.guild_id,
-                    leaderboard_team_count=int(selector.values[0]),
-                )
-            except (SlotStorageError, ValueError) as error:
-                await interaction.response.send_message(
-                    f"Could not save the team count: {error}",
-                    ephemeral=True,
-                )
-                return
-            view = LeaderboardScrimEditView(
-                owner_id=self.owner_id,
-                guild_id=self.guild_id,
-                scrim_id=self.scrim_id,
-                background_url=self.background_url,
-            )
-            await interaction.response.edit_message(
-                content=view.content(),
-                embed=view.embed(),
-                view=view,
-                allowed_mentions=discord.AllowedMentions.none(),
+        if is_gold:
+            selector = discord.ui.Select(
+                placeholder="Choose 16, 18, 20, 22, or 24 teams",
+                min_values=1,
+                max_values=1,
+                options=[
+                    discord.SelectOption(
+                        label=f"{count} teams",
+                        value=str(count),
+                        default=count == current,
+                    )
+                    for count in LEADERBOARD_TEAM_COUNTS
+                ],
+                row=0,
             )
 
-        selector.callback = select_callback
-        self.add_item(selector)
+            async def select_callback(interaction: discord.Interaction) -> None:
+                if repository.get_server_license_type(self.guild_id) != "Gold":
+                    await interaction.response.send_message(
+                        "Standard licenses are locked to 20 teams. "
+                        "Gold licenses can change the team count.",
+                        ephemeral=True,
+                    )
+                    return
+                try:
+                    repository.update_leaderboard_settings(
+                        self.scrim_id,
+                        self.guild_id,
+                        leaderboard_team_count=int(selector.values[0]),
+                    )
+                except (SlotStorageError, ValueError) as error:
+                    await interaction.response.send_message(
+                        f"Could not save the team count: {error}",
+                        ephemeral=True,
+                    )
+                    return
+                view = LeaderboardScrimEditView(
+                    owner_id=self.owner_id,
+                    guild_id=self.guild_id,
+                    scrim_id=self.scrim_id,
+                    background_url=self.background_url,
+                )
+                await interaction.response.edit_message(
+                    content=view.content(),
+                    embed=view.embed(),
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+            selector.callback = select_callback
+            self.add_item(selector)
+        else:
+            self.add_item(
+                discord.ui.Button(
+                    label="Locked to 20 Teams",
+                    style=discord.ButtonStyle.secondary,
+                    disabled=True,
+                    row=0,
+                )
+            )
 
         back_button = discord.ui.Button(
             label="Back to Leaderboard",
@@ -5146,7 +5193,7 @@ class LeaderboardTeamCountView(LeaderboardPanelView):
 
 
 class LeaderboardOrientationView(LeaderboardPanelView):
-    """Choose vertical or Gold-only horizontal leaderboard orientation."""
+    """Choose vertical or horizontal leaderboard orientation."""
 
     def __init__(
         self,
@@ -5169,17 +5216,16 @@ class LeaderboardOrientationView(LeaderboardPanelView):
 
     def embed(self) -> discord.Embed:
         scrim = repository.get(self.scrim_id)
-        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
         current = (
             scrim.leaderboard_orientation
             if scrim is not None
             else DEFAULT_LEADERBOARD_ORIENTATION
         )
-        if current == "horizontal" and not is_gold:
-            current = "vertical"
         description = f"Current setting: **{current.title()}**."
-        if not is_gold:
-            description += "\nHorizontal orientation requires Gold."
+        if repository.get_server_license_type(self.guild_id) != "Gold":
+            description += (
+                "\nStandard licenses use 20 teams in either orientation."
+            )
         return discord.Embed(
             title="Leaderboard Orientation",
             description=description,
@@ -5189,29 +5235,23 @@ class LeaderboardOrientationView(LeaderboardPanelView):
     def rebuild(self) -> None:
         self.clear_items()
         scrim = repository.get(self.scrim_id)
-        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
         current = (
             scrim.leaderboard_orientation
             if scrim is not None
             else DEFAULT_LEADERBOARD_ORIENTATION
         )
-        if current == "horizontal" and not is_gold:
-            current = "vertical"
         options = [
             discord.SelectOption(
                 label="Vertical",
                 value="vertical",
                 default=current == "vertical",
-            )
+            ),
+            discord.SelectOption(
+                label="Horizontal",
+                value="horizontal",
+                default=current == "horizontal",
+            ),
         ]
-        if is_gold:
-            options.append(
-                discord.SelectOption(
-                    label="Horizontal",
-                    value="horizontal",
-                    default=current == "horizontal",
-                )
-            )
         selector = discord.ui.Select(
             placeholder="Choose vertical or horizontal",
             min_values=1,
@@ -6484,11 +6524,7 @@ def calculate_leaderboard(scrim: Scrim) -> list[LeaderboardRow]:
             row.slot_number,
         ),
     )
-    team_count = getattr(
-        scrim,
-        "leaderboard_team_count",
-        DEFAULT_LEADERBOARD_TEAM_COUNT,
-    )
+    _, team_count = _leaderboard_scrim_profile(scrim)
     if team_count not in LEADERBOARD_TEAM_COUNTS:
         raise ValueError("Invalid leaderboard team count.")
     return ranked_rows[:team_count]
@@ -6620,6 +6656,62 @@ def _fit_font(
     return _load_font(min_size, weight=weight)
 
 
+def _leaderboard_field_ranges(
+    left: int,
+    total_width: int,
+) -> tuple[tuple[int, int], ...]:
+    """Scale the six leaderboard fields to the width of one table column."""
+    base_total = sum(LEADERBOARD_FIELD_BASE_WIDTHS)
+    exact_widths = [
+        width * total_width / base_total
+        for width in LEADERBOARD_FIELD_BASE_WIDTHS
+    ]
+    widths = [int(width) for width in exact_widths]
+    remaining = total_width - sum(widths)
+    order = sorted(
+        range(len(widths)),
+        key=lambda index: exact_widths[index] - widths[index],
+        reverse=True,
+    )
+    for index in order[:remaining]:
+        widths[index] += 1
+
+    ranges = []
+    field_left = left
+    for field_width in widths:
+        ranges.append((field_left, field_left + field_width))
+        field_left += field_width
+    return tuple(ranges)
+
+
+def _fit_leaderboard_cell_text(
+    text: object,
+    *,
+    max_width: int,
+    max_height: int,
+    max_size: int,
+    min_size: int = 8,
+    weight: int = 400,
+) -> tuple[str, ImageFont.FreeTypeFont]:
+    """Shrink text to fit a cell, shortening only as a last resort."""
+    text = " ".join(str(text).split())
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    for size in range(max_size, min_size - 1, -1):
+        font = _load_font(size, weight=weight)
+        left, top, right, bottom = probe.textbbox((0, 0), text, font=font)
+        if right - left <= max_width and bottom - top <= max_height:
+            return text, font
+
+    font = _load_font(min_size, weight=weight)
+    ellipsis = "…"
+    for end in range(len(text), -1, -1):
+        candidate = text[:end].rstrip() + ellipsis
+        left, top, right, bottom = probe.textbbox((0, 0), candidate, font=font)
+        if right - left <= max_width and bottom - top <= max_height:
+            return candidate, font
+    return "", font
+
+
 def leaderboard_canvas_dimensions(
     team_count: int,
     orientation: str,
@@ -6653,12 +6745,17 @@ def leaderboard_canvas_dimensions(
         if orientation == "vertical"
         else (team_count + 1) // 2
     )
+    row_height = (
+        LEADERBOARD_VERTICAL_ROW_HEIGHT
+        if orientation == "vertical"
+        else LEADERBOARD_HORIZONTAL_ROW_HEIGHT
+    )
     height = (
         2 * LEADERBOARD_OUTER_MARGIN
         + header_height
         + LEADERBOARD_SECTION_GAP
         + LEADERBOARD_TABLE_HEADER_HEIGHT
-        + visible_rows * LEADERBOARD_ROW_HEIGHT
+        + visible_rows * row_height
         + LEADERBOARD_SECTION_GAP
         + footer_height
     )
@@ -6752,20 +6849,8 @@ def _build_configured_leaderboard_image(
     *,
     background_path: Path = LEADERBOARD_BACKGROUND,
 ) -> io.BytesIO:
-    team_limit = getattr(
-        scrim,
-        "leaderboard_team_count",
-        DEFAULT_LEADERBOARD_TEAM_COUNT,
-    )
-    orientation = getattr(
-        scrim,
-        "leaderboard_orientation",
-        DEFAULT_LEADERBOARD_ORIENTATION,
-    )
+    orientation, team_limit = _leaderboard_scrim_profile(scrim)
     header_height = DEFAULT_LEADERBOARD_HEADER_HEIGHT
-    if orientation == "horizontal":
-        if repository.get_server_license_type(scrim.guild_id) != "Gold":
-            orientation = "vertical"
 
     rows = rows[:team_limit]
     width, height = leaderboard_canvas_dimensions(
@@ -6778,15 +6863,12 @@ def _build_configured_leaderboard_image(
         (width, height),
     )
     margin = LEADERBOARD_OUTER_MARGIN
-    generated_text = _leaderboard_accent_rgb(
+    text = _leaderboard_accent_rgb(
         DEFAULT_LEADERBOARD_ACCENT_COLOR
         if background_path == LEADERBOARD_BACKGROUND
-        else getattr(
-            scrim,
-            "leaderboard_accent_color",
-            DEFAULT_LEADERBOARD_ACCENT_COLOR,
-        )
+        else _leaderboard_profile_accent_color(scrim)
     )
+
     table_top = margin + header_height + LEADERBOARD_SECTION_GAP
     draw = ImageDraw.Draw(output, "RGBA")
     date_label = datetime.now(
@@ -6798,12 +6880,44 @@ def _build_configured_leaderboard_image(
         (width - margin - 75, date_center_y),
         date_label,
         font=date_font,
-        fill=generated_text,
+        fill=text,
         anchor="mm",
     )
+    if background_path == LEADERBOARD_BACKGROUND:
+        scrim_title = str(getattr(scrim, "name", "") or "").strip()
+        if scrim_title:
+            date_bbox = draw.textbbox((0, 0), date_label, font=date_font)
+            date_width = date_bbox[2] - date_bbox[0]
+            date_left = width - margin - 75 - date_width // 2
+            title_center_x = width // 2
+            title_right_limit = date_left - 24
+            title_half_width = min(
+                title_center_x - margin,
+                title_right_limit - title_center_x,
+            )
+            title_font = _fit_font(
+                scrim_title,
+                max_width=max(80, 2 * title_half_width),
+                max_height=header_height - 24,
+                max_size=64,
+                min_size=18,
+                weight=LEADERBOARD_BODY_FONT_WEIGHT,
+            )
+            draw.text(
+                (title_center_x, date_center_y),
+                scrim_title,
+                font=title_font,
+                fill=text,
+                anchor="mm",
+            )
 
     columns = 2 if orientation == "horizontal" else 1
     column_gap = 24 if columns == 2 else 0
+    row_height = (
+        LEADERBOARD_HORIZONTAL_ROW_HEIGHT
+        if columns == 2
+        else LEADERBOARD_VERTICAL_ROW_HEIGHT
+    )
     column_width = (
         width - 2 * margin - column_gap * (columns - 1)
     ) // columns
@@ -6825,59 +6939,76 @@ def _build_configured_leaderboard_image(
         else:
             column_rows = rows
 
-        team_x = x + (74 if columns == 1 else 62)
-        wins_x = x + column_width - (390 if columns == 1 else 330)
-        kills_x = x + column_width - (280 if columns == 1 else 245)
-        place_x = x + column_width - (160 if columns == 1 else 135)
-        total_x = x + column_width - 20
+        field_ranges = _leaderboard_field_ranges(x, column_width)
+        field_centers = tuple(
+            (field_left + field_right) / 2
+            for field_left, field_right in field_ranges
+        )
         for row_index in range(per_column_capacity):
-            y = row_top + row_index * LEADERBOARD_ROW_HEIGHT
-            text_y = y + LEADERBOARD_ROW_HEIGHT // 2
+            y = row_top + row_index * row_height
+            text_y = y + row_height // 2
             rank = column_index * per_column_capacity + row_index + 1
-            draw.text(
-                (x + 34, text_y),
+            rank_text, rank_font = _fit_leaderboard_cell_text(
                 f"{rank:02d}",
-                font=_load_font(
-                    row_font,
-                    weight=LEADERBOARD_BODY_FONT_WEIGHT,
-                ),
-                fill=generated_text,
+                max_width=field_ranges[0][1] - field_ranges[0][0] - 10,
+                max_height=row_height - 8,
+                max_size=row_font,
+                weight=LEADERBOARD_BODY_FONT_WEIGHT,
+            )
+            draw.text(
+                (field_centers[0], text_y),
+                rank_text,
+                font=rank_font,
+                fill=text,
                 anchor="mm",
             )
             if row_index >= len(column_rows):
                 continue
             row = column_rows[row_index]
-            team_max_width = wins_x - team_x - 20
-            team_font = _fit_font(
+            team_text, team_font = _fit_leaderboard_cell_text(
                 row.team_name,
-                max_width=max(80, team_max_width),
-                max_height=LEADERBOARD_ROW_HEIGHT - 8,
+                max_width=max(
+                    1,
+                    field_ranges[1][1] - field_ranges[1][0] - 20,
+                ),
+                max_height=row_height - 8,
                 max_size=row_font,
-                min_size=13,
+                min_size=8,
                 weight=LEADERBOARD_BODY_FONT_WEIGHT,
             )
             draw.text(
-                (team_x, text_y),
-                row.team_name,
+                (field_centers[1], text_y),
+                team_text,
                 font=team_font,
-                fill=generated_text,
-                anchor="lm",
+                fill=text,
+                anchor="mm",
             )
-            for value, value_x in (
-                (row.wins, wins_x),
-                (row.kills, kills_x),
-                (row.placement_points, place_x),
-                (row.total_points, total_x),
+            for field_index, value in enumerate(
+                (
+                    row.wins,
+                    row.kills,
+                    row.placement_points,
+                    row.total_points,
+                ),
+                start=2,
             ):
-                draw.text(
-                    (value_x, text_y),
-                    str(value),
-                    font=_load_font(
-                        row_font,
-                        weight=LEADERBOARD_BODY_FONT_WEIGHT,
+                value_text, value_font = _fit_leaderboard_cell_text(
+                    value,
+                    max_width=(
+                        field_ranges[field_index][1]
+                        - field_ranges[field_index][0]
+                        - 10
                     ),
-                    fill=generated_text,
-                    anchor="rm",
+                    max_height=row_height - 8,
+                    max_size=row_font,
+                    weight=LEADERBOARD_BODY_FONT_WEIGHT,
+                )
+                draw.text(
+                    (field_centers[field_index], text_y),
+                    value_text,
+                    font=value_font,
+                    fill=text,
+                    anchor="mm",
                 )
     buffer = io.BytesIO()
     output.convert("RGB").save(buffer, format="PNG", optimize=True)

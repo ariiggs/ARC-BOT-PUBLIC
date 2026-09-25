@@ -848,23 +848,7 @@ class ScrimRepository:
                     current_config.logs_channel_id,
                     license_type,
                 )
-            if license_type != "Gold":
-                self._downgrade_horizontal_leaderboards(guild_id)
         return not was_authorized
-
-    def _downgrade_horizontal_leaderboards(self, guild_id: int) -> None:
-        for scrim in self.scrims.values():
-            if (
-                scrim.guild_id != guild_id
-                or scrim.leaderboard_orientation != "horizontal"
-            ):
-                continue
-            scrim.leaderboard_orientation = "vertical"
-            scrim.leaderboard_layout = "1_col"
-            scrim.leaderboard_accent_color = scrim.leaderboard_accent_colors.get(
-                leaderboard_profile_key("vertical", scrim.leaderboard_team_count),
-                DEFAULT_LEADERBOARD_ACCENT_COLOR,
-            )
 
     def revoke_guild(self, guild_id: int) -> bool:
         if not _positive_id(guild_id):
@@ -885,7 +869,6 @@ class ScrimRepository:
                     current_config.logs_channel_id,
                     DEFAULT_LICENSE_TYPE,
                 )
-            self._downgrade_horizontal_leaderboards(guild_id)
         return True
 
     def is_admin_authorized(self, user_id: int) -> bool:
@@ -1698,7 +1681,6 @@ class ScrimRepository:
                     "placement_points_string",
                     "leaderboard_layout",
                     "leaderboard_background",
-                    "leaderboard_accent_color",
                     "leaderboard_team_count",
                     "leaderboard_orientation",
                     "leaderboard_header_height",
@@ -1985,9 +1967,19 @@ class ScrimRepository:
             or next_footer_height not in LEADERBOARD_FOOTER_HEIGHTS
         ):
             raise ValueError("Invalid leaderboard configuration.")
+        is_gold = self.get_server_license_type(guild_id) == "Gold"
+        if (
+            not is_gold
+            and leaderboard_team_count is not _UNSET
+            and next_team_count != 20
+        ):
+            raise ValueError(
+                "Standard licenses are locked to 20 teams."
+            )
+        profile_team_count = next_team_count if is_gold else 20
         active_profile_key = leaderboard_profile_key(
             next_orientation,
-            next_team_count,
+            profile_team_count,
         )
         if leaderboard_accent_color is not _UNSET:
             if next_accent_color == DEFAULT_LEADERBOARD_ACCENT_COLOR:
@@ -1998,11 +1990,6 @@ class ScrimRepository:
             active_profile_key,
             DEFAULT_LEADERBOARD_ACCENT_COLOR,
         )
-        if (
-            next_orientation == "horizontal"
-            and self.get_server_license_type(guild_id) != "Gold"
-        ):
-            raise ValueError("Horizontal layout requires a Gold license.")
         with self.transaction():
             scrim.kill_points_value = next_kill_points
             scrim.placement_points_string = next_placement_points
