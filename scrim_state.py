@@ -674,6 +674,10 @@ def parse_placement_points(value: str) -> list[int]:
     parts = value.split()
     if not parts or any(not part.isdigit() for part in parts):
         raise ValueError("Placement points must be space-separated whole numbers.")
+    if len(parts) > MAX_SLOT_COUNT:
+        raise ValueError(
+            f"Placement points can include at most {MAX_SLOT_COUNT} ranks."
+        )
     points = [int(part) for part in parts]
     if any(point < 0 for point in points):
         raise ValueError("Placement points cannot be negative.")

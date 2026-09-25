@@ -39,6 +39,7 @@ from scrim_state import (
     LICENSE_TYPES,
     MatchScore,
     MAX_MATCHES,
+    MAX_SLOT_COUNT,
     Scrim,
     ScrimRepository,
     RegistrationRequest,
@@ -5939,7 +5940,10 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         self.rebuild()
 
     def content(self) -> str:
-        return "**Edit Leaderboard**\nChanges are saved automatically."
+        return (
+            "**Edit Leaderboard**\n"
+            "Presentation and points settings save automatically."
+        )
 
     def embed(self) -> discord.Embed:
         scrim = repository.get(self.scrim_id)
@@ -6001,6 +6005,28 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         embed.add_field(
             name="Background",
             value=background_text,
+            inline=False,
+        )
+        placement_points = parse_placement_points(
+            getattr(
+                scrim,
+                "placement_points_string",
+                DEFAULT_PLACEMENT_POINTS_STRING,
+            )
+        )
+        missing_rank_text = (
+            f"Ranks {len(placement_points) + 1}–{MAX_SLOT_COUNT} automatically "
+            "score 0."
+            if len(placement_points) < MAX_SLOT_COUNT
+            else f"All {MAX_SLOT_COUNT} ranks are configured."
+        )
+        embed.add_field(
+            name="Points System",
+            value=(
+                f"**Kills:** {scrim.kill_points_value} point(s) per kill\n"
+                f"**Placement (Rank 1 onward):** `{scrim.placement_points_string}`\n"
+                f"{missing_rank_text}"
+            ),
             inline=False,
         )
         return embed
@@ -6343,6 +6369,36 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         back_button.callback = back_callback
         self.add_item(back_button)
 
+        points_button = discord.ui.Button(
+            label="Points System",
+            emoji="🏆",
+            style=discord.ButtonStyle.primary,
+            row=2,
+        )
+
+        async def points_callback(interaction: discord.Interaction) -> None:
+            scrim = repository.get(self.scrim_id)
+            if (
+                scrim is None
+                or scrim.guild_id != self.guild_id
+                or not is_active(scrim)
+                or not member_can_configure_scrim(interaction.user, scrim)
+            ):
+                await interaction.response.send_message(
+                    "You no longer have access to this leaderboard panel.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_modal(
+                LeaderboardPointsSystemModal(
+                    panel=self,
+                    scrim=scrim,
+                    prompt_message=interaction.message,
+                )
+            )
+
+        points_button.callback = points_callback
+        self.add_item(points_button)
 
         blueprint_button = discord.ui.Button(
             label="Blueprint",
@@ -6394,6 +6450,142 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
 
         blueprint_button.callback = blueprint_callback
         self.add_item(blueprint_button)
+
+    async def save_points_system(
+        self,
+        interaction: discord.Interaction,
+        kill_points_text: str,
+        placement_points_text: str,
+        prompt_message: discord.Message | None,
+    ) -> None:
+        scrim = repository.get(self.scrim_id)
+        if (
+            interaction.user.id != self.owner_id
+            or interaction.guild_id != self.guild_id
+            or scrim is None
+            or scrim.guild_id != self.guild_id
+            or not is_active(scrim)
+            or not member_can_configure_scrim(interaction.user, scrim)
+        ):
+            await interaction.response.send_message(
+                "You no longer have access to this leaderboard panel.",
+                ephemeral=True,
+            )
+            return
+
+        kill_points_value = kill_points_text.strip()
+        if re.fullmatch(r"[0-9]+", kill_points_value) is None:
+            await interaction.response.send_message(
+                "Kill points must be a whole number of 0 or greater.",
+                ephemeral=True,
+            )
+            return
+
+        placement_points_string = " ".join(placement_points_text.split())
+        try:
+            parse_placement_points(placement_points_string)
+        except ValueError:
+            await interaction.response.send_message(
+                "Enter 1–25 nonnegative whole-number placement values separated "
+                "by spaces, starting with Rank 1. Any unlisted ranks through "
+                f"{MAX_SLOT_COUNT} automatically score 0.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            repository.update_leaderboard_settings(
+                self.scrim_id,
+                self.guild_id,
+                kill_points_value=int(kill_points_value),
+                placement_points_string=placement_points_string,
+            )
+        except (SlotStorageError, ValueError) as error:
+            await interaction.followup.send(
+                f"Could not save the points system: {error}",
+                ephemeral=True,
+            )
+            return
+
+        updated_view = LeaderboardScrimEditView(
+            owner_id=self.owner_id,
+            guild_id=self.guild_id,
+            scrim_id=self.scrim_id,
+            background_url=self.background_url,
+        )
+        if prompt_message is not None:
+            try:
+                await prompt_message.edit(
+                    content=updated_view.content(),
+                    embed=updated_view.embed(),
+                    view=updated_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                logger.exception(
+                    "Saved leaderboard points, but could not refresh panel "
+                    "for scrim %s.",
+                    self.scrim_id,
+                )
+                await interaction.followup.send(
+                    "Points system saved, but the panel could not refresh. "
+                    "Reopen `!setres` to see the saved values.",
+                    ephemeral=True,
+                )
+                return
+
+        await interaction.followup.send(
+            (
+                f"Points system saved: `{kill_points_value}` point(s) per kill; "
+                f"placement points from Rank 1: `{placement_points_string}`. "
+                f"Any unlisted ranks through {MAX_SLOT_COUNT} score 0."
+            ),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class LeaderboardPointsSystemModal(discord.ui.Modal):
+    """Edit kill and placement points for a selected scrim."""
+
+    def __init__(
+        self,
+        *,
+        panel: LeaderboardScrimEditView,
+        scrim: Scrim,
+        prompt_message: discord.Message | None,
+    ) -> None:
+        super().__init__(title="Leaderboard Points System")
+        self.panel = panel
+        self.prompt_message = prompt_message
+        self.kill_points = discord.ui.TextInput(
+            label="Kill points per kill",
+            placeholder="1",
+            default=str(scrim.kill_points_value),
+            min_length=1,
+            max_length=15,
+            required=True,
+            style=discord.TextStyle.short,
+        )
+        self.placement_points = discord.ui.TextInput(
+            label="Placement points (Rank 1 onward)",
+            placeholder="10 6 5 4 3 2 1",
+            default=scrim.placement_points_string,
+            max_length=200,
+            required=True,
+            style=discord.TextStyle.paragraph,
+        )
+        self.add_item(self.kill_points)
+        self.add_item(self.placement_points)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.panel.save_points_system(
+            interaction,
+            self.kill_points.value,
+            self.placement_points.value,
+            self.prompt_message,
+        )
 
 
 class LeaderboardAccentColorView(LeaderboardPanelView):
@@ -8469,8 +8661,10 @@ def calculate_leaderboard(scrim: Scrim) -> list[LeaderboardRow]:
         for slot in scrim.slots.values()
         if slot.status != STATUS_AVAILABLE and slot.team_name
     ]
-    if len(placement_points) < len(registered_slots):
-        placement_points.extend([0] * (len(registered_slots) - len(placement_points)))
+    if len(placement_points) < MAX_SLOT_COUNT:
+        placement_points.extend(
+            [0] * (MAX_SLOT_COUNT - len(placement_points))
+        )
     scores = getattr(scrim, "match_scores", {})
     rows: list[LeaderboardRow] = []
     for slot in registered_slots:
