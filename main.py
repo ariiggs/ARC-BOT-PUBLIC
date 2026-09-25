@@ -4637,7 +4637,6 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
             label="Text Color",
             emoji="🎨",
             style=discord.ButtonStyle.primary,
-            disabled=not has_custom_background,
             row=1,
         )
 
@@ -4932,15 +4931,6 @@ class LeaderboardAccentColorView(LeaderboardPanelView):
         ):
             await interaction.response.send_message(
                 "You no longer have access to this leaderboard panel.",
-                ephemeral=True,
-            )
-            return
-        if not _leaderboard_background_path(
-            scrim.id,
-            *_leaderboard_scrim_profile(scrim),
-        ).is_file():
-            await interaction.response.send_message(
-                "Upload a custom background before changing generated text color.",
                 ephemeral=True,
             )
             return
@@ -6864,9 +6854,7 @@ def _build_configured_leaderboard_image(
     )
     margin = LEADERBOARD_OUTER_MARGIN
     text = _leaderboard_accent_rgb(
-        DEFAULT_LEADERBOARD_ACCENT_COLOR
-        if background_path == LEADERBOARD_BACKGROUND
-        else _leaderboard_profile_accent_color(scrim)
+        _leaderboard_profile_accent_color(scrim)
     )
 
     table_top = margin + header_height + LEADERBOARD_SECTION_GAP
