@@ -91,7 +91,7 @@ LEADERBOARD_TEAM_NAME_LEFT_PADDING = 12
 LEADERBOARD_HORIZONTAL_FIELD_BASE_WIDTHS = (80, 368, 116, 117, 112, 118)
 LEADERBOARD_HORIZONTAL_FIELD_REFERENCE_WIDTH = 920
 LEADERBOARD_HORIZONTAL_TEAM_NAME_LEFT_PADDING = 24
-LEADERBOARD_HORIZONTAL_ROW_TEXT_VERTICAL_OFFSET = 10
+LEADERBOARD_ROW_TEXT_VERTICAL_OFFSET = 10
 LEADERBOARD_HORIZONTAL_RANK_CELL_CENTER_OFFSETS = (1, 3)
 STANDARD_LEADERBOARD_TEAM_COUNT = 20
 LEADERBOARD_FIELD_BASE_WIDTHS = (48, 500, 120, 120, 120, 116)
@@ -8880,8 +8880,7 @@ def _build_configured_leaderboard_image(
         for row_index in range(per_column_capacity):
             y = row_top + row_index * row_height
             text_y = y + row_height // 2
-            if columns == 2:
-                text_y -= LEADERBOARD_HORIZONTAL_ROW_TEXT_VERTICAL_OFFSET
+            text_y -= LEADERBOARD_ROW_TEXT_VERTICAL_OFFSET
             rank = column_index * per_column_capacity + row_index + 1
             rank_text, rank_font = _fit_leaderboard_cell_text(
                 str(rank),

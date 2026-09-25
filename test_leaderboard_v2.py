@@ -46,7 +46,7 @@ from main import (
     LEADERBOARD_TABLE_HEADER_HEIGHT,
     LEADERBOARD_TITLE_MAX_FONT_SIZE,
     LEADERBOARD_HORIZONTAL_RANK_CELL_CENTER_OFFSETS,
-    LEADERBOARD_HORIZONTAL_ROW_TEXT_VERTICAL_OFFSET,
+    LEADERBOARD_ROW_TEXT_VERTICAL_OFFSET,
     LEADERBOARD_HORIZONTAL_TEAM_NAME_LEFT_PADDING,
     LEADERBOARD_TEAM_NAME_LEFT_PADDING,
     HEX_COLOR_GENERATOR_URL,
@@ -2551,10 +2551,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                             + row_index * row_height
                             + row_height // 2
                         )
-                        if columns == 2:
-                            expected_y -= (
-                                LEADERBOARD_HORIZONTAL_ROW_TEXT_VERTICAL_OFFSET
-                            )
+                        expected_y -= LEADERBOARD_ROW_TEXT_VERTICAL_OFFSET
                         self.assertEqual(xy[1], expected_y)
                         column = (
                             0
@@ -2655,6 +2652,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     horizontal=columns == 2,
                 )
                 centers = [(start + end) / 2 for start, end in ranges]
+                expected_text_y = 302 if orientation == "vertical" else 312
 
                 for text, field_index, expected_anchor, expected_x in (
                     (
@@ -2678,7 +2676,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                             call for call in text_calls if call[0] == text
                         )
                         self.assertEqual(call[1][0], expected_x)
-                        self.assertEqual(call[1][1], 312)
+                        self.assertEqual(call[1][1], expected_text_y)
                         self.assertEqual(call[2], expected_anchor)
                         self.assertEqual(
                             call[3].size,
@@ -2753,7 +2751,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                         + (rank_bbox[0] + rank_bbox[2]) / 2,
                         centers[0],
                     )
-                    self.assertEqual(rank_call[1][1], 312)
+                    self.assertEqual(rank_call[1][1], 302)
                     self.assertEqual(rank_call[2], "mm")
 
     def test_long_team_name_shrinks_and_stays_inside_its_field(self):
@@ -2870,7 +2868,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             horizontal_heights,
         )
 
-    def test_first_slot_row_starts_at_same_height_in_both_orientations(self):
+    def test_first_slot_row_positions_reflect_orientation_text_offsets(self):
         team_positions = {"vertical": {}, "horizontal": {}}
         original_text = ImageDraw.ImageDraw.text
 
@@ -2909,7 +2907,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     leaderboard_canvas_dimensions(16, orientation),
                 )
 
-        self.assertEqual(team_positions["vertical"]["Team 01"], 312)
+        self.assertEqual(team_positions["vertical"]["Team 01"], 302)
         self.assertEqual(team_positions["horizontal"]["Team 01"], 312)
         self.assertEqual(team_positions["horizontal"]["Team 09"], 312)
 
