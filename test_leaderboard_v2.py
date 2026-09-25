@@ -18,15 +18,25 @@ from main import (
     LeaderboardScrimEditView,
     LeaderboardSettingsView,
     LeaderboardTeamCountView,
+    MatchScoreCorrectionModal,
+    MatchScoreCorrectionReviewView,
+    MatchScoreCorrectionView,
+    MatchScoreSubmissionEditModal,
+    MatchScoreSubmissionReviewView,
     OperationalMessageView,
     ResultsMessageModal,
     _current_leaderboard_background_path,
+    _ensure_leaderboard_background_preview,
+    _leaderboard_scrim_profile,
+    _fit_leaderboard_cell_text,
     _build_empty_leaderboard_blueprint,
+    _leaderboard_field_ranges,
     _load_leaderboard_background_canvas,
     _load_dimensioned_leaderboard_blueprint,
     _restore_default_leaderboard_background,
     _read_leaderboard_background_metadata,
     _record_match_scores,
+    normalize_score_submission_text,
     _store_leaderboard_background,
     _write_leaderboard_background_metadata,
     LEADERBOARD_BACKGROUND,
@@ -34,8 +44,10 @@ from main import (
     LEADERBOARD_OUTER_MARGIN,
     LEADERBOARD_SECTION_GAP,
     LEADERBOARD_TABLE_HEADER_HEIGHT,
+    LEADERBOARD_TITLE_MAX_FONT_SIZE,
     HEX_COLOR_GENERATOR_URL,
-    LEADERBOARD_ROW_HEIGHT,
+    LEADERBOARD_VERTICAL_ROW_HEIGHT,
+    LEADERBOARD_HORIZONTAL_ROW_HEIGHT,
     _load_font,
     bot,
     build_leaderboard_image,
@@ -73,7 +85,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 font = _load_font(24, weight=weight)
                 self.assertEqual(font.getname(), ("Montserrat", expected_style))
 
-    def test_leaderboard_teams_and_scores_use_regular_weight(self):
+    def test_leaderboard_rows_use_bold_weight(self):
         scrim = self.make_scrim()
         with patch("main._load_font", wraps=_load_font) as font_loader:
             build_leaderboard_image(
@@ -86,7 +98,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             for call in font_loader.call_args_list
         }
         self.assertIn(400, used_weights)
-        self.assertNotIn(700, used_weights)
+        self.assertIn(700, used_weights)
         self.assertNotIn(800, used_weights)
 
     def make_scrim(self):
@@ -148,6 +160,23 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_registered_teams_without_results_remain_zero_score_rows(self):
+        scrim = self.make_scrim()
+        scrim.match_scores = {
+            (1, 1): MatchScore(1, 1, 4, 1),
+        }
+
+        rows = calculate_leaderboard(scrim)
+
+        self.assertEqual(
+            rows,
+            [
+                LeaderboardRow(1, "Alpha", 1, 4, 10, 14),
+                LeaderboardRow(2, "Bravo", 0, 0, 0, 0),
+                LeaderboardRow(3, "Charlie", 0, 0, 0, 0),
+            ],
+        )
+
     def test_results_publication_formats_approved_tokens_and_missing_ranks(self):
         scrim = self.make_scrim()
         scrim.operational_messages = {
@@ -198,16 +227,32 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
         scrim.match_scores[(1, 17)] = MatchScore(1, 17, 100, 1)
         scrim.leaderboard_team_count = 16
 
-        rows = calculate_leaderboard(scrim)
+        with patch("main.repository.get_server_license_type", return_value="Gold"):
+            rows = calculate_leaderboard(scrim)
 
         self.assertEqual(len(scrim.slots), 17)
         self.assertEqual(len(rows), 16)
         self.assertEqual(rows[0].slot_number, 17)
         self.assertNotIn(16, [row.slot_number for row in rows])
 
-    def test_invalid_score_lines_are_ignored(self):
+    def test_ordered_score_lines_assign_placement_from_rank_order(self):
         scores = parse_match_score_lines(
-            "1 5 2\nbad\n2 -1 1\n2 3 0\n3 4 3\n3 5 2",
+            "3 5\n\n1 4",
+            match_number=1,
+            scrim=self.make_scrim(),
+        )
+
+        self.assertEqual(
+            scores,
+            [
+                MatchScore(1, 3, 5, 1),
+                MatchScore(1, 1, 4, 2),
+            ],
+        )
+
+    def test_legacy_explicit_placement_format_remains_supported(self):
+        scores = parse_match_score_lines(
+            "1 5 2\n3 4 3",
             match_number=1,
             scrim=self.make_scrim(),
         )
@@ -220,6 +265,22 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_malformed_score_lines_reject_the_entire_submission(self):
+        invalid_inputs = (
+            "3 5\nbad",
+            "3 5\n1 -1",
+            "3 5\n3 4",
+            "3 5\n1 4 2",
+        )
+        for input_string in invalid_inputs:
+            with self.subTest(input_string=input_string):
+                with self.assertRaises(ValueError):
+                    parse_match_score_lines(
+                        input_string,
+                        match_number=1,
+                        scrim=self.make_scrim(),
+                    )
+
     def test_repository_upsert_replaces_same_match_and_slot(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = ScrimRepository(
@@ -231,22 +292,26 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 1001,
                 1002,
                 slot_start=1,
-                slot_end=1,
+                slot_end=2,
             )
             with repository.transaction():
-                scrim.slots[1] = Slot(
-                    1,
-                    status=STATUS_CONFIRMED,
-                    team_name="Alpha",
-                    tag="A",
-                    manager_id=101,
-                    captain_1_id=101,
-                )
+                for number, name in ((1, "Alpha"), (2, "Bravo")):
+                    scrim.slots[number] = Slot(
+                        number,
+                        status=STATUS_CONFIRMED,
+                        team_name=name,
+                        tag=name[0],
+                        manager_id=100 + number,
+                        captain_1_id=100 + number,
+                    )
             repository.upsert_match_scores(
                 scrim.id,
                 123,
                 1,
-                [MatchScore(1, 1, 4, 2)],
+                [
+                    MatchScore(1, 1, 4, 2),
+                    MatchScore(1, 2, 0, 3),
+                ],
             )
             repository.upsert_match_scores(
                 scrim.id,
@@ -257,7 +322,64 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 repository.get_match_scores(scrim.id),
-                [MatchScore(1, 1, 7, 1)],
+                [
+                    MatchScore(1, 1, 7, 1),
+                    MatchScore(1, 2, 0, 3),
+                ],
+            )
+
+    def test_replacing_match_results_clears_omitted_slots_only_for_that_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScrimRepository(
+                SlotStateStore(Path(directory) / "state.sqlite3")
+            )
+            scrim = repository.create(
+                123,
+                "Scores",
+                1001,
+                1002,
+                slot_start=1,
+                slot_end=2,
+            )
+            with repository.transaction():
+                for number, name in ((1, "Alpha"), (2, "Bravo")):
+                    scrim.slots[number] = Slot(
+                        number,
+                        status=STATUS_CONFIRMED,
+                        team_name=name,
+                        tag=name[0],
+                        manager_id=100 + number,
+                        captain_1_id=100 + number,
+                    )
+            repository.upsert_match_scores(
+                scrim.id,
+                123,
+                1,
+                [
+                    MatchScore(1, 1, 4, 2),
+                    MatchScore(1, 2, 3, 1),
+                ],
+            )
+            repository.upsert_match_scores(
+                scrim.id,
+                123,
+                2,
+                [MatchScore(2, 2, 1, 2)],
+            )
+
+            repository.replace_match_scores(
+                scrim.id,
+                123,
+                1,
+                [MatchScore(1, 1, 8, 1)],
+            )
+
+            self.assertEqual(
+                repository.get_match_scores(scrim.id),
+                [
+                    MatchScore(1, 1, 8, 1),
+                    MatchScore(2, 2, 1, 2),
+                ],
             )
 
     def test_leaderboard_settings_keep_fixed_header_and_footer_dimensions(self):
@@ -266,6 +388,13 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             repository = ScrimRepository(store)
             scrim = repository.create(123, "Display Settings", 1001, 1002)
 
+            repository.save_server_config(
+                123,
+                head_staff_role_id=2001,
+                staff_role_id=2002,
+                logs_channel_id=2003,
+                license_type="Gold",
+            )
             repository.update_leaderboard_settings(
                 scrim.id,
                 123,
@@ -300,6 +429,91 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
             )
             self.assertEqual(settings.leaderboard_accent_color, "#FFD700")
+
+    def test_standard_license_locks_team_count_but_allows_both_orientations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScrimRepository(
+                SlotStateStore(Path(directory) / "state.sqlite3")
+            )
+            scrim = repository.create(123, "Standard Layout", 1001, 1002)
+
+            with self.assertRaisesRegex(ValueError, "locked to 20"):
+                repository.update_leaderboard_settings(
+                    scrim.id,
+                    123,
+                    leaderboard_team_count=18,
+                )
+
+            repository.update_leaderboard_settings(
+                scrim.id,
+                123,
+                leaderboard_team_count=20,
+                leaderboard_orientation="horizontal",
+            )
+            self.assertEqual(scrim.leaderboard_team_count, 20)
+            self.assertEqual(scrim.leaderboard_orientation, "horizontal")
+
+            with self.assertRaisesRegex(ValueError, "locked to 20"):
+                repository.update_leaderboard_settings(
+                    scrim.id,
+                    123,
+                    leaderboard_team_count=24,
+                )
+
+            with patch.object(
+                repository,
+                "get_server_license_type",
+                return_value="Gold",
+            ):
+                repository.update_leaderboard_settings(
+                    scrim.id,
+                    123,
+                    leaderboard_team_count=24,
+                )
+            self.assertEqual(scrim.leaderboard_team_count, 24)
+
+    def test_standard_license_transitions_preserve_horizontal_orientation(self):
+        for transition in ("license_change", "revocation"):
+            with self.subTest(transition=transition):
+                with tempfile.TemporaryDirectory() as directory:
+                    repository = ScrimRepository(
+                        SlotStateStore(Path(directory) / "state.sqlite3")
+                    )
+                    scrim = repository.create(
+                        123,
+                        "Horizontal Transition",
+                        1001,
+                        1002,
+                    )
+                    repository.authorize_guild(123, license_type="Gold")
+                    repository.update_leaderboard_settings(
+                        scrim.id,
+                        123,
+                        leaderboard_team_count=24,
+                        leaderboard_orientation="horizontal",
+                    )
+
+                    if transition == "license_change":
+                        repository.authorize_guild(
+                            123,
+                            license_type="Standard",
+                        )
+                    else:
+                        repository.revoke_guild(123)
+
+                    self.assertEqual(
+                        repository.get_server_license_type(123),
+                        "Standard",
+                    )
+                    self.assertEqual(
+                        scrim.leaderboard_orientation,
+                        "horizontal",
+                    )
+                    with patch("main.repository", repository):
+                        self.assertEqual(
+                            _leaderboard_scrim_profile(scrim),
+                            ("horizontal", 20),
+                        )
 
     def test_v30_snapshot_migration_resets_custom_header_and_footer_heights(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -386,7 +600,64 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(opened_view, LeaderboardScrimEditView)
             self.assertEqual(opened_view.scrim_id, selected_scrim.id)
             self.assertEqual(opened_view.children[3].label, "Text Color")
-            self.assertTrue(opened_view.children[3].disabled)
+            self.assertFalse(opened_view.children[3].disabled)
+
+    async def test_setres_edit_button_opens_without_a_bundled_default_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScrimRepository(
+                SlotStateStore(Path(directory) / "state.sqlite3")
+            )
+            scrim = repository.create(123, "Default Background Scrim", 1001, 1002)
+            missing_default = Path(directory) / "missing-default.png"
+            channel = SimpleNamespace(send=AsyncMock())
+            with (
+                patch("main.repository", repository),
+                patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", Path(directory)),
+                patch("main.LEADERBOARD_BACKGROUND", missing_default),
+                patch("main.member_can_configure_scrim", return_value=True),
+            ):
+                view = LeaderboardSettingsView(
+                    owner_id=456,
+                    guild_id=123,
+                    scrims=[scrim],
+                )
+                interaction = SimpleNamespace(
+                    user=SimpleNamespace(id=456),
+                    channel=channel,
+                    response=SimpleNamespace(defer=AsyncMock()),
+                    edit_original_response=AsyncMock(),
+                )
+                await view.children[0].callback(interaction)
+
+            interaction.response.defer.assert_awaited_once()
+            interaction.edit_original_response.assert_awaited_once()
+            channel.send.assert_not_awaited()
+            opened_view = (
+                interaction.edit_original_response.await_args.kwargs["view"]
+            )
+            self.assertIsInstance(opened_view, LeaderboardScrimEditView)
+            self.assertEqual(opened_view.scrim_id, scrim.id)
+
+    async def test_default_background_preview_skips_missing_generated_asset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScrimRepository(
+                SlotStateStore(Path(directory) / "state.sqlite3")
+            )
+            scrim = repository.create(123, "No Default Image", 1001, 1002)
+            missing_default = Path(directory) / "missing-default.png"
+            channel = SimpleNamespace(send=AsyncMock())
+            with (
+                patch("main.repository", repository),
+                patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", Path(directory)),
+                patch("main.LEADERBOARD_BACKGROUND", missing_default),
+            ):
+                preview_url = await _ensure_leaderboard_background_preview(
+                    scrim,
+                    channel,
+                )
+
+            self.assertEqual(preview_url, "")
+            channel.send.assert_not_awaited()
 
     async def test_custom_hex_opens_modal_and_validates_before_saving(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -395,7 +666,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             )
             scrim = repository.create(123, "HEX Scrim", 1001, 1002)
             background_dir = Path(directory)
-            (background_dir / f"{scrim.id}-vertical-24.png").write_bytes(
+            (background_dir / f"{scrim.id}-vertical-20.png").write_bytes(
                 b"custom background"
             )
             with (
@@ -467,6 +738,78 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             prompt_message.edit.assert_awaited_once()
             followup.send.assert_awaited_once()
 
+    async def test_standard_text_color_is_editable_and_used_without_custom_background(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScrimRepository(
+                SlotStateStore(Path(directory) / "state.sqlite3")
+            )
+            scrim = repository.create(123, "Standard Text Color", 1001, 1002)
+            background_dir = Path(directory) / "backgrounds"
+            background_dir.mkdir()
+            text_fills = []
+            original_text = ImageDraw.ImageDraw.text
+
+            def record_text(drawer, xy, text, *args, **kwargs):
+                text_fills.append(kwargs.get("fill"))
+                return original_text(drawer, xy, text, *args, **kwargs)
+
+            with (
+                patch("main.repository", repository),
+                patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", background_dir),
+                patch("main.member_can_configure_scrim", return_value=True),
+                patch("main.is_active", return_value=True),
+            ):
+                edit_view = LeaderboardScrimEditView(
+                    owner_id=456,
+                    guild_id=123,
+                    scrim_id=scrim.id,
+                    background_url="",
+                )
+                self.assertFalse(edit_view.children[3].disabled)
+
+                color_view = LeaderboardAccentColorView(
+                    owner_id=456,
+                    guild_id=123,
+                    scrim_id=scrim.id,
+                    background_url="",
+                )
+                response = SimpleNamespace(
+                    edit_message=AsyncMock(),
+                    send_message=AsyncMock(),
+                )
+                interaction = SimpleNamespace(
+                    user=SimpleNamespace(id=456),
+                    guild_id=123,
+                    response=response,
+                )
+                await color_view.save_color(interaction, "#12ABCD")
+
+                self.assertEqual(
+                    repository.get(scrim.id).leaderboard_accent_colors[
+                        "vertical:20"
+                    ],
+                    "#12ABCD",
+                )
+                with patch.object(
+                    ImageDraw.ImageDraw,
+                    "text",
+                    new=record_text,
+                ):
+                    rendered = build_leaderboard_image(
+                        scrim,
+                        [LeaderboardRow(1, "Alpha", 1, 2, 16, 18)],
+                    )
+
+            self.assertIn(
+                _leaderboard_accent_rgb("#12ABCD"),
+                text_fills,
+            )
+            with Image.open(rendered) as image:
+                self.assertEqual(
+                    image.size,
+                    leaderboard_canvas_dimensions(20, "vertical"),
+                )
+
     def test_setres_uses_dashboard_and_leaderboard_submenus(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = ScrimRepository(
@@ -497,6 +840,12 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     return_value="Gold",
                 ):
                     gold_edit_view = LeaderboardScrimEditView(
+                        owner_id=456,
+                        guild_id=123,
+                        scrim_id=scrim.id,
+                        background_url="https://cdn.discordapp.com/background.png",
+                    )
+                    gold_team_view = LeaderboardTeamCountView(
                         owner_id=456,
                         guild_id=123,
                         scrim_id=scrim.id,
@@ -547,7 +896,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [child.label for child in edit_view.children],
                 [
-                    "Teams to Display",
+                    "Teams to Display · Gold",
                     "Background",
                     "Orientation",
                     "Text Color",
@@ -556,25 +905,28 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     "Blueprint",
                 ],
             )
+            self.assertTrue(edit_view.children[0].disabled)
+            self.assertFalse(gold_edit_view.children[0].disabled)
             self.assertTrue(edit_view.children[4].disabled)
             self.assertFalse(edit_view.children[6].disabled)
-            self.assertTrue(edit_view.children[2].disabled)
+            self.assertFalse(edit_view.children[2].disabled)
             self.assertFalse(gold_edit_view.children[2].disabled)
             fields = {field.name: field.value for field in edit_fields}
-            self.assertEqual(fields["Teams to Display"], "24")
+            self.assertEqual(fields["Teams to Display"], "20")
             self.assertEqual(fields["Text Color"], "White (`#FFFFFF`)")
             self.assertIn("Built-in default", fields["Background"])
             self.assertIn(
                 "Choose 16, 18, 20, 22, or 24 teams",
-                team_view.children[0].placeholder,
+                gold_team_view.children[0].placeholder,
             )
+            self.assertEqual(team_view.children[0].label, "Locked to 20 Teams")
             self.assertEqual(
-                [option.label for option in team_view.children[0].options],
+                [option.label for option in gold_team_view.children[0].options],
                 ["16 teams", "18 teams", "20 teams", "22 teams", "24 teams"],
             )
             self.assertEqual(
                 [option.label for option in standard_orientation_view.children[0].options],
-                ["Vertical"],
+                ["Vertical", "Horizontal"],
             )
             self.assertEqual(
                 [option.label for option in gold_orientation_view.children[0].options],
@@ -612,6 +964,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
     def test_uploaded_background_is_used_for_rendered_leaderboard(self):
         scrim = self.make_scrim()
+        scrim.leaderboard_team_count = 20
         with tempfile.TemporaryDirectory() as directory:
             background_dir = Path(directory)
             Image.new("RGB", (128, 128), (240, 20, 20)).save(
@@ -633,6 +986,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_background_upload_is_saved_and_rehosted_for_a_stable_link(self):
         scrim = self.make_scrim()
+        scrim.leaderboard_team_count = 20
         payload = io.BytesIO()
         dimensions = leaderboard_canvas_dimensions(
             scrim.leaderboard_team_count,
@@ -674,7 +1028,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 (
                     background_dir
-                    / f"{scrim.id}-vertical-24.png"
+                    / f"{scrim.id}-vertical-20.png"
                 ).is_file()
             )
             self.assertEqual(
@@ -685,6 +1039,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_background_upload_requires_exif_normalized_profile_dimensions(self):
         scrim = self.make_scrim()
+        scrim.leaderboard_team_count = 20
         payload = io.BytesIO()
         exif = Image.Exif()
         exif[274] = 6
@@ -724,7 +1079,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 blueprint.size,
                 leaderboard_canvas_dimensions(
-                    scrim.leaderboard_team_count,
+                    20,
                     scrim.leaderboard_orientation,
                     getattr(scrim, "leaderboard_header_height", DEFAULT_LEADERBOARD_HEADER_HEIGHT),
                     getattr(scrim, "leaderboard_footer_height", DEFAULT_LEADERBOARD_FOOTER_HEIGHT),
@@ -732,7 +1087,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(blueprint.getpixel((0, 0)), (13, 18, 26))
         self.assertIn(
-            f"{scrim.leaderboard_team_count}-{scrim.leaderboard_orientation}",
+            f"20-{scrim.leaderboard_orientation}",
             filename,
         )
         offer = LeaderboardBlueprintOfferView(
@@ -745,11 +1100,15 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             ["Yes, send both blueprints", "No"],
         )
 
-    def test_dimensioned_vertical_16_blueprint_is_the_approved_asset(self):
+    def test_dimensioned_vertical_16_blueprint_matches_updated_profile(self):
         scrim = self.make_scrim()
         scrim.leaderboard_team_count = 16
         scrim.leaderboard_orientation = "vertical"
-        buffer, filename = _load_dimensioned_leaderboard_blueprint(scrim)
+        with patch(
+            "main.repository.get_server_license_type",
+            return_value="Gold",
+        ):
+            buffer, filename = _load_dimensioned_leaderboard_blueprint(scrim)
         self.assertEqual(
             filename,
             "leaderboard-blueprint-vertical-16-dimensions.png",
@@ -762,7 +1121,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             ).read_bytes(),
         )
         with Image.open(buffer) as reference:
-            self.assertEqual(reference.size, (1080, 1232))
+            self.assertEqual(reference.size, (1080, 1400))
 
     def test_dimensioned_blueprints_exist_for_every_profile(self):
         for orientation in ("vertical", "horizontal"):
@@ -771,9 +1130,13 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     scrim = self.make_scrim()
                     scrim.leaderboard_orientation = orientation
                     scrim.leaderboard_team_count = team_count
-                    buffer, filename = _load_dimensioned_leaderboard_blueprint(
-                        scrim
-                    )
+                    with patch(
+                        "main.repository.get_server_license_type",
+                        return_value="Gold",
+                    ):
+                        buffer, filename = _load_dimensioned_leaderboard_blueprint(
+                            scrim
+                        )
                     self.assertEqual(
                         filename,
                         f"leaderboard-blueprint-{orientation}-{team_count}-dimensions.png",
@@ -802,15 +1165,15 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
         sent = interaction.response.send_message.await_args
         self.assertIn(
-            "dimensioned 24-team Vertical reference (1080 × 1616 px)",
+            "dimensioned 20-team Vertical reference (1080 × 1640 px)",
             sent.args[0],
         )
         self.assertIn("not an upload background", sent.args[0])
         self.assertEqual(
             [attachment.filename for attachment in sent.kwargs["files"]],
             [
-                "leaderboard-blueprint-24-vertical-1080x1616.png",
-                "leaderboard-blueprint-vertical-24-dimensions.png",
+                "leaderboard-blueprint-20-vertical-1080x1640.png",
+                "leaderboard-blueprint-vertical-20-dimensions.png",
             ],
         )
 
@@ -845,13 +1208,13 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
         sent = interaction.response.send_message.await_args
         self.assertIn(
-            "dimensioned 24-team Vertical reference (1080 × 1616 px)",
+            "dimensioned 24-team Vertical reference (1080 × 1880 px)",
             sent.args[0],
         )
         self.assertEqual(
             [attachment.filename for attachment in sent.kwargs["files"]],
             [
-                "leaderboard-blueprint-24-vertical-1080x1616.png",
+                "leaderboard-blueprint-24-vertical-1080x1880.png",
                 "leaderboard-blueprint-vertical-24-dimensions.png",
             ],
         )
@@ -862,6 +1225,13 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 SlotStateStore(Path(directory) / "state.sqlite3")
             )
             scrim = repository.create(123, "Profile Colors", 1001, 1002)
+            repository.save_server_config(
+                123,
+                head_staff_role_id=2001,
+                staff_role_id=2002,
+                logs_channel_id=2003,
+                license_type="Gold",
+            )
             repository.update_leaderboard_settings(
                 scrim.id,
                 123,
@@ -1000,7 +1370,13 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             background_dir = Path(directory)
             channel = PreviewChannel()
-            with patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", background_dir):
+            with (
+                patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", background_dir),
+                patch(
+                    "main.repository.get_server_license_type",
+                    return_value="Gold",
+                ),
+            ):
                 vertical_16_url = await _store_leaderboard_background(
                     scrim,
                     channel,
@@ -1059,6 +1435,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
     def test_legacy_background_and_preview_migrate_only_to_active_profile(self):
         scrim = self.make_scrim()
+        scrim.leaderboard_team_count = 20
         with tempfile.TemporaryDirectory() as directory:
             background_dir = Path(directory)
             legacy_image = background_dir / f"{scrim.id}.png"
@@ -1073,11 +1450,11 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 migrated_metadata = _read_leaderboard_background_metadata(
                     scrim.id,
                     "vertical",
-                    24,
+                    20,
                 )
                 other_profile_path = background_dir / f"{scrim.id}-vertical-18.png"
 
-            self.assertEqual(current_path, background_dir / f"{scrim.id}-vertical-24.png")
+            self.assertEqual(current_path, background_dir / f"{scrim.id}-vertical-20.png")
             self.assertEqual(current_path.read_bytes(), b"legacy custom background")
             self.assertEqual(migrated_metadata["attachment_url"], legacy_url)
             self.assertFalse(legacy_image.exists())
@@ -1088,7 +1465,10 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
         scrim = self.make_scrim()
         with tempfile.TemporaryDirectory() as directory:
             background_dir = Path(directory)
-            with patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", background_dir):
+            with (
+                patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", background_dir),
+                patch("main.repository.get", return_value=scrim),
+            ):
                 default_view = LeaderboardScrimEditView(
                     owner_id=456,
                     guild_id=123,
@@ -1098,7 +1478,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(default_view.children[4].disabled)
 
                 (
-                    background_dir / f"{scrim.id}-vertical-24.png"
+                    background_dir / f"{scrim.id}-vertical-20.png"
                 ).write_bytes(b"custom")
                 custom_view = LeaderboardScrimEditView(
                     owner_id=456,
@@ -1110,9 +1490,10 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_restore_default_removes_custom_image_and_replaces_preview(self):
         scrim = self.make_scrim()
+        scrim.leaderboard_team_count = 20
         with tempfile.TemporaryDirectory() as directory:
             background_dir = Path(directory)
-            custom_path = background_dir / f"{scrim.id}-vertical-24.png"
+            custom_path = background_dir / f"{scrim.id}-vertical-20.png"
             custom_path.write_bytes(b"custom background")
             old_message = SimpleNamespace(deleted=False)
 
@@ -1175,7 +1556,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(background_url, "https://cdn.discordapp.com/default-background.png")
             self.assertEqual(
                 channel.filename,
-                f"leaderboard-background-{scrim.id}-vertical-24.png",
+                f"leaderboard-background-{scrim.id}-vertical-20.png",
             )
             self.assertFalse(custom_path.exists())
             self.assertEqual(current_path, LEADERBOARD_BACKGROUND)
@@ -1256,20 +1637,207 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(restored.payload()["version"], 31)
 
-    async def test_score_command_reports_processed_teams(self):
+    async def test_score_command_requires_confirmation_before_replacing_match(self):
         scrim = self.make_scrim()
-        ctx = SimpleNamespace()
+        progress_message = SimpleNamespace(edit=AsyncMock())
+        ctx = SimpleNamespace(
+            author=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=123),
+            channel=SimpleNamespace(id=456),
+            send=AsyncMock(return_value=progress_message),
+        )
 
         with (
             patch("main.require_staff_scrim", new=AsyncMock(return_value=scrim)),
-            patch("main.repository.upsert_match_scores", return_value=2) as upsert,
-            patch("main.send_private_command_feedback", new=AsyncMock()) as feedback,
+            patch(
+                "main.repository.replace_match_scores",
+                return_value=2,
+            ) as replace,
+            patch("main.delete_command_message", new=AsyncMock()),
         ):
-            await _record_match_scores(ctx, 4, "1 5 2\n2 3 1")
+            await _record_match_scores(ctx, 4, "1 5\n3 3")
 
-        upsert.assert_called_once()
-        self.assertEqual(upsert.call_args.args[:3], (scrim.id, scrim.guild_id, 4))
-        self.assertIn("Processed 2 teams.", feedback.call_args.args[1])
+        replace.assert_not_called()
+        review = progress_message.edit.call_args.kwargs["view"]
+        self.assertIsInstance(review, MatchScoreSubmissionReviewView)
+        self.assertEqual(
+            progress_message.edit.call_args.kwargs["embed"].title,
+            "Review Match 4 results",
+        )
+        self.assertIn("01.** Slot 01 · Alpha", review.embed().description)
+        self.assertIn("02.** Slot 03 · Charlie", review.embed().description)
+        self.assertIn("**5** kills", review.embed().description)
+        self.assertEqual(
+            [button.label for button in review.children],
+            ["Confirm", "Edit", "Cancel"],
+        )
+
+        confirm_button = next(
+            button for button in review.children if button.label == "Confirm"
+        )
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=123),
+            channel_id=456,
+            response=SimpleNamespace(
+                edit_message=AsyncMock(),
+                send_message=AsyncMock(),
+            ),
+        )
+        with (
+            patch("main.repository.get", return_value=scrim),
+            patch("main.is_active", return_value=True),
+            patch("main.member_is_staff", return_value=True),
+            patch("main.repository.replace_match_scores", return_value=2) as replace,
+        ):
+            await confirm_button.callback(interaction)
+
+        replace.assert_called_once_with(
+            scrim.id,
+            scrim.guild_id,
+            4,
+            [MatchScore(4, 1, 5, 1), MatchScore(4, 3, 3, 2)],
+        )
+        self.assertIn(
+            "Processed 2 teams.",
+            interaction.response.edit_message.call_args.kwargs["content"],
+        )
+
+    async def test_score_command_does_not_save_when_any_line_is_invalid(self):
+        scrim = self.make_scrim()
+        progress_message = SimpleNamespace(edit=AsyncMock())
+        ctx = SimpleNamespace(send=AsyncMock(return_value=progress_message))
+
+        with (
+            patch("main.require_staff_scrim", new=AsyncMock(return_value=scrim)),
+            patch("main.repository.replace_match_scores") as replace,
+            patch("main.delete_command_message", new=AsyncMock()),
+        ):
+            await _record_match_scores(ctx, 1, "1 5\nbad")
+
+        replace.assert_not_called()
+        self.assertIn(
+            "Nothing was saved.",
+            progress_message.edit.call_args.kwargs["content"],
+        )
+
+    async def test_score_review_edit_opens_full_command_and_repreviews_changes(self):
+        scrim = self.make_scrim()
+        review = MatchScoreSubmissionReviewView(
+            owner_id=7,
+            guild_id=123,
+            channel_id=456,
+            scrim=scrim,
+            match_number=4,
+            scores=[MatchScore(4, 1, 5, 1)],
+            raw_input="1 5",
+        )
+        review.message = SimpleNamespace(edit=AsyncMock())
+        edit_button = next(
+            button for button in review.children if button.label == "Edit"
+        )
+        edit_interaction = SimpleNamespace(
+            user=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=123),
+            channel_id=456,
+            response=SimpleNamespace(
+                send_modal=AsyncMock(),
+                send_message=AsyncMock(),
+            ),
+        )
+
+        with (
+            patch("main.repository.get", return_value=scrim),
+            patch("main.is_active", return_value=True),
+            patch("main.member_is_staff", return_value=True),
+        ):
+            await edit_button.callback(edit_interaction)
+
+        modal = edit_interaction.response.send_modal.call_args.args[0]
+        self.assertIsInstance(modal, MatchScoreSubmissionEditModal)
+        self.assertEqual(modal.command_input.default, "!resg4\n1 5")
+        modal.command_input._value = "!resg4\n3 8\n1 2"
+        updated_message = SimpleNamespace()
+        modal_interaction = SimpleNamespace(
+            user=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=123),
+            channel_id=456,
+            response=SimpleNamespace(send_message=AsyncMock()),
+            original_response=AsyncMock(return_value=updated_message),
+        )
+
+        with (
+            patch("main.repository.get", return_value=scrim),
+            patch("main.is_active", return_value=True),
+            patch("main.member_is_staff", return_value=True),
+            patch("main.repository.replace_match_scores") as replace,
+        ):
+            await modal.on_submit(modal_interaction)
+
+        replace.assert_not_called()
+        updated_review = modal_interaction.response.send_message.call_args.kwargs[
+            "view"
+        ]
+        self.assertIsInstance(updated_review, MatchScoreSubmissionReviewView)
+        self.assertEqual(
+            list(updated_review.scores),
+            [MatchScore(4, 3, 8, 1), MatchScore(4, 1, 2, 2)],
+        )
+        self.assertEqual(updated_review.message, updated_message)
+        review.message.edit.assert_awaited_once()
+        self.assertTrue(review.completed)
+
+    async def test_score_review_rejects_confirmation_after_saved_scores_change(self):
+        scrim = self.make_scrim()
+        review = MatchScoreSubmissionReviewView(
+            owner_id=7,
+            guild_id=123,
+            channel_id=456,
+            scrim=scrim,
+            match_number=4,
+            scores=[MatchScore(4, 1, 5, 1)],
+            raw_input="1 5",
+        )
+        scrim.match_scores[(4, 1)] = MatchScore(4, 1, 2, 1)
+        confirm_button = next(
+            button for button in review.children if button.label == "Confirm"
+        )
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=123),
+            channel_id=456,
+            response=SimpleNamespace(
+                edit_message=AsyncMock(),
+                send_message=AsyncMock(),
+            ),
+        )
+
+        with (
+            patch("main.repository.get", return_value=scrim),
+            patch("main.is_active", return_value=True),
+            patch("main.member_is_staff", return_value=True),
+            patch("main.repository.replace_match_scores") as replace,
+        ):
+            await confirm_button.callback(interaction)
+
+        replace.assert_not_called()
+        self.assertIn(
+            "out of date",
+            interaction.response.edit_message.call_args.kwargs["content"],
+        )
+
+    def test_score_submission_edit_accepts_the_full_command_prefix(self):
+        self.assertEqual(
+            normalize_score_submission_text(
+                "!resg4\n1 5\n3 3",
+                4,
+            ),
+            "1 5\n3 3",
+        )
+        self.assertEqual(
+            normalize_score_submission_text("!resg4 1 5\n3 3", 4),
+            "1 5\n3 3",
+        )
 
     async def test_score_command_rejects_match_above_scrim_limit(self):
         scrim = self.make_scrim()
@@ -1278,13 +1846,356 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("main.require_staff_scrim", new=AsyncMock(return_value=scrim)),
-            patch("main.repository.upsert_match_scores") as upsert,
+            patch("main.repository.replace_match_scores") as replace,
             patch("main.send_private_command_feedback", new=AsyncMock()) as feedback,
         ):
             await _record_match_scores(ctx, 4, "1 5 2")
 
-        upsert.assert_not_called()
+        replace.assert_not_called()
         self.assertIn("match limit is 3", feedback.call_args.args[1])
+
+    async def test_editres_command_shows_a_team_selector_for_the_match(self):
+        scrim = self.make_scrim()
+        sent_message = SimpleNamespace(edit=AsyncMock())
+        ctx = SimpleNamespace(
+            author=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=123),
+            channel=SimpleNamespace(id=456),
+            send=AsyncMock(return_value=sent_message),
+        )
+
+        with (
+            patch("main.require_staff_scrim", new=AsyncMock(return_value=scrim)),
+            patch("main.delete_command_message", new=AsyncMock()) as delete_command,
+        ):
+            await bot.get_command("editres").callback(ctx, "2")
+
+        ctx.send.assert_awaited_once()
+        self.assertIn("Match 2", ctx.send.call_args.args[0])
+        view = ctx.send.call_args.kwargs["view"]
+        self.assertIsInstance(view, MatchScoreCorrectionView)
+        self.assertEqual(view.match_number, 2)
+        self.assertEqual(
+            [option.label for option in view.children[0].options],
+            [
+                "Slot 01 · Alpha",
+                "Slot 02 · Bravo",
+                "Slot 03 · Charlie",
+            ],
+        )
+        delete_command.assert_awaited_once_with(ctx)
+
+    async def test_editres_team_selection_opens_rank_and_kills_form(self):
+        scrim = self.make_scrim()
+        view = MatchScoreCorrectionView(
+            owner_id=7,
+            guild_id=123,
+            channel_id=456,
+            scrim=scrim,
+            match_number=2,
+            slots=list(scrim.slots.values()),
+        )
+        selector = view.children[0]
+        selector._values = ["2"]
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=123),
+            channel_id=456,
+            response=SimpleNamespace(
+                send_modal=AsyncMock(),
+                send_message=AsyncMock(),
+            ),
+        )
+
+        with (
+            patch("main.repository.get", return_value=scrim),
+            patch("main.is_active", return_value=True),
+            patch("main.member_is_staff", return_value=True),
+        ):
+            await selector.callback(interaction)
+
+        interaction.response.send_modal.assert_awaited_once()
+        modal = interaction.response.send_modal.call_args.args[0]
+        self.assertIsInstance(modal, MatchScoreCorrectionModal)
+        self.assertEqual(modal.slot_number, 2)
+        self.assertEqual(modal.placement_input.max_length, 3)
+        self.assertEqual(modal.kills_input.max_length, 5)
+
+    async def test_editres_modal_updates_only_the_selected_team(self):
+        scrim = self.make_scrim()
+        previous_score = MatchScore(2, 2, 4, 5)
+        scrim.match_scores[(2, 2)] = previous_score
+        view = MatchScoreCorrectionView(
+            owner_id=7,
+            guild_id=123,
+            channel_id=456,
+            scrim=scrim,
+            match_number=2,
+            slots=list(scrim.slots.values()),
+        )
+        modal = MatchScoreCorrectionModal(
+            view,
+            scrim.slots[2],
+            default_score=previous_score,
+            baseline_score=previous_score,
+        )
+        modal.placement_input._value = "3"
+        modal.kills_input._value = "6"
+        review_message = SimpleNamespace(edit=AsyncMock())
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=123),
+            channel_id=456,
+            response=SimpleNamespace(send_message=AsyncMock()),
+            original_response=AsyncMock(return_value=review_message),
+        )
+
+        with (
+            patch("main.repository.get", return_value=scrim),
+            patch("main.is_active", return_value=True),
+            patch("main.member_is_staff", return_value=True),
+            patch("main.repository.upsert_match_scores") as upsert,
+        ):
+            await modal.on_submit(interaction)
+
+        upsert.assert_not_called()
+        review = interaction.response.send_message.call_args.kwargs["view"]
+        self.assertIsInstance(review, MatchScoreCorrectionReviewView)
+        self.assertEqual(
+            interaction.response.send_message.call_args.kwargs["embed"].title,
+            "Review score correction · Match 2",
+        )
+        self.assertEqual(review.previous_score, previous_score)
+        self.assertEqual(review.proposed_score, MatchScore(2, 2, 6, 3))
+
+        confirm_button = next(
+            button for button in review.children if button.label == "Confirm"
+        )
+        confirm_interaction = SimpleNamespace(
+            user=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=123),
+            channel_id=456,
+            response=SimpleNamespace(
+                edit_message=AsyncMock(),
+                send_message=AsyncMock(),
+            ),
+        )
+        with (
+            patch("main.repository.get", return_value=scrim),
+            patch("main.is_active", return_value=True),
+            patch("main.member_is_staff", return_value=True),
+            patch("main.repository.upsert_match_scores", return_value=1) as upsert,
+        ):
+            await confirm_button.callback(confirm_interaction)
+
+        upsert.assert_called_once_with(
+            scrim.id,
+            scrim.guild_id,
+            2,
+            [MatchScore(2, 2, 6, 3)],
+        )
+        confirm_interaction.response.edit_message.assert_awaited_once()
+        self.assertIn(
+            "rank 3, 6 kills",
+            confirm_interaction.response.edit_message.call_args.kwargs["content"],
+        )
+
+    async def test_edit_button_reopens_form_prefilled_with_proposed_values(self):
+        scrim = self.make_scrim()
+        previous_score = MatchScore(2, 2, 4, 5)
+        scrim.match_scores[(2, 2)] = previous_score
+        correction_view = MatchScoreCorrectionView(
+            owner_id=7,
+            guild_id=123,
+            channel_id=456,
+            scrim=scrim,
+            match_number=2,
+            slots=list(scrim.slots.values()),
+        )
+        review = MatchScoreCorrectionReviewView(
+            correction_view=correction_view,
+            slot=scrim.slots[2],
+            previous_score=previous_score,
+            proposed_score=MatchScore(2, 2, 6, 3),
+        )
+        edit_button = next(
+            button for button in review.children if button.label == "Edit"
+        )
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=123),
+            channel_id=456,
+            response=SimpleNamespace(send_modal=AsyncMock(), send_message=AsyncMock()),
+        )
+
+        with (
+            patch("main.repository.get", return_value=scrim),
+            patch("main.is_active", return_value=True),
+            patch("main.member_is_staff", return_value=True),
+        ):
+            await edit_button.callback(interaction)
+
+        interaction.response.send_modal.assert_awaited_once()
+        modal = interaction.response.send_modal.call_args.args[0]
+        self.assertIsInstance(modal, MatchScoreCorrectionModal)
+        self.assertEqual(modal.placement_input.default, "3")
+        self.assertEqual(modal.kills_input.default, "6")
+        self.assertEqual(modal.baseline_score, previous_score)
+        self.assertIs(modal.source_review, review)
+
+    async def test_choose_another_team_returns_to_slot_selector(self):
+        scrim = self.make_scrim()
+        scrim.match_scores.pop((2, 2), None)
+        correction_view = MatchScoreCorrectionView(
+            owner_id=7,
+            guild_id=123,
+            channel_id=456,
+            scrim=scrim,
+            match_number=2,
+            slots=list(scrim.slots.values()),
+        )
+        review = MatchScoreCorrectionReviewView(
+            correction_view=correction_view,
+            slot=scrim.slots[2],
+            previous_score=None,
+            proposed_score=MatchScore(2, 2, 6, 3),
+        )
+        choose_button = next(
+            button
+            for button in review.children
+            if button.label == "Choose another team"
+        )
+        message = SimpleNamespace()
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=123),
+            channel_id=456,
+            message=message,
+            response=SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock()),
+        )
+
+        with (
+            patch("main.repository.get", return_value=scrim),
+            patch("main.is_active", return_value=True),
+            patch("main.member_is_staff", return_value=True),
+        ):
+            await choose_button.callback(interaction)
+
+        new_view = interaction.response.edit_message.call_args.kwargs["view"]
+        self.assertIsInstance(new_view, MatchScoreCorrectionView)
+        self.assertIs(new_view.message, message)
+        self.assertTrue(review.completed)
+
+    async def test_cancel_discards_review_without_saving(self):
+        scrim = self.make_scrim()
+        scrim.match_scores.pop((2, 2), None)
+        correction_view = MatchScoreCorrectionView(
+            owner_id=7,
+            guild_id=123,
+            channel_id=456,
+            scrim=scrim,
+            match_number=2,
+            slots=list(scrim.slots.values()),
+        )
+        review = MatchScoreCorrectionReviewView(
+            correction_view=correction_view,
+            slot=scrim.slots[2],
+            previous_score=None,
+            proposed_score=MatchScore(2, 2, 6, 3),
+        )
+        cancel_button = next(
+            button for button in review.children if button.label == "Cancel"
+        )
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=7),
+            response=SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock()),
+        )
+
+        with patch("main.repository.upsert_match_scores") as upsert:
+            await cancel_button.callback(interaction)
+
+        upsert.assert_not_called()
+        self.assertTrue(review.completed)
+        self.assertIn(
+            "No score was changed",
+            interaction.response.edit_message.call_args.kwargs["content"],
+        )
+
+    async def test_stale_score_review_cannot_overwrite_a_newer_result(self):
+        scrim = self.make_scrim()
+        scrim.match_scores.pop((2, 2), None)
+        correction_view = MatchScoreCorrectionView(
+            owner_id=7,
+            guild_id=123,
+            channel_id=456,
+            scrim=scrim,
+            match_number=2,
+            slots=list(scrim.slots.values()),
+        )
+        review = MatchScoreCorrectionReviewView(
+            correction_view=correction_view,
+            slot=scrim.slots[2],
+            previous_score=None,
+            proposed_score=MatchScore(2, 2, 6, 3),
+        )
+        scrim.match_scores[(2, 2)] = MatchScore(2, 2, 2, 5)
+        confirm_button = next(
+            button for button in review.children if button.label == "Confirm"
+        )
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=123),
+            channel_id=456,
+            response=SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock()),
+        )
+
+        with (
+            patch("main.repository.get", return_value=scrim),
+            patch("main.is_active", return_value=True),
+            patch("main.member_is_staff", return_value=True),
+            patch("main.repository.upsert_match_scores") as upsert,
+        ):
+            await confirm_button.callback(interaction)
+
+        upsert.assert_not_called()
+        self.assertIn(
+            "changed after the recap",
+            interaction.response.edit_message.call_args.kwargs["content"],
+        )
+
+    async def test_editres_modal_rejects_negative_kills_without_saving(self):
+        scrim = self.make_scrim()
+        view = MatchScoreCorrectionView(
+            owner_id=7,
+            guild_id=123,
+            channel_id=456,
+            scrim=scrim,
+            match_number=2,
+            slots=list(scrim.slots.values()),
+        )
+        modal = MatchScoreCorrectionModal(view, scrim.slots[2])
+        modal.placement_input._value = "1"
+        modal.kills_input._value = "-2"
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=123),
+            channel_id=456,
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        with (
+            patch("main.repository.get", return_value=scrim),
+            patch("main.is_active", return_value=True),
+            patch("main.member_is_staff", return_value=True),
+            patch("main.repository.upsert_match_scores") as upsert,
+        ):
+            await modal.on_submit(interaction)
+
+        upsert.assert_not_called()
+        self.assertIn(
+            "whole numbers",
+            interaction.response.send_message.call_args.args[0],
+        )
 
     def test_all_score_aliases_are_registered(self):
         for match_number in range(1, MAX_MATCHES + 1):
@@ -1296,7 +2207,10 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_res_command_sends_final_png_directly(self):
         scrim = self.make_scrim()
-        ctx = SimpleNamespace(send=AsyncMock())
+        progress_message = SimpleNamespace(delete=AsyncMock(), edit=AsyncMock())
+        ctx = SimpleNamespace(
+            send=AsyncMock(side_effect=[progress_message, SimpleNamespace()])
+        )
         command = bot.get_command("res")
 
         with (
@@ -1305,12 +2219,20 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
         ):
             await command.callback(ctx)
 
-        ctx.send.assert_awaited_once()
+        self.assertEqual(ctx.send.await_count, 2)
         self.assertEqual(
-            ctx.send.await_args.kwargs["file"].filename,
+            ctx.send.await_args_list[0].args[0],
+            "⏳ Working on the leaderboard…",
+        )
+        progress_message.delete.assert_awaited_once()
+        self.assertEqual(
+            ctx.send.await_args_list[1].kwargs["file"].filename,
             "leaderboard.png",
         )
-        self.assertIn("V2 Scrim Results", ctx.send.await_args.kwargs["content"])
+        self.assertIn(
+            "V2 Scrim Results",
+            ctx.send.await_args_list[1].kwargs["content"],
+        )
 
     async def test_res_command_sends_an_empty_leaderboard_table(self):
         scrim = self.make_scrim()
@@ -1322,13 +2244,13 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
         with patch("main.require_staff_scrim", new=AsyncMock(return_value=scrim)):
             await command.callback(ctx)
 
-        ctx.send.assert_awaited_once()
+        self.assertEqual(ctx.send.await_count, 2)
         image_file = ctx.send.await_args.kwargs["file"]
         self.assertEqual(image_file.filename, "leaderboard.png")
         with Image.open(image_file.fp) as rendered:
             self.assertEqual(
                 rendered.size,
-                leaderboard_canvas_dimensions(24, "vertical", 180, 120),
+                leaderboard_canvas_dimensions(20, "vertical", 180, 120),
             )
 
     def test_vertical_image_uses_configured_count_and_canvas_dimensions(self):
@@ -1336,7 +2258,11 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
         scrim.leaderboard_team_count = 16
         scrim.leaderboard_header_height = 180
         scrim.leaderboard_footer_height = 120
-        buffer = build_leaderboard_image(scrim, calculate_leaderboard(scrim))
+        with patch("main.repository.get_server_license_type", return_value="Gold"):
+            buffer = build_leaderboard_image(
+                scrim,
+                calculate_leaderboard(scrim),
+            )
         with Image.open(buffer) as rendered:
             self.assertEqual(
                 rendered.size,
@@ -1356,8 +2282,9 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             for number in range(1, 25)
         }
 
-        rows = calculate_leaderboard(scrim)
-        image_buffer = build_leaderboard_image(scrim, rows)
+        with patch("main.repository.get_server_license_type", return_value="Gold"):
+            rows = calculate_leaderboard(scrim)
+            image_buffer = build_leaderboard_image(scrim, rows)
 
         self.assertEqual(len(rows), 24)
         self.assertEqual(rows[-1].slot_number, 24)
@@ -1366,6 +2293,82 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 rendered.size,
                 leaderboard_canvas_dimensions(24, "vertical", 180, 120),
             )
+
+    def test_standard_sparse_results_keep_full_rank_capacity_in_both_orientations(self):
+        original_text = ImageDraw.ImageDraw.text
+
+        for orientation, expected_row_count in (
+            ("vertical", 20),
+            ("horizontal", 10),
+        ):
+            with self.subTest(orientation=orientation):
+                scrim = self.make_scrim()
+                scrim.leaderboard_team_count = 24
+                scrim.leaderboard_orientation = orientation
+                scrim.slots = {
+                    number: Slot(
+                        number,
+                        status=STATUS_CONFIRMED,
+                        team_name=f"Team {number:02d}",
+                    )
+                    for number in range(1, 8)
+                }
+                text_calls = []
+
+                def record_text(drawer, xy, text, *args, **kwargs):
+                    text_calls.append((str(text), xy))
+                    return original_text(drawer, xy, text, *args, **kwargs)
+
+                with (
+                    patch(
+                        "main.repository.get_server_license_type",
+                        return_value="Standard",
+                    ),
+                    patch.object(
+                        ImageDraw.ImageDraw,
+                        "text",
+                        new=record_text,
+                    ),
+                ):
+                    rows = calculate_leaderboard(scrim)
+                    image_buffer = build_leaderboard_image(scrim, rows)
+
+                rank_calls = [
+                    (int(text), position)
+                    for text, position in text_calls
+                    if len(text) == 2
+                    and text.isdigit()
+                    and 1 <= int(text) <= 20
+                ]
+                rank_columns = {
+                    position[0]
+                    for position in (position for _, position in rank_calls)
+                    if sum(
+                        1
+                        for _, candidate_position in rank_calls
+                        if candidate_position[0] == position[0]
+                    )
+                    >= 10
+                }
+                rank_calls = [
+                    (rank, position)
+                    for rank, position in rank_calls
+                    if position[0] in rank_columns
+                ]
+                self.assertEqual(len(rows), 7)
+                self.assertEqual(
+                    [rank for rank, _ in rank_calls],
+                    list(range(1, 21)),
+                )
+                self.assertEqual(
+                    len({position[1] for _, position in rank_calls}),
+                    expected_row_count,
+                )
+                with Image.open(image_buffer) as rendered:
+                    self.assertEqual(
+                        rendered.size,
+                        leaderboard_canvas_dimensions(20, orientation),
+                    )
 
     def test_renderer_generates_only_date_ranks_team_and_scores(self):
         original_text = ImageDraw.ImageDraw.text
@@ -1393,7 +2396,9 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     text_calls = []
 
                     def record_text(drawer, xy, text, *args, **kwargs):
-                        text_calls.append((str(text), xy))
+                        text_calls.append(
+                            (str(text), xy, kwargs.get("anchor"))
+                        )
                         return original_text(drawer, xy, text, *args, **kwargs)
 
                     with (
@@ -1437,10 +2442,12 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     ):
                         build_leaderboard_image(scrim, rows)
 
-                    rendered_text = [text for text, _ in text_calls]
+                    rendered_text = [
+                        text for text, _, _ in text_calls
+                    ]
                     self.assertRegex(
                         rendered_text[0],
-                        r"^\d{2} [A-Z]{3} \d{4}$",
+                        r"^\d{2}/\d{2}/\d{4}$",
                     )
                     columns = 2 if orientation == "horizontal" else 1
                     per_column_capacity = (
@@ -1449,21 +2456,32 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                         else team_count
                     )
                     column_gap = 24 if columns == 2 else 0
+                    canvas_width, _ = leaderboard_canvas_dimensions(
+                        team_count,
+                        orientation,
+                    )
                     column_width = (
-                        1920
+                        canvas_width
                         - 2 * LEADERBOARD_OUTER_MARGIN
                         - column_gap * (columns - 1)
                     ) // columns
-                    rank_x_positions = {
-                        LEADERBOARD_OUTER_MARGIN
-                        + column * (column_width + column_gap)
-                        + 34
-                        for column in range(columns)
-                    }
+                    rank_x_positions = set()
+                    for column in range(columns):
+                        column_left = (
+                            LEADERBOARD_OUTER_MARGIN
+                            + column * (column_width + column_gap)
+                        )
+                        rank_left, rank_right = _leaderboard_field_ranges(
+                            column_left,
+                            column_width,
+                        )[0]
+                        rank_x_positions.add((rank_left + rank_right) / 2)
                     ranks = [
                         text
-                        for text, xy in text_calls
+                        for text, xy, _ in text_calls
                         if xy[0] in rank_x_positions
+                        and text.isdigit()
+                        and len(text) == 2
                     ]
                     self.assertEqual(
                         ranks,
@@ -1479,6 +2497,108 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("KILL", rendered_text)
                     self.assertNotIn("PLACE", rendered_text)
                     self.assertNotIn("TOTAL", rendered_text)
+
+    def test_date_is_top_right_and_table_text_matches_reference_alignment(self):
+        original_text = ImageDraw.ImageDraw.text
+        for orientation in ("vertical", "horizontal"):
+            with self.subTest(orientation=orientation):
+                scrim = self.make_scrim()
+                scrim.leaderboard_team_count = 16
+                scrim.leaderboard_orientation = orientation
+                text_calls = []
+
+                def record_text(drawer, xy, text, *args, **kwargs):
+                    text_calls.append(
+                        (
+                            str(text),
+                            xy,
+                            kwargs.get("anchor"),
+                            kwargs.get("font"),
+                        )
+                    )
+                    return original_text(drawer, xy, text, *args, **kwargs)
+
+                with (
+                    patch.object(
+                        ImageDraw.ImageDraw,
+                        "text",
+                        new=record_text,
+                    ),
+                    patch(
+                        "main.repository.get_server_license_type",
+                        return_value="Gold",
+                    ),
+                ):
+                    build_leaderboard_image(
+                        scrim,
+                        [LeaderboardRow(1, "CENTER ME", 13, 27, 34, 74)],
+                    )
+
+                columns = 2 if orientation == "horizontal" else 1
+                column_gap = 24 if columns == 2 else 0
+                canvas_width, _ = leaderboard_canvas_dimensions(
+                    16,
+                    orientation,
+                )
+                self.assertEqual(
+                    next(call for call in text_calls if "/" in call[0])[1:3],
+                    (
+                        (canvas_width - LEADERBOARD_OUTER_MARGIN, LEADERBOARD_OUTER_MARGIN),
+                        "rt",
+                    ),
+                )
+                date_call = next(call for call in text_calls if "/" in call[0])
+                self.assertEqual(date_call[3].size, 36)
+                column_width = (
+                    canvas_width
+                    - 2 * LEADERBOARD_OUTER_MARGIN
+                    - column_gap * (columns - 1)
+                ) // columns
+                left = LEADERBOARD_OUTER_MARGIN
+                ranges = _leaderboard_field_ranges(left, column_width)
+                centers = [(start + end) / 2 for start, end in ranges]
+
+                for text, field_index, expected_anchor, expected_x in (
+                    ("01", 0, "mm", centers[0]),
+                    (
+                        "CENTER ME",
+                        1,
+                        "lm",
+                        ranges[1][0] + 12,
+                    ),
+                    ("13", 2, "mm", centers[2]),
+                    ("27", 3, "mm", centers[3]),
+                    ("34", 4, "mm", centers[4]),
+                    ("74", 5, "mm", centers[5]),
+                ):
+                    with self.subTest(text=text):
+                        call = next(
+                            call for call in text_calls if call[0] == text
+                        )
+                        self.assertEqual(call[1][0], expected_x)
+                        self.assertEqual(call[2], expected_anchor)
+                        self.assertEqual(
+                            call[3].size,
+                            32 if orientation == "horizontal" else 21,
+                        )
+
+    def test_long_team_name_shrinks_and_stays_inside_its_field(self):
+        fitted_text, font = _fit_leaderboard_cell_text(
+            "LONG-TEAM-NAME-" * 20,
+            max_width=120,
+            max_height=52,
+            max_size=21,
+            min_size=8,
+        )
+
+        bbox = ImageDraw.Draw(Image.new("RGB", (1, 1))).textbbox(
+            (0, 0),
+            fitted_text,
+            font=font,
+        )
+        self.assertLess(font.size, 21)
+        self.assertLessEqual(bbox[2] - bbox[0], 120)
+        self.assertLessEqual(bbox[3] - bbox[1], 52)
 
     def test_renderer_preserves_background_away_from_all_text_fields(self):
         for orientation in ("vertical", "horizontal"):
@@ -1510,17 +2630,22 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                             )
                         with Image.open(rendered_buffer) as rendered:
                             self.assertEqual(
-                                rendered.crop((250, 0, 500, dimensions[1])).tobytes(),
-                                expected.crop((250, 0, 500, dimensions[1])).tobytes(),
+                                rendered.crop(
+                                    (0, 0, LEADERBOARD_OUTER_MARGIN, dimensions[1])
+                                ).tobytes(),
+                                expected.crop(
+                                    (0, 0, LEADERBOARD_OUTER_MARGIN, dimensions[1])
+                                ).tobytes(),
                             )
 
     def test_leaderboard_text_color_changes_generated_text_only(self):
         scrim = self.make_scrim()
+        scrim.leaderboard_team_count = 20
         rows = [LeaderboardRow(1, "Alpha", 1, 2, 16, 18)]
         with tempfile.TemporaryDirectory() as directory:
             background_dir = Path(directory)
             Image.new("RGB", (320, 180), (25, 80, 140)).save(
-                background_dir / f"{scrim.id}-vertical-24.png"
+                background_dir / f"{scrim.id}-vertical-20.png"
             )
             with patch("main.LEADERBOARD_BACKGROUND_UPLOAD_DIR", background_dir):
                 blue = build_leaderboard_image(scrim, rows)
@@ -1540,20 +2665,36 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 gold_image.getpixel((LEADERBOARD_OUTER_MARGIN, table_border_y)),
             )
 
-    def test_row_height_is_48px_in_both_orientations(self):
+    def test_orientations_use_approved_row_pitch_and_440px_fixed_space(self):
         team_counts = (16, 18, 20, 22, 24)
-        vertical_heights = [
-            leaderboard_canvas_dimensions(count, "vertical", 180, 120)[1]
-            for count in team_counts
-        ]
-        horizontal_heights = [
-            leaderboard_canvas_dimensions(count, "horizontal", 180, 120)[1]
-            for count in team_counts
-        ]
+        vertical_heights = (1400, 1520, 1640, 1760, 1880)
+        horizontal_heights = (1080, 1160, 1240, 1320, 1400)
 
-        self.assertEqual(LEADERBOARD_ROW_HEIGHT, 48)
-        self.assertEqual(vertical_heights[-1] - vertical_heights[0], 8 * 48)
-        self.assertEqual(horizontal_heights[-1] - horizontal_heights[0], 4 * 48)
+        self.assertEqual(LEADERBOARD_VERTICAL_ROW_HEIGHT, 60)
+        self.assertEqual(LEADERBOARD_HORIZONTAL_ROW_HEIGHT, 80)
+        self.assertEqual(LEADERBOARD_SECTION_GAP, 10)
+        fixed_space = (
+            2 * LEADERBOARD_OUTER_MARGIN
+            + DEFAULT_LEADERBOARD_HEADER_HEIGHT
+            + LEADERBOARD_TABLE_HEADER_HEIGHT
+            + DEFAULT_LEADERBOARD_FOOTER_HEIGHT
+            + 2 * LEADERBOARD_SECTION_GAP
+        )
+        self.assertEqual(fixed_space, 440)
+        self.assertEqual(
+            tuple(
+                leaderboard_canvas_dimensions(count, "vertical", 180, 120)[1]
+                for count in team_counts
+            ),
+            vertical_heights,
+        )
+        self.assertEqual(
+            tuple(
+                leaderboard_canvas_dimensions(count, "horizontal", 180, 120)[1]
+                for count in team_counts
+            ),
+            horizontal_heights,
+        )
 
     def test_first_slot_row_starts_at_same_height_in_both_orientations(self):
         team_positions = {"vertical": {}, "horizontal": {}}
@@ -1594,9 +2735,9 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     leaderboard_canvas_dimensions(16, orientation),
                 )
 
-        self.assertEqual(team_positions["vertical"]["Team 01"], 318)
-        self.assertEqual(team_positions["horizontal"]["Team 01"], 318)
-        self.assertEqual(team_positions["horizontal"]["Team 09"], 318)
+        self.assertEqual(team_positions["vertical"]["Team 01"], 312)
+        self.assertEqual(team_positions["horizontal"]["Team 01"], 322)
+        self.assertEqual(team_positions["horizontal"]["Team 09"], 322)
 
     def test_generated_default_background_does_not_need_static_assets(self):
         missing_background = Path("/missing/leaderboard-background.png")
@@ -1613,13 +2754,36 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(LEADERBOARD_BACKGROUND.name, "leaderboard-background.png")
         self.assertFalse(LEADERBOARD_BACKGROUND.is_file())
 
-    def test_scrim_name_is_not_generated_on_the_default_background(self):
+    def test_scrim_name_is_rendered_as_title_on_the_default_background(self):
         scrim = self.make_scrim()
-        unnamed_scrim = SimpleNamespace(**vars(scrim))
-        unnamed_scrim.name = ""
-        with_name = build_leaderboard_image(scrim, [])
-        without_name = build_leaderboard_image(unnamed_scrim, [])
-        self.assertEqual(with_name.getvalue(), without_name.getvalue())
+        drawn_text = []
+        title_calls = []
+        original_text = ImageDraw.ImageDraw.text
+
+        def capture_text(draw, xy, text, *args, **kwargs):
+            drawn_text.append(str(text))
+            if str(text) == scrim.name:
+                title_calls.append(
+                    (xy, kwargs.get("anchor"), kwargs.get("font"))
+                )
+            return original_text(draw, xy, text, *args, **kwargs)
+
+        with patch.object(ImageDraw.ImageDraw, "text", new=capture_text):
+            build_leaderboard_image(scrim, [])
+
+        self.assertIn(scrim.name, drawn_text)
+        self.assertEqual(len(title_calls), 1)
+        position, anchor, title_font = title_calls[0]
+        self.assertEqual(
+            position,
+            (
+                LEADERBOARD_OUTER_MARGIN,
+                LEADERBOARD_OUTER_MARGIN
+                + DEFAULT_LEADERBOARD_HEADER_HEIGHT // 2,
+            ),
+        )
+        self.assertEqual(anchor, "lm")
+        self.assertEqual(title_font.size, LEADERBOARD_TITLE_MAX_FONT_SIZE)
 
     def test_custom_background_does_not_render_scrim_name(self):
         scrim = self.make_scrim()

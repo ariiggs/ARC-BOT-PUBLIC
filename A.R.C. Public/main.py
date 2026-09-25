@@ -86,6 +86,7 @@ LEADERBOARD_VERTICAL_ROW_FONT_SIZE = 21
 LEADERBOARD_HORIZONTAL_ROW_FONT_SIZE = 32
 LEADERBOARD_ROW_FONT_WEIGHT = 700
 LEADERBOARD_DATE_FONT_SIZE = 36
+LEADERBOARD_TITLE_MAX_FONT_SIZE = 96
 LEADERBOARD_TEAM_NAME_LEFT_PADDING = 12
 STANDARD_LEADERBOARD_TEAM_COUNT = 20
 LEADERBOARD_FIELD_BASE_WIDTHS = (48, 500, 120, 120, 120, 116)
@@ -8114,25 +8115,20 @@ def _build_configured_leaderboard_image(
     if background_path == LEADERBOARD_BACKGROUND:
         scrim_title = str(getattr(scrim, "name", "") or "").strip()
         if scrim_title:
-            title_center_x = width // 2
-            title_half_width = min(
-                title_center_x - margin,
-                width - margin - title_center_x,
-            )
             title_font = _fit_font(
                 scrim_title,
-                max_width=max(80, 2 * title_half_width),
+                max_width=width - 2 * margin,
                 max_height=header_height - 24,
-                max_size=64,
+                max_size=LEADERBOARD_TITLE_MAX_FONT_SIZE,
                 min_size=18,
                 weight=LEADERBOARD_BODY_FONT_WEIGHT,
             )
             draw.text(
-                (title_center_x, margin + header_height // 2),
+                (margin, margin + header_height // 2),
                 scrim_title,
                 font=title_font,
                 fill=text,
-                anchor="mm",
+                anchor="lm",
             )
 
     columns = 2 if orientation == "horizontal" else 1
