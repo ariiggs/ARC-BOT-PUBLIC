@@ -78,9 +78,10 @@ MAX_LEADERBOARD_BACKGROUND_UPLOAD_BYTES = 8 * 1024 * 1024
 LEADERBOARD_VERTICAL_WIDTH = 1080
 LEADERBOARD_HORIZONTAL_WIDTH = 1920
 LEADERBOARD_OUTER_MARGIN = 28
-LEADERBOARD_SECTION_GAP = 22
+LEADERBOARD_SECTION_GAP = 10
 LEADERBOARD_TABLE_HEADER_HEIGHT = 64
-LEADERBOARD_ROW_HEIGHT = 48
+LEADERBOARD_VERTICAL_ROW_HEIGHT = 60
+LEADERBOARD_HORIZONTAL_ROW_HEIGHT = 80
 
 
 class LeaderboardBackgroundDimensionsError(ValueError):
@@ -6660,12 +6661,17 @@ def leaderboard_canvas_dimensions(
         if orientation == "vertical"
         else (team_count + 1) // 2
     )
+    row_height = (
+        LEADERBOARD_VERTICAL_ROW_HEIGHT
+        if orientation == "vertical"
+        else LEADERBOARD_HORIZONTAL_ROW_HEIGHT
+    )
     height = (
         2 * LEADERBOARD_OUTER_MARGIN
         + header_height
         + LEADERBOARD_SECTION_GAP
         + LEADERBOARD_TABLE_HEADER_HEIGHT
-        + visible_rows * LEADERBOARD_ROW_HEIGHT
+        + visible_rows * row_height
         + LEADERBOARD_SECTION_GAP
         + footer_height
     )
@@ -6809,9 +6815,41 @@ def _build_configured_leaderboard_image(
         fill=text,
         anchor="mm",
     )
+    if background_path == LEADERBOARD_BACKGROUND:
+        scrim_title = str(getattr(scrim, "name", "") or "").strip()
+        if scrim_title:
+            date_bbox = draw.textbbox((0, 0), date_label, font=date_font)
+            date_width = date_bbox[2] - date_bbox[0]
+            date_left = width - margin - 75 - date_width // 2
+            title_center_x = width // 2
+            title_right_limit = date_left - 24
+            title_half_width = min(
+                title_center_x - margin,
+                title_right_limit - title_center_x,
+            )
+            title_font = _fit_font(
+                scrim_title,
+                max_width=max(80, 2 * title_half_width),
+                max_height=header_height - 24,
+                max_size=64,
+                min_size=18,
+                weight=LEADERBOARD_BODY_FONT_WEIGHT,
+            )
+            draw.text(
+                (title_center_x, date_center_y),
+                scrim_title,
+                font=title_font,
+                fill=text,
+                anchor="mm",
+            )
 
     columns = 2 if orientation == "horizontal" else 1
     column_gap = 24 if columns == 2 else 0
+    row_height = (
+        LEADERBOARD_HORIZONTAL_ROW_HEIGHT
+        if columns == 2
+        else LEADERBOARD_VERTICAL_ROW_HEIGHT
+    )
     column_width = (
         width - 2 * margin - column_gap * (columns - 1)
     ) // columns
@@ -6839,8 +6877,8 @@ def _build_configured_leaderboard_image(
         place_x = x + column_width - (160 if columns == 1 else 135)
         total_x = x + column_width - 20
         for row_index in range(per_column_capacity):
-            y = row_top + row_index * LEADERBOARD_ROW_HEIGHT
-            text_y = y + LEADERBOARD_ROW_HEIGHT // 2
+            y = row_top + row_index * row_height
+            text_y = y + row_height // 2
             rank = column_index * per_column_capacity + row_index + 1
             draw.text(
                 (x + 34, text_y),
@@ -6859,7 +6897,7 @@ def _build_configured_leaderboard_image(
             team_font = _fit_font(
                 row.team_name,
                 max_width=max(80, team_max_width),
-                max_height=LEADERBOARD_ROW_HEIGHT - 8,
+                max_height=row_height - 8,
                 max_size=row_font,
                 min_size=13,
                 weight=LEADERBOARD_BODY_FONT_WEIGHT,
