@@ -1,4 +1,4 @@
-"""Generate the remaining measured leaderboard blueprint references."""
+"""Generate dimensioned leaderboard blueprints for every supported profile."""
 
 from __future__ import annotations
 
@@ -21,13 +21,19 @@ VERTICAL_WIDTH = 1080
 HORIZONTAL_WIDTH = 1920
 OUTER_MARGIN = 28
 HEADER_HEIGHT = 180
-SECTION_GAP = 22
+SECTION_GAP = 10
 TABLE_HEADER_HEIGHT = 64
-ROW_HEIGHT = 48
+VERTICAL_ROW_HEIGHT = 60
+HORIZONTAL_ROW_HEIGHT = 80
 FOOTER_HEIGHT = 120
 COLUMN_GAP = 24
 FIELD_NAMES = ("RANK", "TEAM NAME", "WIN", "KILLS", "PLACE", "TOTAL")
 VERTICAL_FIELD_WIDTHS = (48, 500, 120, 120, 120, 116)
+
+
+def _row_height(orientation: str) -> int:
+    return VERTICAL_ROW_HEIGHT if orientation == "vertical" else HORIZONTAL_ROW_HEIGHT
+
 
 BG = (4, 17, 36)
 PANEL = (6, 23, 43)
@@ -51,12 +57,13 @@ def _font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
 def _canvas_dimensions(team_count: int, orientation: str) -> tuple[int, int]:
     width = VERTICAL_WIDTH if orientation == "vertical" else HORIZONTAL_WIDTH
     rows = team_count if orientation == "vertical" else ceil(team_count / 2)
+    row_height = _row_height(orientation)
     height = (
         2 * OUTER_MARGIN
         + HEADER_HEIGHT
         + SECTION_GAP
         + TABLE_HEADER_HEIGHT
-        + rows * ROW_HEIGHT
+        + rows * row_height
         + SECTION_GAP
         + FOOTER_HEIGHT
     )
@@ -204,9 +211,10 @@ def _draw_table(
     columns = 1 if orientation == "vertical" else 2
     rows_per_column = team_count if columns == 1 else ceil(team_count / 2)
     gap = 0 if columns == 1 else COLUMN_GAP
+    row_height = _row_height(orientation)
     column_width = (content_width - gap * (columns - 1)) // columns
     field_widths = _field_widths(column_width)
-    table_height = TABLE_HEADER_HEIGHT + rows_per_column * ROW_HEIGHT
+    table_height = TABLE_HEADER_HEIGHT + rows_per_column * row_height
     table_bottom = table_top + table_height
 
     for column in range(columns):
@@ -261,15 +269,15 @@ def _draw_table(
             )
 
         for row_index in range(rows_per_column):
-            row_top = table_top + TABLE_HEADER_HEIGHT + row_index * ROW_HEIGHT
-            row_bottom = row_top + ROW_HEIGHT
+            row_top = table_top + TABLE_HEADER_HEIGHT + row_index * row_height
+            row_bottom = row_top + row_height
             draw.rectangle(
                 (left + 1, row_top + 1, right - 1, row_bottom),
                 fill=ROW_LIGHT if row_index % 2 == 0 else ROW_DARK,
             )
             draw.line((left, row_bottom, right, row_bottom), fill=GRID, width=1)
             rank = column * rows_per_column + row_index + 1
-            center_y = row_top + ROW_HEIGHT // 2
+            center_y = row_top + row_height // 2
             draw.text(
                 ((x_positions[0] + x_positions[1]) // 2, center_y),
                 f"{rank:02d}",
@@ -310,7 +318,8 @@ def _draw_footer(
     content_width = width - 2 * OUTER_MARGIN
     footer_top = table_bottom + SECTION_GAP
     footer_bottom = footer_top + FOOTER_HEIGHT
-    body_height = rows_per_column * ROW_HEIGHT
+    row_height = _row_height(orientation)
+    body_height = rows_per_column * row_height
     field_widths = _field_widths(column_width)
 
     draw.rectangle(
@@ -340,7 +349,7 @@ def _draw_footer(
         (width // 2, footer_top + 39),
         (
             f"TABLE HEADER ROW {column_width} × {TABLE_HEADER_HEIGHT} PX"
-            f"  ·  DATA ROW {column_width} × {ROW_HEIGHT} PX"
+            f"  ·  DATA ROW {column_width} × {row_height} PX"
             f"  ·  {rows_label}"
         ),
         fill=CYAN,
@@ -408,7 +417,9 @@ def create_blueprint(team_count: int, orientation: str) -> Image.Image:
     image = Image.new("RGB", (width, height), BG)
     _draw_rulers(image)
     rows_per_column = team_count if orientation == "vertical" else ceil(team_count / 2)
-    table_height = TABLE_HEADER_HEIGHT + rows_per_column * ROW_HEIGHT
+    table_height = (
+        TABLE_HEADER_HEIGHT + rows_per_column * _row_height(orientation)
+    )
     table_top = OUTER_MARGIN + HEADER_HEIGHT + SECTION_GAP
     _draw_header(
         image,
@@ -435,15 +446,8 @@ def create_blueprint(team_count: int, orientation: str) -> Image.Image:
 
 
 def main() -> None:
-    approved_vertical_16 = OUTPUT_DIRS[0] / "vertical-16-complete-dimensions.png"
-    with Image.open(approved_vertical_16) as approved:
-        if approved.size != _canvas_dimensions(16, "vertical"):
-            raise ValueError("The approved Vertical 16 blueprint has unexpected dimensions.")
-
     for orientation in ORIENTATIONS:
         for team_count in TEAM_COUNTS:
-            if (orientation, team_count) == ("vertical", 16):
-                continue
             image = create_blueprint(team_count, orientation)
             filename = f"{orientation}-{team_count}-complete-dimensions.png"
             for output_dir in OUTPUT_DIRS:

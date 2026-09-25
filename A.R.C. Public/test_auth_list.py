@@ -55,22 +55,21 @@ class AuthPanelTests(unittest.IsolatedAsyncioTestCase):
     async def test_auth_command_opens_version_picker(self):
         message = SimpleNamespace(edit=AsyncMock())
         ctx = SimpleNamespace(
-            author=SimpleNamespace(id=1234),
+            author=SimpleNamespace(
+                id=1234,
+                send=AsyncMock(return_value=message),
+            ),
             message=SimpleNamespace(delete=AsyncMock()),
         )
-        with patch(
-            "main.send_private_command_feedback",
-            new=AsyncMock(return_value=message),
-        ) as send_feedback:
-            await auth_command.callback(ctx)
+        await auth_command.callback(ctx)
 
-        kwargs = send_feedback.await_args.kwargs
+        kwargs = ctx.author.send.await_args.kwargs
         self.assertEqual(kwargs["view"].owner_id, 1234)
         self.assertEqual(
             [button.label for button in kwargs["view"].children],
             ["Standard", "Gold", "Close"],
         )
-        self.assertEqual(kwargs["delete_after"], 300)
+        self.assertEqual(kwargs["delete_after"], 330)
         self.assertIs(kwargs["view"].message, message)
         self.assertIn("Authorization Manager", kwargs["embed"].title)
 

@@ -55,6 +55,7 @@ from main import (
     calculate_leaderboard,
     leaderboard_canvas_dimensions,
     member_can_configure_scrim,
+    missing_score_matches,
     parse_match_score_lines,
     _leaderboard_accent_rgb,
 )
@@ -179,6 +180,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
     def test_results_publication_formats_approved_tokens_and_missing_ranks(self):
         scrim = self.make_scrim()
+        scrim.max_matches = 2
         scrim.operational_messages = {
             "publish_results": (
                 "{scrim}|{team_count}|{match_count}|"
@@ -196,6 +198,18 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             message,
             "V2 Scrim|3|2|Alpha:18:2:1|—:0:0:0",
         )
+
+    def test_results_publication_warns_about_missing_matches_only(self):
+        scrim = self.make_scrim()
+        scrim.max_matches = 4
+        missing = missing_score_matches(scrim)
+
+        self.assertEqual(missing, [3, 4])
+        message = build_results_publication_message(
+            scrim,
+            calculate_leaderboard(scrim),
+        )
+        self.assertIn("no scores are saved for match(es) 3, 4", message)
 
     def test_results_template_accepts_only_approved_placeholders(self):
         template = (
@@ -538,7 +552,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             settings.leaderboard_footer_height,
             DEFAULT_LEADERBOARD_FOOTER_HEIGHT,
         )
-        self.assertEqual(restored.payload()["version"], 31)
+        self.assertEqual(restored.payload()["version"], 32)
 
     def test_leaderboard_accent_color_rejects_nonstandard_hex(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1323,7 +1337,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 loaded.leaderboard_accent_colors,
                 {"vertical:18": "#A12BC3"},
             )
-            self.assertEqual(restored.payload()["version"], 31)
+            self.assertEqual(restored.payload()["version"], 32)
 
     async def test_backgrounds_and_preview_links_are_isolated_by_profile(self):
         scrim = self.make_scrim()
@@ -1615,7 +1629,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(loaded.match_scores, {})
             self.assertEqual(restored.get_server_config(123).license_type, "Standard")
-            self.assertEqual(restored.payload()["version"], 31)
+            self.assertEqual(restored.payload()["version"], 32)
 
     def test_v27_snapshot_migrates_default_accent_color(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1635,7 +1649,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 loaded.leaderboard_accent_color,
                 DEFAULT_LEADERBOARD_ACCENT_COLOR,
             )
-            self.assertEqual(restored.payload()["version"], 31)
+            self.assertEqual(restored.payload()["version"], 32)
 
     async def test_score_command_requires_confirmation_before_replacing_match(self):
         scrim = self.make_scrim()
@@ -1699,7 +1713,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             [MatchScore(4, 1, 5, 1), MatchScore(4, 3, 3, 2)],
         )
         self.assertIn(
-            "Processed 2 teams.",
+            "Processed 2 teams (reviewed by <@7>).",
             interaction.response.edit_message.call_args.kwargs["content"],
         )
 
@@ -2207,6 +2221,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_res_command_sends_final_png_directly(self):
         scrim = self.make_scrim()
+        scrim.max_matches = 2
         progress_message = SimpleNamespace(delete=AsyncMock(), edit=AsyncMock())
         ctx = SimpleNamespace(
             send=AsyncMock(side_effect=[progress_message, SimpleNamespace()])
@@ -2238,20 +2253,25 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
         scrim = self.make_scrim()
         scrim.slots = {}
         scrim.match_scores = {}
-        ctx = SimpleNamespace(send=AsyncMock())
+        progress_message = SimpleNamespace(edit=AsyncMock())
+        ctx = SimpleNamespace(
+            send=AsyncMock(return_value=progress_message),
+            author=SimpleNamespace(id=7),
+            guild=SimpleNamespace(id=scrim.guild_id),
+            channel=SimpleNamespace(id=55),
+        )
         command = bot.get_command("res")
 
         with patch("main.require_staff_scrim", new=AsyncMock(return_value=scrim)):
             await command.callback(ctx)
 
-        self.assertEqual(ctx.send.await_count, 2)
-        image_file = ctx.send.await_args.kwargs["file"]
-        self.assertEqual(image_file.filename, "leaderboard.png")
-        with Image.open(image_file.fp) as rendered:
-            self.assertEqual(
-                rendered.size,
-                leaderboard_canvas_dimensions(20, "vertical", 180, 120),
-            )
+        self.assertEqual(ctx.send.await_count, 1)
+        progress_message.edit.assert_awaited_once()
+        self.assertIn(
+            "Results appear incomplete",
+            progress_message.edit.call_args.kwargs["content"],
+        )
+        self.assertIsNotNone(progress_message.edit.call_args.kwargs.get("view"))
 
     def test_vertical_image_uses_configured_count_and_canvas_dimensions(self):
         scrim = self.make_scrim()
@@ -2850,6 +2870,129 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
         with Image.open(first) as rendered:
             self.assertEqual(rendered.getpixel((540, 118)), (255, 255, 255))
             self.assertEqual(rendered.getpixel((540, 1528)), (255, 255, 255))
+
+
+class ResultPlacementValidationTests(unittest.TestCase):
+    def make_scrim(self):
+        return SimpleNamespace(
+            max_matches=4,
+            slots={
+                number: SimpleNamespace(number=number, status=STATUS_CONFIRMED)
+                for number in (1, 2, 3)
+            },
+            match_scores={},
+        )
+
+    def test_parser_rejects_duplicate_and_out_of_range_placements(self):
+        scrim = self.make_scrim()
+        valid = parse_match_score_lines(
+            "1 5\n3 4",
+            match_number=1,
+            scrim=scrim,
+        )
+        self.assertEqual(
+            valid,
+            [
+                MatchScore(1, 1, 5, 1),
+                MatchScore(1, 3, 4, 2),
+            ],
+        )
+        self.assertEqual(
+            parse_match_score_lines(
+                "1 5 4",
+                match_number=1,
+                scrim=scrim,
+            ),
+            [MatchScore(1, 1, 5, 4)],
+        )
+        for raw_input in ("1 5 0", "1 5 2\n3 4 2"):
+            with self.subTest(raw_input=raw_input):
+                with self.assertRaisesRegex(ValueError, "placement"):
+                    parse_match_score_lines(
+                        raw_input,
+                        match_number=1,
+                        scrim=scrim,
+                    )
+
+    def test_invalid_replacement_scores_do_not_change_saved_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ScrimRepository(
+                SlotStateStore(Path(directory) / "state.sqlite3")
+            )
+            scrim = repository.create(
+                123,
+                "Scores",
+                1001,
+                1002,
+                slot_start=1,
+                slot_end=2,
+            )
+            with repository.transaction():
+                for number, name in ((1, "Alpha"), (2, "Bravo")):
+                    scrim.slots[number] = Slot(
+                        number,
+                        status=STATUS_CONFIRMED,
+                        team_name=name,
+                        tag=name[0],
+                        manager_id=100 + number,
+                        captain_1_id=100 + number,
+                    )
+
+            existing = MatchScore(1, 1, 4, 2)
+            repository.replace_match_scores(
+                scrim.id,
+                123,
+                1,
+                [existing],
+            )
+            before = repository.get_match_scores(scrim.id)
+            invalid_sets = (
+                [MatchScore(1, 99, 5, 1)],
+                [MatchScore(1, 1, 4, 1), MatchScore(1, 2, 3, 1)],
+                [MatchScore(1, 1, 4, 0)],
+            )
+            for scores in invalid_sets:
+                with self.subTest(scores=scores):
+                    with self.assertRaises(ValueError):
+                        repository.replace_match_scores(
+                            scrim.id,
+                            123,
+                            1,
+                            scores,
+                        )
+                    self.assertEqual(
+                        repository.get_match_scores(scrim.id),
+                        before,
+                    )
+
+
+class StaffReviewHandoffTests(unittest.IsolatedAsyncioTestCase):
+    async def test_any_authorized_staff_member_can_review_submitted_scores(self):
+        scrim = LeaderboardV2Tests().make_scrim()
+        view = MatchScoreSubmissionReviewView(
+            owner_id=7,
+            guild_id=scrim.guild_id,
+            channel_id=55,
+            scrim=scrim,
+            match_number=1,
+            scores=[MatchScore(1, 1, 4, 1)],
+            raw_input="1 4",
+        )
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=99),
+            guild=SimpleNamespace(id=scrim.guild_id),
+            channel_id=55,
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        with (
+            patch("main.repository.get", return_value=scrim),
+            patch("main.is_active", return_value=True),
+            patch("main.member_is_staff", return_value=True),
+        ):
+            self.assertIs(await view.authorized_scrim(interaction), scrim)
+
+        interaction.response.send_message.assert_not_awaited()
 
 
 if __name__ == "__main__":

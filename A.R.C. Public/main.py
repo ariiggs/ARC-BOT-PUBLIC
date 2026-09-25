@@ -144,6 +144,7 @@ _global_setup_installed = False
 _loaded = False
 # Each scrim owns its own live announcement and alert tasks.
 active_idpw: dict[str, dict[str, object]] = {}
+active_idpw_locks: dict[str, asyncio.Lock] = {}
 logs_coverage_snapshots_sent: set[str] = set()
 
 
@@ -243,6 +244,33 @@ def disable_view_items(view: discord.ui.View) -> None:
             item = item.item
         if hasattr(item, "disabled"):
             item.disabled = True
+
+
+class ExpiringView(discord.ui.View):
+    """Retire timed controls visibly instead of leaving a dead panel behind."""
+
+    timeout_notice = "⏱️ This panel expired. Run the command again to reopen it."
+
+    async def on_timeout(self) -> None:
+        disable_view_items(self)
+        self.stop()
+        message = getattr(self, "message", None)
+        if message is None:
+            return
+        content = getattr(message, "content", None) or ""
+        notice = self.timeout_notice
+        if notice not in content:
+            content = f"{content}\n\n{notice}" if content else notice
+        try:
+            await message.edit(
+                content=content,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.NotFound, discord.Forbidden):
+            return
+        except discord.HTTPException:
+            logger.exception("Could not retire an expired interactive panel.")
 
 
 def slot_display_line(scrim: Scrim, slot: Slot) -> str:
@@ -446,13 +474,17 @@ async def send_private_command_feedback(
     silent: bool = False,
     **kwargs,
 ):
-    """Send routine prefix-command feedback in the invoking channel."""
+    """Send routine feedback in the invoking channel.
+
+    The legacy function name does not make prefix-command messages private or
+    ephemeral; they remain visible in the channel until Discord deletes them.
+    """
     if silent:
         if delete_command:
             await delete_command_message(ctx)
         return None
     send_kwargs = dict(kwargs)
-    send_kwargs.setdefault("delete_after", 15)
+    send_kwargs.setdefault("delete_after", 20)
     send_kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
     sent = None
     try:
@@ -478,6 +510,32 @@ async def send_private_registration_feedback(
         logger.exception(
             "Could not DM registration feedback to %s.",
             getattr(ctx.author, "id", None),
+        )
+    finally:
+        await delete_command_message(ctx)
+
+
+async def send_dm_command_feedback(
+    ctx: commands.Context,
+    content: str,
+) -> None:
+    """Deliver sensitive command feedback by DM and remove the invocation."""
+    try:
+        await ctx.author.send(
+            content,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        logger.exception(
+            "Could not DM command feedback to %s.",
+            getattr(ctx.author, "id", None),
+        )
+        await send_private_command_feedback(
+            ctx,
+            "I could not send that response privately. Enable DMs from this "
+            "server and run the command again.",
+            delete_command=False,
+            delete_after=30,
         )
     finally:
         await delete_command_message(ctx)
@@ -562,7 +620,188 @@ def _track_active_idpw_message(
     return True
 
 
-async def clear_active_idpw(scrim_id: str | None = None) -> None:
+async def _send_scheduled_idpw_reminder(
+    scrim: Scrim,
+    state: dict[str, object],
+    target_channel,
+    *,
+    start_timestamp: int,
+    stage: str,
+    confirmed_role_id: int | None,
+) -> None:
+    """Send one reminder independently, retrying transient Discord failures."""
+    due_timestamp = start_timestamp - (180 if stage == "three_minute" else 60)
+    delay = due_timestamp - time.time()
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+    title, message_text = (
+        (
+            "The match starts in 3 minutes",
+            "Please prepare.",
+        )
+        if stage == "three_minute"
+        else ("FINAL CALL", "The match begins in 1 minute.")
+    )
+    allowed_mentions = discord.AllowedMentions(
+        everyone=False,
+        users=False,
+        roles=confirmed_role_id is not None,
+        replied_user=False,
+    )
+    retry_delays = (5, 15, 30)
+    for attempt in range(len(retry_delays) + 1):
+        if active_idpw.get(scrim.id) is not state:
+            return
+        remaining = start_timestamp - time.time()
+        if remaining <= 0:
+            return
+        try:
+            reminder = await target_channel.send(
+                content=_format_idpw_reminder(
+                    title=title,
+                    message=message_text,
+                    confirmed_role_id=confirmed_role_id,
+                ),
+                allowed_mentions=allowed_mentions,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Could not send the %s MATCH ACCESS reminder for scrim %s.",
+                stage,
+                scrim.id,
+            )
+            if attempt >= len(retry_delays):
+                return
+            await asyncio.sleep(min(retry_delays[attempt], remaining))
+            continue
+
+        if not _track_active_idpw_message(scrim.id, state, reminder):
+            try:
+                await reminder.delete()
+            except discord.HTTPException:
+                logger.exception(
+                    "Could not remove a stale MATCH ACCESS reminder (%s).",
+                    scrim.id,
+                )
+            return
+        try:
+            repository.set_idpw_reminder(
+                scrim.id,
+                stage,
+                reminder.id,
+            )
+        except (SlotStorageError, ValueError):
+            logger.exception(
+                "Could not persist the %s MATCH ACCESS reminder for scrim %s.",
+                stage,
+                scrim.id,
+            )
+        return
+
+
+async def restore_active_idpw() -> None:
+    """Reattach persisted ID/PW announcements and resume pending reminders."""
+    now = time.time()
+    for config in tuple(repository.idpw_configs.values()):
+        if (
+            config.start_timestamp is None
+            or config.announcement_message_id is None
+            or config.announcement_channel_id is None
+            or config.scrim_id in active_idpw
+        ):
+            continue
+        scrim = repository.get(config.scrim_id)
+        if scrim is None:
+            continue
+        try:
+            channel = await configured_text_channel(
+                scrim, config.announcement_channel_id
+            )
+            if channel is None:
+                continue
+            announcement = await channel.fetch_message(
+                config.announcement_message_id
+            )
+        except discord.NotFound:
+            logger.info(
+                "The persisted MATCH ACCESS message is missing for scrim %s.",
+                scrim.id,
+            )
+            await clear_active_idpw(scrim.id)
+            continue
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Could not restore MATCH ACCESS messages for scrim %s.",
+                scrim.id,
+            )
+            continue
+
+        messages = [announcement]
+        for reminder_id in (
+            config.three_minute_reminder_message_id,
+            config.one_minute_reminder_message_id,
+        ):
+            if reminder_id is None:
+                continue
+            try:
+                reminder = await channel.fetch_message(reminder_id)
+            except discord.NotFound:
+                continue
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception(
+                    "Could not restore a MATCH ACCESS reminder for scrim %s.",
+                    scrim.id,
+                )
+                continue
+            messages.append(reminder)
+
+        state = {
+            "message": announcement,
+            "messages": messages,
+            "tasks": [],
+        }
+        active_idpw[scrim.id] = state
+        remaining = config.start_timestamp - now
+        if (
+            config.three_minute_reminder_message_id is None
+            and remaining >= 180
+        ):
+            state["tasks"].append(
+                asyncio.create_task(
+                    _send_scheduled_idpw_reminder(
+                        scrim,
+                        state,
+                        channel,
+                        start_timestamp=config.start_timestamp,
+                        stage="three_minute",
+                        confirmed_role_id=scrim.confirmed_role_id,
+                    )
+                )
+            )
+        if (
+            config.one_minute_reminder_message_id is None
+            and remaining > 0
+        ):
+            state["tasks"].append(
+                asyncio.create_task(
+                    _send_scheduled_idpw_reminder(
+                        scrim,
+                        state,
+                        channel,
+                        start_timestamp=config.start_timestamp,
+                        stage="one_minute",
+                        confirmed_role_id=scrim.confirmed_role_id,
+                    )
+                )
+            )
+
+
+async def clear_active_idpw(
+    scrim_id: str | None = None,
+    *,
+    preserve_message_id: int | None = None,
+) -> None:
     """Cancel ID/PW alerts and remove the persisted announcement for a scrim."""
     scrim_ids = (
         [scrim_id]
@@ -584,32 +823,46 @@ async def clear_active_idpw(scrim_id: str | None = None) -> None:
             messages.insert(0, message)
         config = repository.get_idpw_config(current_id)
         scrim = repository.get(current_id)
-        persisted_message_id = (
-            config.announcement_message_id
+        persisted_message_ids = (
+            (
+                config.announcement_message_id,
+                config.three_minute_reminder_message_id,
+                config.one_minute_reminder_message_id,
+            )
             if config is not None
-            else None
+            else ()
         )
-        active_message_id = getattr(message, "id", None)
-        if (
-            persisted_message_id is not None
-            and persisted_message_id != active_message_id
-            and scrim is not None
-        ):
+        known_message_ids = {
+            getattr(existing, "id", None) for existing in messages
+        }
+        unresolved_message_ids = [
+            message_id
+            for message_id in persisted_message_ids
+            if message_id is not None
+            and message_id != preserve_message_id
+            and message_id not in known_message_ids
+        ]
+        if unresolved_message_ids and config is not None and scrim is not None:
             try:
+                announcement_channel_id = (
+                    config.announcement_channel_id or config.target_channel_id
+                )
                 channel = await configured_text_channel(
-                    scrim, config.target_channel_id
+                    scrim, announcement_channel_id
                 )
                 fetch_message = getattr(channel, "fetch_message", None)
                 if fetch_message is not None:
-                    persisted_message = await fetch_message(persisted_message_id)
-                    if all(
-                        getattr(existing, "id", None)
-                        != getattr(persisted_message, "id", None)
-                        for existing in messages
-                    ):
-                        messages.insert(0, persisted_message)
-            except discord.NotFound:
-                pass
+                    for message_id in unresolved_message_ids:
+                        try:
+                            persisted_message = await fetch_message(message_id)
+                        except discord.NotFound:
+                            continue
+                        if all(
+                            getattr(existing, "id", None)
+                            != getattr(persisted_message, "id", None)
+                            for existing in messages
+                        ):
+                            messages.append(persisted_message)
             except (discord.Forbidden, discord.HTTPException):
                 logger.exception(
                     "Could not resolve the MATCH ACCESS message for scrim %s.",
@@ -617,6 +870,8 @@ async def clear_active_idpw(scrim_id: str | None = None) -> None:
                 )
 
         for message in messages:
+            if getattr(message, "id", None) == preserve_message_id:
+                continue
             try:
                 await message.delete()
             except discord.NotFound:
@@ -627,7 +882,11 @@ async def clear_active_idpw(scrim_id: str | None = None) -> None:
                     current_id,
                 )
 
-        if config is not None and config.announcement_message_id is not None:
+        if (
+            config is not None
+            and config.announcement_message_id is not None
+            and config.announcement_message_id != preserve_message_id
+        ):
             try:
                 repository.set_idpw_announcement(current_id, None)
             except (SlotStorageError, ValueError):
@@ -675,7 +934,7 @@ def resolve_channel_scrim(ctx: commands.Context, *, staff_only: bool = False) ->
     return matches[0] if len(matches) == 1 else None
 
 
-class StaffScrimSelectView(discord.ui.View):
+class StaffScrimSelectView(ExpiringView):
     """Select a scrim for one Staff command without persisting the choice."""
 
     def __init__(
@@ -1067,7 +1326,7 @@ def operational_message_preview(message: str) -> str:
     return message
 
 
-class OperationalMessageView(discord.ui.View):
+class OperationalMessageView(ExpiringView):
     """Staff-bound panel for editing a scrim's operational messages."""
 
     def __init__(
@@ -1519,7 +1778,7 @@ async def require_channel_scrim(
     return scrim
 
 
-class DurableView(discord.ui.View):
+class DurableView(ExpiringView):
     async def on_error(self, interaction, error, item):
         logger.error("Interaction error", exc_info=error)
         text = (
@@ -1614,7 +1873,7 @@ async def subscription_status(ctx: commands.Context) -> None:
         "Bot Manager can view the subscription status."
     )
     if ctx.guild is None:
-        await send_private_command_feedback(ctx, access_denied, silent=False)
+        await send_dm_command_feedback(ctx, access_denied)
         return
 
     config = repository.get_server_config(ctx.guild.id)
@@ -1634,23 +1893,32 @@ async def subscription_status(ctx: commands.Context) -> None:
         manager_role_id is not None and manager_role_id in role_ids
     )
     if not is_owner and not is_manager:
-        await send_private_command_feedback(ctx, access_denied, silent=False)
+        await send_dm_command_feedback(ctx, access_denied)
         return
 
     authorized, expires_at, duration_days = repository.get_guild_subscription(
         ctx.guild.id
     )
-    await send_private_command_feedback(
-        ctx,
-        "",
-        embed=build_subscription_embed(
-            authorized=authorized,
-            expires_at=expires_at,
-            duration_days=duration_days,
-        ),
-        view=SubscriptionStatusView(),
-        delete_after=60,
-    )
+    try:
+        await ctx.author.send(
+            embed=build_subscription_embed(
+                authorized=authorized,
+                expires_at=expires_at,
+                duration_days=duration_days,
+            ),
+            view=SubscriptionStatusView(),
+            delete_after=60,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        await send_private_command_feedback(
+            ctx,
+            "I could not DM the subscription status. Enable DMs from this server "
+            "and run `!sub` again.",
+            delete_after=30,
+        )
+    finally:
+        await delete_command_message(ctx)
 
 
 @bot.command(name="link")
@@ -2380,6 +2648,7 @@ class SlotReviewView(DurableView):
         result: SlotSnapshot | None = None
         registration_member_id: int | None = None
         approved_registration: RegistrationRequest | None = None
+        reviewed_registration: RegistrationRequest | None = None
         async with self.scrim.state_lock:
             if is_active(self.scrim):
                 current = self.scrim.slots[self.slot.number]
@@ -2391,6 +2660,7 @@ class SlotReviewView(DurableView):
                         and current.assignment_id == request.assignment_id
                         and current.status == STATUS_AVAILABLE
                     ):
+                        reviewed_registration = request
                         result = SlotSnapshot(
                             number=request.slot_number,
                             status=STATUS_PENDING,
@@ -2468,15 +2738,24 @@ class SlotReviewView(DurableView):
                     else f"🟢 Team **{result.team_name}** has been confirmed."
                 )
                 if confirm
-                else f"Team **{result.team_name}** has been released."
+                else (
+                    f"❌ Registration for **{result.team_name}** was rejected."
+                    if self.registration_request
+                    else f"Team **{result.team_name}** has been released."
+                )
             )
             if confirm and self.registration_request and not access_ok:
                 text += " Pending Captain access could not be completed."
-            if confirm and self.registration_request:
+            if self.registration_request:
                 if not await update_registration_reaction(
-                    self.scrim, approved_registration
+                    self.scrim,
+                    reviewed_registration,
+                    approved=confirm,
                 ):
-                    text += " The registration message reaction could not be updated."
+                    text += (
+                        " The registration message could not be marked "
+                        f"{'approved' if confirm else 'rejected'}."
+                    )
             if (
                 confirm
                 and not self.registration_request
@@ -2492,6 +2771,8 @@ class SlotReviewView(DurableView):
                 (
                     "STAFF REGISTRATION APPROVAL"
                     if self.registration_request and confirm
+                    else "STAFF REGISTRATION REJECTION"
+                    if self.registration_request
                     else "STAFF VALIDATION"
                     if confirm
                     else "STAFF RELEASE"
@@ -2520,7 +2801,10 @@ async def delete_staff_review_message(interaction: discord.Interaction) -> bool:
 
 
 async def update_registration_reaction(
-    scrim: Scrim, request: RegistrationRequest | None
+    scrim: Scrim,
+    request: RegistrationRequest | None,
+    *,
+    approved: bool = True,
 ) -> bool:
     if request is None or request.registration_message_id is None:
         return False
@@ -2534,7 +2818,7 @@ async def update_registration_reaction(
         if channel is None:
             return False
         message = await channel.fetch_message(request.registration_message_id)
-        await message.add_reaction("✅")
+        await message.add_reaction("✅" if approved else "❌")
         bot_user = getattr(bot, "user", None)
         if bot_user is not None:
             await message.remove_reaction("🆗", bot_user)
@@ -3174,7 +3458,7 @@ async def reset_slots(ctx: commands.Context) -> None:
             "Click **Confirm Reset** to continue."
         ),
         view=confirmation,
-        delete_after=60,
+        delete_after=120,
     )
     confirmation.message = confirmation_message
 
@@ -3204,6 +3488,11 @@ async def open_scrim(ctx: commands.Context) -> None:
         await send_operational_message(
             ctx, registration_scrim, "open_registration"
         )
+        await send_private_command_feedback(
+            ctx,
+            "✅ Registration is now open.",
+            delete_command=False,
+        )
         return
     scrim = await require_staff_scrim(ctx, allow_public=True)
     if scrim is None:
@@ -3216,10 +3505,32 @@ async def open_scrim(ctx: commands.Context) -> None:
             return
         with repository.transaction():
             scrim.is_open = True
-    await refresh_public_slots(scrim)
+    board_refreshed = await refresh_public_slots(scrim)
     await delete_command_message(ctx)
-    await send_scrim_log(scrim, "SCRIM OPENED", "Manager interactions were opened.")
+    await send_scrim_log(
+        scrim,
+        "SCRIM OPENED",
+        (
+            "Manager interactions were opened."
+            if board_refreshed
+            else "Open state saved, but the public board could not be refreshed."
+        ),
+    )
+    if not board_refreshed:
+        await send_private_command_feedback(
+            ctx,
+            "The scrim is open, but its public board could not be refreshed. "
+            "Check the bot's channel permissions, then run `!update`.",
+            delete_command=False,
+            delete_after=30,
+        )
+        return
     await send_operational_message(ctx, scrim, "open_slots")
+    await send_private_command_feedback(
+        ctx,
+        "✅ Slot interactions are now open.",
+        delete_command=False,
+    )
 
 
 @bot.command(name="close", aliases=["c"])
@@ -3259,9 +3570,26 @@ async def close_scrim(ctx: commands.Context) -> None:
             return
         with repository.transaction():
             scrim.is_open = False
-    await remove_public_controls(scrim)
-    await send_scrim_log(scrim, "SCRIM CLOSED", "Manager interactions were closed.")
+    controls_removed = await remove_public_controls(scrim)
+    await send_scrim_log(
+        scrim,
+        "SCRIM CLOSED",
+        (
+            "Manager interactions were closed."
+            if controls_removed
+            else "Closed state saved, but the public controls could not be removed."
+        ),
+    )
     await delete_command_message(ctx)
+    if not controls_removed:
+        await send_private_command_feedback(
+            ctx,
+            "The scrim is closed, but the public board may still show old controls. "
+            "They should no longer work; check permissions and run `!update`.",
+            delete_command=False,
+            delete_after=30,
+        )
+        return
     await send_operational_message(ctx, scrim, "close_slots")
 
 
@@ -3379,6 +3707,43 @@ async def _publish_idpw(
     password: str | None = None,
     scrim: Scrim | None = None,
     config: object | None = None,
+    specific_match: bool = False,
+) -> None:
+    if scrim is None:
+        scrim = await require_staff_scrim(ctx, allow_public=True)
+        if scrim is None:
+            return
+    lock = active_idpw_locks.setdefault(scrim.id, asyncio.Lock())
+    if lock.locked():
+        await send_private_command_feedback(
+            ctx,
+            "Another ID/PW update is in progress for this scrim. Wait and retry.",
+            delete_after=30,
+        )
+        return
+    async with lock:
+        await _publish_idpw_locked(
+            ctx,
+            lobby_id,
+            minutes,
+            requested_match,
+            password=password,
+            scrim=scrim,
+            config=config,
+            specific_match=specific_match,
+        )
+
+
+async def _publish_idpw_locked(
+    ctx: commands.Context,
+    lobby_id: str,
+    minutes: int,
+    requested_match: int | None = None,
+    *,
+    password: str | None = None,
+    scrim: Scrim | None = None,
+    config: object | None = None,
+    specific_match: bool = False,
 ) -> None:
     """Publish ID/password details for the current or requested match."""
     if scrim is None:
@@ -3407,14 +3772,6 @@ async def _publish_idpw(
             ctx, "The number of minutes must be at least 1."
         )
         return
-    if scrim.confirmed_role_id is None:
-        await send_private_command_feedback(
-            ctx,
-            "This scrim has no Confirmed Captain Role configured. "
-            "Edit the scrim in `!setup` first.",
-        )
-        return
-
     target_channel = await configured_text_channel(scrim, config.target_channel_id)
     if target_channel is None:
         await send_private_command_feedback(
@@ -3423,7 +3780,6 @@ async def _publish_idpw(
         )
         return
 
-    await clear_active_idpw(scrim.id)
     start_timestamp = int(time.time()) + (minutes * 60)
     local_start = datetime.fromtimestamp(
         start_timestamp, tz=timezone_for_name(config.timezone_name)
@@ -3439,6 +3795,8 @@ async def _publish_idpw(
         start_time=heure_formatee,
         confirmed_role_id=scrim.confirmed_role_id,
         map_name=_match_map_for_scrim(scrim, match_number),
+        start_label="Start Time" if specific_match else "Start",
+        separate_role_mention=specific_match,
     )
     role_mentions = discord.AllowedMentions(
         everyone=False, users=False, roles=True, replied_user=False
@@ -3448,14 +3806,6 @@ async def _publish_idpw(
             content=message_content,
             allowed_mentions=role_mentions,
         )
-        repository.set_idpw_announcement(scrim.id, message.id)
-        if requested_match is None:
-            with repository.transaction():
-                scrim.current_match_counter = (
-                    scrim.current_match_counter % scrim.max_matches
-                ) + 1
-        state = {"message": message, "messages": [message], "tasks": []}
-        active_idpw[scrim.id] = state
     except (discord.Forbidden, discord.HTTPException):
         logger.exception("Could not publish MATCH ACCESS for scrim %s.", scrim.id)
         await send_private_command_feedback(
@@ -3464,41 +3814,77 @@ async def _publish_idpw(
         )
         return
 
-    async def schedule_alerts() -> None:
+    try:
+        repository.set_idpw_run(
+            scrim.id,
+            announcement_message_id=message.id,
+            announcement_channel_id=target_channel.id,
+            start_timestamp=start_timestamp,
+        )
+    except (SlotStorageError, ValueError):
+        logger.exception(
+            "Could not save the MATCH ACCESS schedule for scrim %s.", scrim.id
+        )
         try:
-            if minutes > 3:
-                await asyncio.sleep((minutes - 3) * 60)
-                reminder = await target_channel.send(
-                    content=_format_idpw_reminder(
-                        title="The match starts in 3 minutes",
-                        message="Please prepare.",
-                        confirmed_role_id=scrim.confirmed_role_id,
-                    ),
-                    allowed_mentions=role_mentions,
-                )
-                if not _track_active_idpw_message(scrim.id, state, reminder):
-                    await reminder.delete()
-                await asyncio.sleep(2 * 60)
-            elif minutes > 1:
-                await asyncio.sleep((minutes - 1) * 60)
-            if minutes >= 1:
-                reminder = await target_channel.send(
-                    content=_format_idpw_reminder(
-                        title="FINAL CALL",
-                        message="The match begins in 1 minute.",
-                        confirmed_role_id=scrim.confirmed_role_id,
-                    ),
-                    allowed_mentions=role_mentions,
-                )
-                if not _track_active_idpw_message(scrim.id, state, reminder):
-                    await reminder.delete()
-        except asyncio.CancelledError:
-            raise
-        except (discord.Forbidden, discord.HTTPException):
-            logger.exception("Could not send MATCH ACCESS alert.")
+            await message.delete()
+        except discord.HTTPException:
+            logger.exception(
+                "Could not remove untracked MATCH ACCESS message for scrim %s.",
+                scrim.id,
+            )
+        await send_private_command_feedback(
+            ctx,
+            "The announcement was sent, but its reminder schedule could not be "
+            "saved. The previous announcement was kept; please retry after "
+            "checking storage.",
+            delete_after=30,
+        )
+        return
 
-    task = bot.loop.create_task(schedule_alerts())
-    active_idpw[scrim.id]["tasks"].append(task)
+    await clear_active_idpw(scrim.id, preserve_message_id=message.id)
+    state = {"message": message, "messages": [message], "tasks": []}
+    active_idpw[scrim.id] = state
+    try:
+        with repository.transaction():
+            current_match = requested_match or scrim.current_match_counter
+            scrim.current_match_counter = current_match % scrim.max_matches + 1
+    except SlotStorageError:
+        logger.exception(
+            "Could not advance the match counter after ID/PW for scrim %s.",
+            scrim.id,
+        )
+        await send_private_command_feedback(
+            ctx,
+            "The room details and reminders are active, but the match counter "
+            "could not be advanced. Check it in setup before the next match.",
+            delete_after=30,
+        )
+    tasks = state["tasks"]
+    if minutes > 3:
+        tasks.append(
+            asyncio.create_task(
+                _send_scheduled_idpw_reminder(
+                    scrim,
+                    state,
+                    target_channel,
+                    start_timestamp=start_timestamp,
+                    stage="three_minute",
+                    confirmed_role_id=scrim.confirmed_role_id,
+                )
+            )
+        )
+    tasks.append(
+        asyncio.create_task(
+            _send_scheduled_idpw_reminder(
+                scrim,
+                state,
+                target_channel,
+                start_timestamp=start_timestamp,
+                stage="one_minute",
+                confirmed_role_id=scrim.confirmed_role_id,
+            )
+        )
+    )
     await delete_command_message(ctx)
 
 
@@ -3531,61 +3917,16 @@ async def _publish_idpwg(
     if parsed is None:
         return
     scrim, config, room_id, minutes, password = parsed
-
-    target_channel = await configured_text_channel(scrim, config.target_channel_id)
-    if target_channel is None:
-        await send_private_command_feedback(
-            ctx,
-            "The configured ID/password channel could not be found or used.",
-        )
-        return
-
-    await clear_active_idpw(scrim.id)
-    start_timestamp = int(time.time()) + minutes * 60
-    configured_timezone = getattr(scrim, "timezone", config.timezone_name)
-    local_start = datetime.fromtimestamp(
-        start_timestamp,
-        tz=timezone_for_name(configured_timezone),
-    )
-    map_name = _match_map_for_scrim(scrim, game_number)
-    message_content = _format_idpw_announcement(
-        match_number=game_number,
-        room_id=room_id,
+    await _publish_idpw(
+        ctx,
+        room_id,
+        minutes,
+        requested_match=game_number,
         password=password,
-        start_time=local_start.strftime("%H:%M"),
-        confirmed_role_id=scrim.confirmed_role_id,
-        map_name=map_name,
-        start_label="Start Time",
-        separate_role_mention=True,
+        scrim=scrim,
+        config=config,
+        specific_match=True,
     )
-    allowed_mentions = discord.AllowedMentions(
-        everyone=False,
-        users=False,
-        roles=True,
-        replied_user=False,
-    )
-    try:
-        message = await target_channel.send(
-            content=message_content,
-            allowed_mentions=allowed_mentions,
-        )
-        repository.set_idpw_announcement(scrim.id, message.id)
-        with repository.transaction():
-            scrim.current_match_counter = (
-                game_number + 1
-                if game_number < scrim.max_matches
-                else 1
-            )
-        state = {"message": message, "messages": [message], "tasks": []}
-        active_idpw[scrim.id] = state
-    except (discord.Forbidden, discord.HTTPException):
-        logger.exception("Could not publish MATCH ACCESS for scrim %s.", scrim.id)
-        await send_private_command_feedback(
-            ctx,
-            "The MATCH ACCESS message could not be sent to the configured channel.",
-        )
-        return
-    await delete_command_message(ctx)
 
 
 def _register_specific_idpw_commands() -> None:
@@ -3754,7 +4095,7 @@ def _match_scores_snapshot(scrim: Scrim, match_number: int) -> tuple:
     )
 
 
-class MatchScoreSubmissionReviewView(discord.ui.View):
+class MatchScoreSubmissionReviewView(ExpiringView):
     """Confirm or edit a complete match result set before it is saved."""
 
     def __init__(
@@ -3806,6 +4147,8 @@ class MatchScoreSubmissionReviewView(discord.ui.View):
                 f"Confirm replaces the previous complete result set for Match "
                 f"{self.match_number}; teams omitted here will be removed.\n\n"
                 + "\n".join(score_lines)
+                + "\n\nAny authorized scrim Staff member in this channel may "
+                "review this submission."
             ),
             color=discord.Color.orange(),
         )
@@ -3818,12 +4161,6 @@ class MatchScoreSubmissionReviewView(discord.ui.View):
         self,
         interaction: discord.Interaction,
     ) -> Scrim | None:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "This score review belongs to another staff member.",
-                ephemeral=True,
-            )
-            return None
         if (
             getattr(interaction.guild, "id", None) != self.guild_id
             or interaction.channel_id != self.channel_id
@@ -3972,7 +4309,8 @@ class MatchScoreSubmissionReviewView(discord.ui.View):
         await interaction.response.edit_message(
             content=(
                 f"✅ Scores saved for Match {self.match_number}: "
-                f"Processed {processed} teams. Use `!res` when you are ready "
+                f"Processed {processed} teams (reviewed by "
+                f"<@{interaction.user.id}>). Use `!res` when you are ready "
                 "to publish the leaderboard image."
             ),
             embed=None,
@@ -4000,6 +4338,7 @@ class MatchScoreSubmissionReviewView(discord.ui.View):
         if scrim is None:
             return
         self.editing = True
+        self.owner_id = interaction.user.id
         await interaction.response.send_modal(
             MatchScoreSubmissionEditModal(self)
         )
@@ -4135,7 +4474,7 @@ class MatchScoreSubmissionEditModal(discord.ui.Modal):
         )
 
 
-class MatchScoreCorrectionView(discord.ui.View):
+class MatchScoreCorrectionView(ExpiringView):
     """Let the command owner choose one assigned team to correct."""
 
     def __init__(
@@ -4430,7 +4769,7 @@ class MatchScoreCorrectionModal(discord.ui.Modal):
             )
 
 
-class MatchScoreCorrectionReviewView(discord.ui.View):
+class MatchScoreCorrectionReviewView(ExpiringView):
     """Review a score correction before saving its single-team upsert."""
 
     def __init__(
@@ -5119,7 +5458,7 @@ def _available_leaderboard_scrims(
     ]
 
 
-class LeaderboardPanelView(discord.ui.View):
+class LeaderboardPanelView(ExpiringView):
     """Owner- and scrim-bound base for the standalone leaderboard panel."""
 
     def __init__(
@@ -5129,7 +5468,7 @@ class LeaderboardPanelView(discord.ui.View):
         guild_id: int,
         scrim_id: str | None = None,
     ) -> None:
-        super().__init__(timeout=600)
+        super().__init__(timeout=300)
         self.owner_id = owner_id
         self.guild_id = guild_id
         self.scrim_id = scrim_id
@@ -5967,7 +6306,7 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
 
 
 class LeaderboardAccentColorView(LeaderboardPanelView):
-    """Choose the generated date, team, and score text color for one profile."""
+    """Choose the generated date, team, and score text color for one scrim."""
 
     def __init__(
         self,
@@ -5998,16 +6337,9 @@ class LeaderboardAccentColorView(LeaderboardPanelView):
             if scrim is not None
             else DEFAULT_LEADERBOARD_ACCENT_COLOR
         )
-        orientation, team_count = (
-            _leaderboard_scrim_profile(scrim)
-            if scrim is not None
-            else (DEFAULT_LEADERBOARD_ORIENTATION, DEFAULT_LEADERBOARD_TEAM_COUNT)
-        )
-        profile = f"{orientation.title()} / {team_count} teams"
         return discord.Embed(
             title="Leaderboard Text Color",
             description=(
-                f"Profile: **{profile}**\n"
                 f"Current color: **{_leaderboard_accent_label(accent_color)}**\n"
                 "This color applies only to generated dates, team names, and "
                 "scores. Table styling stays fixed.\n"
@@ -6718,9 +7050,208 @@ async def leaderboard_settings_command(ctx: commands.Context) -> None:
         embed=view.embed(),
         view=view,
         allowed_mentions=discord.AllowedMentions.none(),
-        delete_after=600,
+        delete_after=330,
     )
     await delete_command_message(ctx)
+
+
+class IncompleteResultsReviewView(ExpiringView):
+    """Require a staff confirmation before publishing missing-match results."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild_id: int,
+        channel_id: int,
+        scrim: Scrim,
+    ) -> None:
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.scrim_id = scrim.id
+        self.assignment_generation = assignment_fingerprint(scrim)
+        self.score_snapshot = tuple(
+            sorted(
+                (
+                    score.match_number,
+                    score.slot_number,
+                    score.kills,
+                    score.placement,
+                )
+                for score in scrim.match_scores.values()
+            )
+        )
+        self.message: discord.Message | None = None
+        self.completed = False
+        self.processing = False
+        self.timeout_notice = (
+            "⏱️ This incomplete-results review expired. Nothing was published."
+        )
+
+    async def current_scrim(
+        self,
+        interaction: discord.Interaction,
+    ) -> Scrim | None:
+        if (
+            getattr(interaction.guild, "id", None) != self.guild_id
+            or interaction.channel_id != self.channel_id
+        ):
+            await interaction.response.send_message(
+                "This review is only valid in its original server and channel.",
+                ephemeral=True,
+            )
+            return None
+        scrim = repository.get(self.scrim_id)
+        if (
+            scrim is None
+            or scrim.guild_id != self.guild_id
+            or not member_is_staff(interaction.user, scrim)
+        ):
+            await interaction.response.send_message(
+                "You no longer have access to publish this scrim's results.",
+                ephemeral=True,
+            )
+            return None
+        current_scores = tuple(
+            sorted(
+                (
+                    score.match_number,
+                    score.slot_number,
+                    score.kills,
+                    score.placement,
+                )
+                for score in scrim.match_scores.values()
+            )
+        )
+        if (
+            assignment_fingerprint(scrim) != self.assignment_generation
+            or current_scores != self.score_snapshot
+        ):
+            self.completed = True
+            disable_view_items(self)
+            self.stop()
+            await interaction.response.edit_message(
+                content=(
+                    "Teams or saved scores changed after this warning. "
+                    "Nothing was published. Run `!res` again to review the "
+                    "current results."
+                ),
+                embed=None,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return None
+        if self.completed:
+            await interaction.response.send_message(
+                "This results review has already been processed.",
+                ephemeral=True,
+            )
+            return None
+        return scrim
+
+    async def on_timeout(self) -> None:
+        if self.completed:
+            return
+        self.completed = True
+        disable_view_items(self)
+        self.stop()
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=self.timeout_notice,
+                embed=None,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not retire incomplete-results review.")
+
+    @discord.ui.button(
+        label="Publish anyway",
+        emoji="⚠️",
+        style=discord.ButtonStyle.danger,
+    )
+    async def publish_anyway(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.processing:
+            await interaction.response.send_message(
+                "This results review is already being processed.",
+                ephemeral=True,
+            )
+            return
+        scrim = await self.current_scrim(interaction)
+        if scrim is None:
+            return
+        self.processing = True
+        await interaction.response.defer(ephemeral=True)
+        try:
+            rows = calculate_leaderboard(scrim)
+            image = build_leaderboard_image(scrim, rows)
+            channel = interaction.channel
+            if channel is None:
+                channel = await get_channel(self.channel_id)
+            await channel.send(
+                content=build_results_publication_message(scrim, rows),
+                file=discord.File(image, filename="leaderboard.png"),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (OSError, ValueError, discord.HTTPException):
+            logger.exception(
+                "Could not publish incomplete results for scrim %s.", scrim.id
+            )
+            self.processing = False
+            await interaction.followup.send(
+                "The leaderboard could not be published. Nothing was confirmed "
+                "as published; check the bot's permissions and try `!res` again.",
+                ephemeral=True,
+            )
+            return
+
+        self.completed = True
+        disable_view_items(self)
+        self.stop()
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="✅ Incomplete results were published above.",
+                    embed=None,
+                    view=self,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                logger.exception("Could not close the results publication review.")
+        await interaction.followup.send(
+            "The leaderboard was published. It is marked as incomplete.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Cancel",
+        emoji="✖️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if await self.current_scrim(interaction) is None:
+            return
+        self.completed = True
+        disable_view_items(self)
+        self.stop()
+        await interaction.response.edit_message(
+            content="Cancelled. No leaderboard was published.",
+            embed=None,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
 
 @bot.command(name="res", aliases=["leaderboard", "lb"])
@@ -6742,6 +7273,51 @@ async def leaderboard_command(ctx: commands.Context) -> None:
                 "Could not show leaderboard progress for scrim %s.",
                 scrim.id,
             )
+
+        async def update_prompt(content: str, view: discord.ui.View):
+            if progress_message is not None:
+                try:
+                    updated = await progress_message.edit(
+                        content=content,
+                        view=view,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return updated or progress_message
+                except discord.HTTPException:
+                    logger.exception(
+                        "Could not show incomplete-results review for scrim %s.",
+                        scrim.id,
+                    )
+            try:
+                return await ctx.send(
+                    content,
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                logger.exception(
+                    "Could not send incomplete-results review for scrim %s.",
+                    scrim.id,
+                )
+                return None
+
+        missing_matches = missing_score_matches(scrim)
+        if missing_matches:
+            review = IncompleteResultsReviewView(
+                owner_id=ctx.author.id,
+                guild_id=scrim.guild_id,
+                channel_id=ctx.channel.id,
+                scrim=scrim,
+            )
+            match_list = ", ".join(str(number) for number in missing_matches)
+            review.message = await update_prompt(
+                "⚠️ **Results appear incomplete.** No scores are saved for "
+                f"match(es) {match_list}. Teams omitted from a submitted match "
+                "are treated as having no result for that match. Any authorized "
+                "Staff member in this channel may decide whether to publish.",
+                view=review,
+            )
+            return
         rows = calculate_leaderboard(scrim)
         image = build_leaderboard_image(scrim, rows)
         await ctx.send(
@@ -6787,50 +7363,118 @@ async def leaderboard_command(ctx: commands.Context) -> None:
         await delete_command_message(ctx)
 
 
-HELP_COPY_TEXT = (
-    "A.R.C. HELP\n"
-    "STAFF: !setup | !setres | !set @Role | !say text | !reset\n"
-    "SLOTS: !add Team / TAG / @Captain | !confirm 03 04 | !remove 03 | "
-    "!open | !close | !remind\n"
-    "STATUS: !slots [Scrim] | !update [Scrim] | !res / !lb "
-    "(posts leaderboard image)\n"
-    f"!resg1-{MAX_MATCHES} slot kills "
-    "(best team first; omit missed teams; review and confirm to save)\n"
-    "!editres <match> (choose team, enter rank and kills)\n"
-    "ROOM: !idpw room / minutes | !idpwg1-25 room / minutes\n"
-    "CAPTAINS: !register Team / TAG [/ @Manager] | "
-    "!cap add|transfer|remove @User\n"
-    "Use ! for every command. Staff, registration, Manager, and Cap Transfer "
-    "commands require their configured role/channel."
-)
+HELP_CATEGORIES = {
+    "Getting started": {
+        "description": "Setup, server access, and help",
+        "text": (
+            "`!help` — open this category panel.\n"
+            "`!setup` — create or configure scrims.\n"
+            "`!set @Staff` — choose the server-wide Staff role.\n"
+            "`!setres` — configure leaderboard appearance and scoring.\n"
+            "`!sub` — view subscription status privately (Server Owner or Bot Manager)."
+        ),
+    },
+    "Scrims and slots": {
+        "description": "Boards, teams, and staff operations",
+        "text": (
+            "`!slots [Scrim]` — view a slot summary.\n"
+            "`!update [Scrim]` — publish or refresh a slot board.\n"
+            "`!open` / `!close` — open or close slot interactions/registrations.\n"
+            "`!add Team / TAG / @Captain` — add a team to the selected scrim.\n"
+            "`!confirm 03 04` — confirm assigned slots.\n"
+            "`!remove 03 04` — remove assigned slots.\n"
+            "`!reset` — clear a scrim after confirming the warning.\n"
+            "`!remind` — remind reserved teams to confirm.\n"
+            "`!say <message>` — publish a staff announcement.\n"
+            "`!msg <key> <text>` — edit an operational message."
+        ),
+    },
+    "Registration and captains": {
+        "description": "Team registration and captain tools",
+        "text": (
+            "`!register Team / TAG [/ @Captain]` — request a registration.\n"
+            "`!cap add @User` — grant captain access.\n"
+            "`!cap transfer @User` — transfer captain access.\n"
+            "`!cap remove @User` — remove captain access.\n"
+            "Registration, Manager, and Cap Transfer actions require their "
+            "configured roles and channels."
+        ),
+    },
+    "Match results": {
+        "description": "Score entry, review, and leaderboard",
+        "text": (
+            "`!res` / `!lb` — generate the leaderboard image.\n"
+            f"`!resg1-{MAX_MATCHES} slot kills` — enter results in rank order, "
+            "best team first. Omit teams that did not play; review before saving.\n"
+            "`!editres <match>` — choose one team and correct its rank/kills.\n"
+            "Confirming a full match replaces that match's previous result set."
+        ),
+    },
+    "Room ID and password": {
+        "description": "Fixed or per-match room access details",
+        "text": (
+            "`!idpw <room> / <minutes>` — use the saved fixed password.\n"
+            "`!idpw <room> / <password> / <minutes>` — provide a dynamic "
+            "password.\n"
+            f"`!idpwg1-{MAX_MATCHES}` accepts the same formats for a specific "
+            "match. The reminder target and time zone come from scrim setup."
+        ),
+    },
+}
+
+HELP_COPY_TEXT = "A.R.C. HELP\n\n" + "\n\n".join(
+    f"{category.upper()}\n{details['text']}"
+    for category, details in HELP_CATEGORIES.items()
+) + "\n\nUse `!` for every command. Configured roles and channels apply."
 
 
-def build_help_text() -> str:
-    """Return the condensed, Discord-formatted help content."""
+def build_help_text(category: str | None = None) -> str:
+    """Return the selected help category or the interactive panel prompt."""
+    if category not in HELP_CATEGORIES:
+        return (
+            ">>> **A.R.C. HELP**\n"
+            "Choose a category below to see commands and their formats. "
+            "Use **Copy text** for the complete help guide."
+        )
+    details = HELP_CATEGORIES[category]
     return (
-        ">>> **A.R.C. HELP**\n"
-        "**STAFF** `!setup` `!setres` `!set @Role` `!say text` "
-        "`!reset`\n"
-        "**SLOTS** `!add Team / TAG / @Captain` `!confirm 03 04` "
-        "`!remove 03` `!open` `!close` `!remind`\n"
-        "**STATUS** `!slots [Scrim]` `!update [Scrim]` "
-        "`!res`/`!lb` (posts leaderboard image) "
-        f"`!resg1-{MAX_MATCHES} slot kills` "
-        "(best team first; omit missed teams; review and confirm to save) "
-        "`!editres <match>` (choose team, enter rank and kills)\n"
-        "**ROOM** `!idpw room / minutes` `!idpwg1-25 room / minutes`\n"
-        "**CAPTAINS** `!register Team / TAG [/ @Manager]` "
-        "`!cap add|transfer|remove @User`\n"
+        f">>> **A.R.C. HELP · {category.upper()}**\n"
+        f"{details['text']}\n\n"
         "_Use `!` for every command. Configured roles and channels apply._"
     )
 
 
-class HelpView(discord.ui.View):
+class HelpView(ExpiringView):
     """Owner-only controls for the condensed help message."""
 
     def __init__(self, owner_id: int) -> None:
         super().__init__(timeout=300)
         self.owner_id = owner_id
+        self.timeout_notice = "⏱️ This help panel expired. Run `!help` again."
+        category_select = discord.ui.Select(
+            placeholder="Choose a help category...",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=category,
+                    value=category,
+                    description=details["description"],
+                )
+                for category, details in HELP_CATEGORIES.items()
+            ],
+        )
+
+        async def select_category(interaction: discord.Interaction) -> None:
+            category = category_select.values[0]
+            await interaction.response.edit_message(
+                content=build_help_text(category),
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        category_select.callback = select_category
+        self.add_item(category_select)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
@@ -6877,7 +7521,7 @@ class HelpView(discord.ui.View):
 @bot.command(name="help", aliases=["h"])
 async def help_command(ctx: commands.Context) -> None:
     view = HelpView(ctx.author.id)
-    await send_private_command_feedback(
+    view.message = await send_private_command_feedback(
         ctx,
         build_help_text(),
         delete_after=None,
@@ -6888,10 +7532,9 @@ async def help_command(ctx: commands.Context) -> None:
 @bot.group(name="admin", invoke_without_command=True, hidden=True)
 @commands.is_owner()
 async def admin_command(ctx: commands.Context) -> None:
-    await send_private_command_feedback(
+    await send_dm_command_feedback(
         ctx,
         "Use `!admin add @User`, `!admin remove @User`, or `!admin list`.",
-        silent=False,
     )
 
 
@@ -6901,14 +7544,14 @@ async def admin_add(ctx: commands.Context, user: discord.User) -> None:
     try:
         added = repository.authorize_admin(user.id)
     except ValueError as error:
-        await send_private_command_feedback(ctx, str(error), silent=False)
+        await send_dm_command_feedback(ctx, str(error))
         return
     message = (
         f"User `{user.id}` is now an authorized bot admin."
         if added
         else f"User `{user.id}` is already an authorized bot admin."
     )
-    await send_private_command_feedback(ctx, message, silent=False)
+    await send_dm_command_feedback(ctx, message)
 
 
 @admin_command.command(name="remove")
@@ -6917,14 +7560,14 @@ async def admin_remove(ctx: commands.Context, user: discord.User) -> None:
     try:
         removed = repository.revoke_admin(user.id)
     except ValueError as error:
-        await send_private_command_feedback(ctx, str(error), silent=False)
+        await send_dm_command_feedback(ctx, str(error))
         return
     message = (
         f"User `{user.id}` has been removed from bot admins."
         if removed
         else f"User `{user.id}` was not an authorized bot admin."
     )
-    await send_private_command_feedback(ctx, message, silent=False)
+    await send_dm_command_feedback(ctx, message)
 
 
 @admin_command.command(name="list")
@@ -6937,7 +7580,7 @@ async def admin_list(ctx: commands.Context) -> None:
         )
     else:
         message = "No authorized bot admins."
-    await send_private_command_feedback(ctx, message, silent=False)
+    await send_dm_command_feedback(ctx, message)
 
 
 def build_auth_panel_embed() -> discord.Embed:
@@ -7027,6 +7670,10 @@ class AuthAdminPanelView(DurableView):
     def __init__(self, owner_id: int):
         super().__init__(timeout=300)
         self.owner_id = owner_id
+        self.timeout_notice = (
+            "⏱️ This private authorization panel expired. Run `!auth` again "
+            "to reopen it in your DMs."
+        )
         self.selected_tier: str | None = None
         self.message: discord.Message | None = None
         self.rebuild()
@@ -7310,14 +7957,22 @@ class AuthRemoveGuildModal(discord.ui.Modal):
 @auth_admin_required()
 async def auth_command(ctx: commands.Context) -> None:
     view = AuthAdminPanelView(owner_id=ctx.author.id)
-    view.message = await send_private_command_feedback(
-        ctx,
-        "",
-        embed=build_auth_panel_embed(),
-        view=view,
-        delete_after=300,
-        silent=False,
-    )
+    try:
+        view.message = await ctx.author.send(
+            embed=build_auth_panel_embed(),
+            view=view,
+            delete_after=330,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        await send_private_command_feedback(
+            ctx,
+            "I could not DM the authorization panel. Enable DMs from this server "
+            "and run `!auth` again.",
+            delete_after=30,
+        )
+    finally:
+        await delete_command_message(ctx)
 
 
 async def authorized_guild_name(guild_id: int) -> str | None:
@@ -7362,12 +8017,17 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
             silent=False,
         )
     elif isinstance(error, commands.MissingRequiredArgument):
-        if command_name in {"confirm", "remove", "say"}:
-            await send_private_command_feedback(ctx, "", silent=True)
-            return
+        command_usage = {
+            "confirm": "Use `!confirm <slot> [<slot> ...]`.",
+            "remove": "Use `!remove <slot> [<slot> ...]`.",
+            "say": "Use `!say <message>`.",
+        }
         await send_private_command_feedback(
             ctx,
-            "A required argument is missing. Use `!help` to check the command format.",
+            command_usage.get(
+                command_name,
+                "A required argument is missing. Use `!help` to check the command format.",
+            ),
             silent=False,
         )
     elif isinstance(error, commands.BadArgument):
@@ -7466,6 +8126,7 @@ async def on_ready() -> None:
     if bot.user is not None:
         logger.info("Bot connected as %s (ID: %s)", bot.user, bot.user.id)
     await migrate_legacy()
+    await restore_active_idpw()
     results = await asyncio.gather(
         *(
             publish_scrim(scrim)
@@ -7780,7 +8441,27 @@ def build_results_publication_message(
         message = DEFAULT_OPERATIONAL_MESSAGES["publish_results"].format(
             **replacements
         )
+    missing_matches = missing_score_matches(scrim)
+    if missing_matches:
+        message += (
+            "\n\n⚠️ **Incomplete results:** no scores are saved for match(es) "
+            + ", ".join(str(number) for number in missing_matches)
+            + "."
+        )
     return message if len(message) <= 2000 else f"{message[:1997]}..."
+
+
+def missing_score_matches(scrim: Scrim) -> list[int]:
+    """Return configured match numbers that have no saved score rows."""
+    saved_matches = {
+        score.match_number
+        for score in getattr(scrim, "match_scores", {}).values()
+    }
+    return [
+        match_number
+        for match_number in range(1, scrim.max_matches + 1)
+        if match_number not in saved_matches
+    ]
 
 
 def parse_match_score_lines(
@@ -7792,6 +8473,7 @@ def parse_match_score_lines(
     """Parse ordered `slot kills` lines or legacy explicit-placement lines."""
     scores: list[MatchScore] = []
     seen_slots: set[int] = set()
+    seen_placements: set[int] = set()
     lines = [
         (line_number, line.strip())
         for line_number, line in enumerate(str(input_string).splitlines(), start=1)
@@ -7846,7 +8528,12 @@ def parse_match_score_lines(
             raise ValueError(f"Line {line_number} has a negative kill count.")
         if placement < 1:
             raise ValueError(f"Line {line_number} has an invalid placement.")
+        if placement in seen_placements:
+            raise ValueError(
+                f"Line {line_number} repeats placement {placement}."
+            )
         seen_slots.add(slot_number)
+        seen_placements.add(placement)
         scores.append(
             MatchScore(
                 match_number=match_number,
@@ -8095,10 +8782,9 @@ def _build_configured_leaderboard_image(
         (width, height),
     )
     margin = LEADERBOARD_OUTER_MARGIN
-    text = _leaderboard_accent_rgb(
+    generated_text = _leaderboard_accent_rgb(
         _leaderboard_profile_accent_color(scrim)
     )
-
     table_top = margin + header_height + LEADERBOARD_SECTION_GAP
     draw = ImageDraw.Draw(output, "RGBA")
     date_label = datetime.now(
@@ -8109,7 +8795,7 @@ def _build_configured_leaderboard_image(
         (width - margin, margin),
         date_label,
         font=date_font,
-        fill=text,
+        fill=generated_text,
         anchor="rt",
     )
     if background_path == LEADERBOARD_BACKGROUND:
@@ -8127,7 +8813,7 @@ def _build_configured_leaderboard_image(
                 (margin, margin + header_height // 2),
                 scrim_title,
                 font=title_font,
-                fill=text,
+                fill=generated_text,
                 anchor="lm",
             )
 
@@ -8183,7 +8869,7 @@ def _build_configured_leaderboard_image(
                 (field_centers[0], text_y),
                 rank_text,
                 font=rank_font,
-                fill=text,
+                fill=generated_text,
                 anchor="mm",
             )
             if row_index >= len(column_rows):
@@ -8210,7 +8896,7 @@ def _build_configured_leaderboard_image(
                 ),
                 team_text,
                 font=team_font,
-                fill=text,
+                fill=generated_text,
                 anchor="lm",
             )
             for field_index, value in enumerate(
@@ -8237,7 +8923,7 @@ def _build_configured_leaderboard_image(
                     (field_centers[field_index], text_y),
                     value_text,
                     font=value_font,
-                    fill=text,
+                    fill=generated_text,
                     anchor="mm",
                 )
     buffer = io.BytesIO()
@@ -8267,7 +8953,7 @@ def build_leaderboard_image(
     )
 
 
-class SlotsScrimSelectView(discord.ui.View):
+class SlotsScrimSelectView(ExpiringView):
     """Let a Manager choose an active scrim for the !slots summary."""
 
     def __init__(
@@ -8362,7 +9048,7 @@ async def show_slots(ctx: commands.Context, *, name: str | None = None) -> None:
             ctx,
             "❌ You do not have permission to use this command.",
             silent=False,
-            delete_after=3,
+            delete_after=20,
         )
         return
 
@@ -8372,7 +9058,7 @@ async def show_slots(ctx: commands.Context, *, name: str | None = None) -> None:
             ctx,
             "❌ No active scrims found.",
             silent=False,
-            delete_after=3,
+            delete_after=20,
         )
         return
 
@@ -8383,7 +9069,7 @@ async def show_slots(ctx: commands.Context, *, name: str | None = None) -> None:
                 ctx,
                 "❌ No active scrim found with that name.",
                 silent=False,
-                delete_after=3,
+                delete_after=20,
             )
             return
         await send_slot_status_embed(ctx, scrim)
@@ -8403,7 +9089,7 @@ async def show_slots(ctx: commands.Context, *, name: str | None = None) -> None:
         await ctx.send(
             "📊 Select a scrim to view its slot status:",
             view=view,
-            delete_after=120,
+            delete_after=150,
         )
     except discord.HTTPException:
         logger.exception("Could not show the !slots scrim selector.")
@@ -8411,7 +9097,7 @@ async def show_slots(ctx: commands.Context, *, name: str | None = None) -> None:
         await delete_command_message(ctx)
 
 
-class UpdateScrimSelectView(discord.ui.View):
+class UpdateScrimSelectView(ExpiringView):
     """Let staff choose which active scrim should be published or refreshed."""
 
     def __init__(
@@ -8512,7 +9198,7 @@ async def update_slots_command(
         await send_private_command_feedback(
             ctx,
             "No active scrims are configured for this server.",
-            silent=True,
+            silent=False,
         )
         return
 
@@ -8522,18 +9208,29 @@ async def update_slots_command(
             await send_private_command_feedback(
                 ctx,
                 "Scrim not found for this server.",
-                silent=True,
+                silent=False,
             )
             return
         if not member_is_staff(ctx.author, scrim):
             await send_private_command_feedback(
                 ctx,
                 "You must have the authorized staff role to update this board.",
-                silent=True,
+                silent=False,
             )
             return
         if await publish_scrim(scrim):
-            await send_private_command_feedback(ctx, "The slot board has been updated.")
+            await send_private_command_feedback(
+                ctx,
+                "✅ The slot board has been updated.",
+            )
+        else:
+            await send_private_command_feedback(
+                ctx,
+                "❌ The board was not updated. Check the bot's channel permissions "
+                "and try `!update` again.",
+                silent=False,
+                delete_after=30,
+            )
         return
 
     channel_scrim = resolve_channel_scrim(ctx)
@@ -8542,11 +9239,22 @@ async def update_slots_command(
             await send_private_command_feedback(
                 ctx,
                 "You must have the authorized Staff role to update this board.",
-                silent=True,
+                silent=False,
             )
             return
         if await publish_scrim(channel_scrim):
-            await send_private_command_feedback(ctx, "The slot board has been updated.")
+            await send_private_command_feedback(
+                ctx,
+                "✅ The slot board has been updated.",
+            )
+        else:
+            await send_private_command_feedback(
+                ctx,
+                "❌ The board was not updated. Check the bot's channel permissions "
+                "and try `!update` again.",
+                silent=False,
+                delete_after=30,
+            )
         return
 
     view = UpdateScrimSelectView(
@@ -8558,7 +9266,7 @@ async def update_slots_command(
         await ctx.send(
             "🔄 Select a scrim to update:",
             view=view,
-            delete_after=120,
+            delete_after=150,
         )
     except discord.HTTPException:
         logger.exception("Could not show the !update scrim selector.")
@@ -9191,14 +9899,12 @@ async def add_team(ctx: commands.Context, *, arguments: str) -> None:
             )
         if not board_refreshed:
             messages.append("⚠️ The slot board could not be refreshed.")
-        if len(messages) > 1:
-            await send_private_command_feedback(
-                ctx,
-                "\n".join(messages),
-                silent=False,
-            )
-        else:
-            await delete_command_message(ctx)
+        await send_private_command_feedback(
+            ctx,
+            "\n".join(messages),
+            silent=False,
+            delete_after=30,
+        )
         return
 
     view = AddRegistrationView(ctx, scrim, valid_entries, error_entries)
@@ -9806,7 +10512,7 @@ async def confirm_slot(ctx: commands.Context, *, slot_numbers: str) -> None:
             for slot in manager_confirmations
         )
     )
-    await refresh_public_slots(scrim)
+    board_refreshed = await refresh_public_slots(scrim)
     slot_details = ", ".join(
         f"{slot.number:02d} · team **{slot.team_name}**" for slot in confirmed
     )
@@ -9822,10 +10528,15 @@ async def confirm_slot(ctx: commands.Context, *, slot_numbers: str) -> None:
             + ", ".join(f"{number:02d}" for number in failed_role_updates)
             + "."
         )
+    if not board_refreshed:
+        result_lines.append(
+            "⚠️ The slot board could not be refreshed. Check bot permissions "
+            "and run `!update`."
+        )
     await send_private_command_feedback(
         ctx,
         "\n".join(result_lines),
-        delete_after=3,
+        delete_after=30,
     )
     await send_scrim_log(
         scrim,
@@ -9837,37 +10548,76 @@ async def confirm_slot(ctx: commands.Context, *, slot_numbers: str) -> None:
 @bot.command(name="remove", aliases=["rm"])
 @commands.guild_only()
 async def remove_team(ctx: commands.Context, *, slot_numbers: str) -> None:
-    scrim = await require_staff_scrim(ctx)
+    scrim = await require_staff_scrim(ctx, silent=False)
     if scrim is None:
         return
     try:
         requested_numbers = parse_slot_numbers(slot_numbers)
-    except ValueError:
-        await send_private_command_feedback(ctx, "", silent=True)
+    except ValueError as error:
+        await send_private_command_feedback(
+            ctx,
+            f"❌ {error} Use `!remove <slot>` or `!remove <slot> <slot> ...`.",
+            silent=False,
+        )
         return
     removed: list[SlotSnapshot] = []
     async with scrim.state_lock:
         if not is_active(scrim):
-            await send_private_command_feedback(ctx, "", silent=True)
+            await send_private_command_feedback(
+                ctx,
+                "This scrim no longer exists. No slots were changed.",
+                silent=False,
+            )
             return
         slots = [scrim.slots.get(number) for number in requested_numbers]
         if any(slot is None or slot_is_assignable(slot) for slot in slots):
-            await send_private_command_feedback(ctx, "", silent=True)
+            invalid_numbers = [
+                number
+                for number, slot in zip(requested_numbers, slots)
+                if slot is None or slot_is_assignable(slot)
+            ]
+            await send_private_command_feedback(
+                ctx,
+                "No changes were made. These slots are invalid or unassigned: "
+                + ", ".join(f"{number:02d}" for number in invalid_numbers)
+                + ".",
+                silent=False,
+            )
             return
         with repository.transaction():
             for slot in slots:
                 removed.append(slot.snapshot())
                 slot.clear()
+    access_failures = []
     for captain_id in {
         captain_id
         for slot in removed
         for captain_id in (slot.captain_1_id, slot.captain_2_id)
         if captain_id is not None
     }:
-        await revoke_manager_access_if_unused(scrim, captain_id)
-    await refresh_public_slots(scrim)
+        if not await revoke_manager_access_if_unused(scrim, captain_id):
+            access_failures.append(captain_id)
+    board_refreshed = await refresh_public_slots(scrim)
     slot_details = ", ".join(
         f"{slot.number:02d} · team **{slot.team_name}**" for slot in removed
+    )
+    result_lines = [f"✅ Removed slot(s): {slot_details}."]
+    if access_failures:
+        result_lines.append(
+            "⚠️ Captain access could not be synchronized for user(s): "
+            + ", ".join(f"<@{user_id}>" for user_id in access_failures)
+            + "."
+        )
+    if not board_refreshed:
+        result_lines.append(
+            "⚠️ The slot board could not be refreshed. Check bot permissions "
+            "and run `!update`."
+        )
+    await send_private_command_feedback(
+        ctx,
+        "\n".join(result_lines),
+        silent=False,
+        delete_after=30,
     )
     await send_scrim_log(
         scrim,

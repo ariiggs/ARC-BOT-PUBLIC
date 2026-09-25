@@ -53,7 +53,7 @@ class ConfirmCommandTests(unittest.IsolatedAsyncioTestCase):
         confirm_role.assert_awaited_once_with(scrim, 101)
         feedback.assert_awaited_once()
         self.assertIn("Confirmed slot(s): 03", feedback.await_args.args[1])
-        self.assertEqual(feedback.await_args.kwargs["delete_after"], 3)
+        self.assertEqual(feedback.await_args.kwargs["delete_after"], 30)
 
     async def test_confirm_moves_reserved_slot_to_confirmed(self):
         ctx = self.make_context()
@@ -76,7 +76,7 @@ class ConfirmCommandTests(unittest.IsolatedAsyncioTestCase):
         confirm_role.assert_awaited_once_with(scrim, 101)
         feedback.assert_awaited_once()
         self.assertIn("Confirmed slot(s): 03", feedback.await_args.args[1])
-        self.assertEqual(feedback.await_args.kwargs["delete_after"], 3)
+        self.assertEqual(feedback.await_args.kwargs["delete_after"], 30)
 
     async def test_confirm_rejects_slot_that_is_already_confirmed(self):
         ctx = self.make_context()

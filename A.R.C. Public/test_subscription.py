@@ -15,8 +15,13 @@ from main import (
 class SubscriptionStatusTests(unittest.IsolatedAsyncioTestCase):
     def make_context(self, *, author_id=10, owner_id=99, roles=()):
         return SimpleNamespace(
-            author=SimpleNamespace(id=author_id, roles=list(roles)),
+            author=SimpleNamespace(
+                id=author_id,
+                roles=list(roles),
+                send=AsyncMock(),
+            ),
             guild=SimpleNamespace(id=123, owner_id=owner_id),
+            message=SimpleNamespace(delete=AsyncMock()),
         )
 
     def test_unlimited_embed(self):
@@ -68,14 +73,10 @@ class SubscriptionStatusTests(unittest.IsolatedAsyncioTestCase):
                 "main.repository.get_guild_subscription",
                 return_value=(True, None, 0),
             ),
-            patch(
-                "main.send_private_command_feedback",
-                new=AsyncMock(),
-            ) as send_feedback,
         ):
             await subscription_status.callback(ctx)
 
-        kwargs = send_feedback.await_args.kwargs
+        kwargs = ctx.author.send.await_args.kwargs
         self.assertIsInstance(kwargs["view"], SubscriptionStatusView)
         self.assertEqual(kwargs["embed"].fields[0].value, "🟢 Active")
         button = kwargs["view"].children[0]
@@ -98,28 +99,20 @@ class SubscriptionStatusTests(unittest.IsolatedAsyncioTestCase):
                 "main.repository.get_guild_subscription",
                 return_value=(False, None, None),
             ),
-            patch(
-                "main.send_private_command_feedback",
-                new=AsyncMock(),
-            ) as send_feedback,
         ):
             await subscription_status.callback(ctx)
 
         self.assertEqual(
-            send_feedback.await_args.kwargs["embed"].fields[0].value,
+            ctx.author.send.await_args.kwargs["embed"].fields[0].value,
             "🔴 Expired",
         )
 
     async def test_other_users_are_denied(self):
         ctx = self.make_context()
-        with patch(
-            "main.send_private_command_feedback",
-            new=AsyncMock(),
-        ) as send_feedback:
-            await subscription_status.callback(ctx)
+        await subscription_status.callback(ctx)
 
         self.assertEqual(
-            send_feedback.await_args.args[1],
+            ctx.author.send.await_args.args[0],
             "❌ **Access Denied.** Only the Server Owner or a designated "
             "Bot Manager can view the subscription status.",
         )

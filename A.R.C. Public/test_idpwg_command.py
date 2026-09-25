@@ -31,7 +31,10 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
         scrim = self.make_scrim()
         ctx = self.make_context()
         sent_message = SimpleNamespace(id=987)
-        target_channel = SimpleNamespace(send=AsyncMock(return_value=sent_message))
+        target_channel = SimpleNamespace(
+            id=321,
+            send=AsyncMock(return_value=sent_message),
+        )
 
         with (
             patch("main.require_staff_scrim", new=AsyncMock(return_value=scrim)),
@@ -45,7 +48,7 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("main.configured_text_channel", new=AsyncMock(return_value=target_channel)),
             patch("main.clear_active_idpw", new=AsyncMock()),
-            patch("main.repository.set_idpw_announcement"),
+            patch("main.repository.set_idpw_run"),
             patch("main.repository.transaction", return_value=nullcontext()),
             patch("main.time.time", return_value=0),
             patch("main.delete_command_message", new=AsyncMock()),
@@ -55,11 +58,12 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
         content = target_channel.send.call_args.kwargs["content"]
         self.assertEqual(
             content,
-            "**Match 1**\n"
-            "Map : Erangel\n"
-            "**ID :** `ROOM-1`\n"
-            "**PW :** fixed-secret\n"
-            "**Start :** 00:05\n"
+            "# __**Match 1**__\n\n"
+            "**Map : Erangel\n"
+            "ID : `ROOM-1`\n"
+            "PW : fixed-secret\n"
+            "Start Time : 00:05**\n"
+            "\n"
             "<@&456>",
         )
         self.assertEqual(scrim.current_match_counter, 2)
@@ -70,6 +74,7 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         ctx = self.make_context()
         target_channel = SimpleNamespace(
+            id=321,
             send=AsyncMock(return_value=SimpleNamespace(id=987))
         )
 
@@ -85,7 +90,7 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("main.configured_text_channel", new=AsyncMock(return_value=target_channel)),
             patch("main.clear_active_idpw", new=AsyncMock()),
-            patch("main.repository.set_idpw_announcement"),
+            patch("main.repository.set_idpw_run"),
             patch("main.repository.transaction", return_value=nullcontext()),
             patch("main.time.time", return_value=0),
             patch("main.delete_command_message", new=AsyncMock()),
@@ -100,7 +105,10 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
         scrim.match_maps = []
         ctx = self.make_context()
         sent_message = SimpleNamespace(id=987)
-        target_channel = SimpleNamespace(send=AsyncMock(return_value=sent_message))
+        target_channel = SimpleNamespace(
+            id=321,
+            send=AsyncMock(return_value=sent_message),
+        )
 
         with (
             patch("main.require_staff_scrim", new=AsyncMock(return_value=scrim)),
@@ -114,7 +122,7 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("main.configured_text_channel", new=AsyncMock(return_value=target_channel)),
             patch("main.clear_active_idpw", new=AsyncMock()),
-            patch("main.repository.set_idpw_announcement"),
+            patch("main.repository.set_idpw_run"),
             patch("main.repository.transaction", return_value=nullcontext()),
             patch("main.time.time", return_value=0),
             patch("main.delete_command_message", new=AsyncMock()),
@@ -123,10 +131,10 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             target_channel.send.call_args.kwargs["content"],
-            "**Match 2**\n"
-            "**ID :** `ROOM-2`\n"
-            "**PW :** dynamic password\n"
-            "**Start :** 00:10",
+            "# __**Match 2**__\n\n"
+            "**ID : `ROOM-2`\n"
+            "PW : dynamic password\n"
+            "Start Time : 00:10**",
         )
         self.assertEqual(scrim.current_match_counter, 3)
 

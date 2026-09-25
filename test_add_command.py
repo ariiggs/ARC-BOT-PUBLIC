@@ -315,7 +315,11 @@ class AddCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scrim.slots[3].team_name, "Alpha")
         self.assertEqual(scrim.slots[3].manager_id, 900)
         self.assertEqual(scrim.pending_registrations, {})
-        update_reaction.assert_awaited_once_with(scrim, request)
+        update_reaction.assert_awaited_once_with(
+            scrim,
+            request,
+            approved=True,
+        )
 
     async def test_approved_registration_replaces_ok_reaction_with_checkmark(self):
         scrim = SimpleNamespace(id="e" * 16, registration_channel_id=777)

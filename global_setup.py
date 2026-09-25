@@ -223,8 +223,13 @@ def install_global_setup(bot, repository) -> None:
             "GLOBAL CONFIGURATION UPDATED",
             "Changed:\n" + "\n".join(changed) if changed else "No fields changed.",
         )
+        changed_summary = "; ".join(changed) if changed else "No settings changed."
         await interaction.edit_original_response(
-            content=global_content(config),
+            content=(
+                "✅ **Global configuration saved.**\n"
+                f"Changed: {changed_summary}\n\n"
+                f"{global_content(config)}"
+            ),
             view=GlobalConfigurationView(interaction.user.id, interaction.guild.id),
         )
 
@@ -235,6 +240,30 @@ def install_global_setup(bot, repository) -> None:
             super().__init__(timeout=timeout)
             self.owner_id = owner_id
             self.guild_id = guild_id
+            self._timed_out = False
+
+        async def on_timeout(self) -> None:
+            """Disable expired controls without deleting the configuration summary."""
+            if self._timed_out:
+                return
+            self._timed_out = True
+            for item in self.children:
+                item.disabled = True
+            self.stop()
+            message = getattr(self, "message", None)
+            if message is None:
+                return
+            content = getattr(message, "content", None) or ""
+            notice = (
+                "⏱️ This global configuration panel expired. "
+                "Run `!set <@Staff>` to reopen it."
+            )
+            if notice not in content:
+                content = f"{content}\n\n{notice}" if content else notice
+            try:
+                await message.edit(content=content, view=self)
+            except discord.HTTPException:
+                logger.exception("Could not retire the expired global setup panel")
 
         async def interaction_check(self, interaction: discord.Interaction) -> bool:
             user = interaction.user

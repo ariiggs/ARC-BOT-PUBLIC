@@ -479,6 +479,10 @@ class IdPwConfig:
     fixed_password: str
     timezone_name: str = DEFAULT_IDPW_TIMEZONE
     announcement_message_id: int | None = None
+    announcement_channel_id: int | None = None
+    start_timestamp: int | None = None
+    three_minute_reminder_message_id: int | None = None
+    one_minute_reminder_message_id: int | None = None
 
     def payload(self) -> dict:
         return {
@@ -487,6 +491,14 @@ class IdPwConfig:
             "fixed_password": self.fixed_password,
             "timezone_name": self.timezone_name,
             "announcement_message_id": self.announcement_message_id,
+            "announcement_channel_id": self.announcement_channel_id,
+            "start_timestamp": self.start_timestamp,
+            "three_minute_reminder_message_id": (
+                self.three_minute_reminder_message_id
+            ),
+            "one_minute_reminder_message_id": (
+                self.one_minute_reminder_message_id
+            ),
         }
 
 
@@ -848,23 +860,7 @@ class ScrimRepository:
                     current_config.logs_channel_id,
                     license_type,
                 )
-            if license_type != "Gold":
-                self._downgrade_horizontal_leaderboards(guild_id)
         return not was_authorized
-
-    def _downgrade_horizontal_leaderboards(self, guild_id: int) -> None:
-        for scrim in self.scrims.values():
-            if (
-                scrim.guild_id != guild_id
-                or scrim.leaderboard_orientation != "horizontal"
-            ):
-                continue
-            scrim.leaderboard_orientation = "vertical"
-            scrim.leaderboard_layout = "1_col"
-            scrim.leaderboard_accent_color = scrim.leaderboard_accent_colors.get(
-                leaderboard_profile_key("vertical", scrim.leaderboard_team_count),
-                DEFAULT_LEADERBOARD_ACCENT_COLOR,
-            )
 
     def revoke_guild(self, guild_id: int) -> bool:
         if not _positive_id(guild_id):
@@ -885,7 +881,6 @@ class ScrimRepository:
                     current_config.logs_channel_id,
                     DEFAULT_LICENSE_TYPE,
                 )
-            self._downgrade_horizontal_leaderboards(guild_id)
         return True
 
     def is_admin_authorized(self, user_id: int) -> bool:
@@ -914,7 +909,7 @@ class ScrimRepository:
 
     def payload(self) -> dict:
         return {
-            "version": 31,
+            "version": 32,
             "scrims": [s.payload() for s in self.scrims.values()],
             "server_configs": [
                 config.payload() for config in self.server_configs.values()
@@ -962,7 +957,8 @@ class ScrimRepository:
         try:
             version = payload.get("version")
             if type(version) is not int or version not in (
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
             ):
                 raise ValueError("Unsupported snapshot version.")
             if not isinstance(payload["scrims"], list):
@@ -1525,13 +1521,32 @@ class ScrimRepository:
                         "announcement_message_id",
                     }
                     current_fields = legacy_fields | {"timezone_name"}
+                    scheduled_fields = current_fields | {
+                        "announcement_channel_id",
+                        "start_timestamp",
+                        "three_minute_reminder_message_id",
+                        "one_minute_reminder_message_id",
+                    }
                     if (
                         not isinstance(entry, dict)
-                        or set(entry) not in (legacy_fields, current_fields)
+                        or set(entry)
+                        not in (
+                            (legacy_fields, current_fields)
+                            if payload["version"] < 32
+                            else (scheduled_fields,)
+                        )
                     ):
                         raise ValueError("Invalid ID/password configuration fields.")
                     config_data = dict(entry)
                     config_data.setdefault("timezone_name", DEFAULT_IDPW_TIMEZONE)
+                    config_data.setdefault("announcement_channel_id", None)
+                    config_data.setdefault("start_timestamp", None)
+                    config_data.setdefault(
+                        "three_minute_reminder_message_id", None
+                    )
+                    config_data.setdefault(
+                        "one_minute_reminder_message_id", None
+                    )
                     config = IdPwConfig(**config_data)
                 if (
                     not isinstance(config.scrim_id, str)
@@ -1547,6 +1562,38 @@ class ScrimRepository:
                     or (
                         config.announcement_message_id is not None
                         and not _positive_id(config.announcement_message_id)
+                    )
+                    or (
+                        config.announcement_channel_id is not None
+                        and not _positive_id(config.announcement_channel_id)
+                    )
+                    or (
+                        config.start_timestamp is not None
+                        and (
+                            type(config.start_timestamp) is not int
+                            or config.start_timestamp <= 0
+                            or config.announcement_message_id is None
+                            or config.announcement_channel_id is None
+                        )
+                    )
+                    or (
+                        config.three_minute_reminder_message_id is not None
+                        and not _positive_id(
+                            config.three_minute_reminder_message_id
+                        )
+                    )
+                    or (
+                        config.one_minute_reminder_message_id is not None
+                        and not _positive_id(
+                            config.one_minute_reminder_message_id
+                        )
+                    )
+                    or (
+                        config.start_timestamp is None
+                        and (
+                            config.three_minute_reminder_message_id is not None
+                            or config.one_minute_reminder_message_id is not None
+                        )
                     )
                     or config.scrim_id in idpw_configs
                 ):
@@ -1587,7 +1634,7 @@ class ScrimRepository:
             except (KeyError, TypeError, ValueError) as error:
                 raise SlotStorageError("Invalid legacy snapshot; migration was stopped.") from error
             new_payload = {
-                "version": 31,
+                "version": 32,
                 "scrims": [],
                 "server_configs": [],
                 "idpw_configs": [],
@@ -1633,7 +1680,7 @@ class ScrimRepository:
         self.authorized_guild_duration_days = authorized_guild_duration_days
         self.authorized_guild_license_types = authorized_guild_license_types
         self.authorized_admin_ids = authorized_admin_ids
-        if payload.get("version", 0) < 31:
+        if payload.get("version", 0) < 32:
             self.store.save(self.payload())
 
     @contextmanager
@@ -1698,6 +1745,7 @@ class ScrimRepository:
                     "placement_points_string",
                     "leaderboard_layout",
                     "leaderboard_background",
+                    "leaderboard_accent_color",
                     "leaderboard_team_count",
                     "leaderboard_orientation",
                     "leaderboard_header_height",
@@ -1984,9 +2032,19 @@ class ScrimRepository:
             or next_footer_height not in LEADERBOARD_FOOTER_HEIGHTS
         ):
             raise ValueError("Invalid leaderboard configuration.")
+        is_gold = self.get_server_license_type(guild_id) == "Gold"
+        if (
+            not is_gold
+            and leaderboard_team_count is not _UNSET
+            and next_team_count != 20
+        ):
+            raise ValueError(
+                "Standard licenses are locked to 20 teams."
+            )
+        profile_team_count = next_team_count if is_gold else 20
         active_profile_key = leaderboard_profile_key(
             next_orientation,
-            next_team_count,
+            profile_team_count,
         )
         if leaderboard_accent_color is not _UNSET:
             if next_accent_color == DEFAULT_LEADERBOARD_ACCENT_COLOR:
@@ -1997,11 +2055,6 @@ class ScrimRepository:
             active_profile_key,
             DEFAULT_LEADERBOARD_ACCENT_COLOR,
         )
-        if (
-            next_orientation == "horizontal"
-            and self.get_server_license_type(guild_id) != "Gold"
-        ):
-            raise ValueError("Horizontal layout requires a Gold license.")
         with self.transaction():
             scrim.kill_points_value = next_kill_points
             scrim.placement_points_string = next_placement_points
@@ -2043,6 +2096,10 @@ class ScrimRepository:
             raise ValueError(
                 f"Match number must be between 1 and {scrim.max_matches}."
             )
+        incoming_slots = {
+            score.slot_number for score in scores if isinstance(score, MatchScore)
+        }
+        seen_placements: set[int] = set()
         for score in scores:
             if (
                 not isinstance(score, MatchScore)
@@ -2055,7 +2112,75 @@ class ScrimRepository:
                 or score.placement < 1
             ):
                 raise ValueError("Invalid match score.")
+            if score.placement in seen_placements:
+                raise ValueError(
+                    f"Placement {score.placement} is assigned more than once."
+                )
+            if any(
+                existing.match_number == match_number
+                and existing.placement == score.placement
+                and existing.slot_number not in incoming_slots
+                for existing in scrim.match_scores.values()
+            ):
+                raise ValueError(
+                    f"Placement {score.placement} is already assigned to another team."
+                )
+            seen_placements.add(score.placement)
         with self.transaction():
+            for score in scores:
+                scrim.match_scores[(score.match_number, score.slot_number)] = score
+        return len(scores)
+
+    def replace_match_scores(
+        self,
+        scrim_id: str,
+        guild_id: int,
+        match_number: int,
+        scores: list[MatchScore],
+    ) -> int:
+        """Replace one match's complete submitted result set atomically."""
+        scrim = self.get(scrim_id)
+        if scrim is None or scrim.guild_id != guild_id:
+            raise ValueError("This scrim does not exist on this server.")
+        if (
+            type(match_number) is not int
+            or not 1 <= match_number <= scrim.max_matches
+        ):
+            raise ValueError(
+                f"Match number must be between 1 and {scrim.max_matches}."
+            )
+        if not scores:
+            raise ValueError("At least one team result is required.")
+
+        seen_slots: set[int] = set()
+        seen_placements: set[int] = set()
+        for score in scores:
+            if (
+                not isinstance(score, MatchScore)
+                or score.match_number != match_number
+                or score.slot_number not in scrim.slots
+                or scrim.slots[score.slot_number].status == STATUS_AVAILABLE
+                or type(score.kills) is not int
+                or score.kills < 0
+                or type(score.placement) is not int
+                or score.placement < 1
+            ):
+                raise ValueError("Invalid match score.")
+            if score.slot_number in seen_slots:
+                raise ValueError(
+                    f"Slot {score.slot_number} appears more than once."
+                )
+            if score.placement in seen_placements:
+                raise ValueError(
+                    f"Placement {score.placement} appears more than once."
+                )
+            seen_slots.add(score.slot_number)
+            seen_placements.add(score.placement)
+
+        with self.transaction():
+            for key in tuple(scrim.match_scores):
+                if key[0] == match_number:
+                    del scrim.match_scores[key]
             for score in scores:
                 scrim.match_scores[(score.match_number, score.slot_number)] = score
         return len(scores)
@@ -2076,12 +2201,29 @@ class ScrimRepository:
         scrim = self.get(scrim_id)
         if scrim is None:
             raise ValueError("This scrim does not exist.")
+        current = self.get_idpw_config(scrim_id)
         config = IdPwConfig(
             scrim_id,
             target_channel_id,
             fixed_password,
             timezone_name,
-            announcement_message_id,
+            (
+                current.announcement_message_id
+                if current is not None
+                else announcement_message_id
+            ),
+            current.announcement_channel_id if current is not None else None,
+            current.start_timestamp if current is not None else None,
+            (
+                current.three_minute_reminder_message_id
+                if current is not None
+                else None
+            ),
+            (
+                current.one_minute_reminder_message_id
+                if current is not None
+                else None
+            ),
         )
         if (
             not _positive_id(target_channel_id)
@@ -2120,6 +2262,91 @@ class ScrimRepository:
             current.fixed_password,
             current.timezone_name,
             announcement_message_id,
+            (
+                current.announcement_channel_id
+                if announcement_message_id is not None
+                else None
+            ),
+            current.start_timestamp if announcement_message_id is not None else None,
+            (
+                current.three_minute_reminder_message_id
+                if announcement_message_id is not None
+                else None
+            ),
+            (
+                current.one_minute_reminder_message_id
+                if announcement_message_id is not None
+                else None
+            ),
+        )
+        with self.transaction():
+            self.idpw_configs[scrim_id] = updated
+        return updated
+
+    def set_idpw_run(
+        self,
+        scrim_id: str,
+        *,
+        announcement_message_id: int,
+        announcement_channel_id: int,
+        start_timestamp: int,
+    ) -> IdPwConfig:
+        current = self.get_idpw_config(scrim_id)
+        if current is None:
+            raise ValueError("This scrim has no ID/password configuration.")
+        if (
+            not _positive_id(announcement_message_id)
+            or not _positive_id(announcement_channel_id)
+            or type(start_timestamp) is not int
+            or start_timestamp <= 0
+        ):
+            raise ValueError("Invalid ID/password reminder schedule.")
+        updated = IdPwConfig(
+            current.scrim_id,
+            current.target_channel_id,
+            current.fixed_password,
+            current.timezone_name,
+            announcement_message_id,
+            announcement_channel_id,
+            start_timestamp,
+            None,
+            None,
+        )
+        with self.transaction():
+            self.idpw_configs[scrim_id] = updated
+        return updated
+
+    def set_idpw_reminder(
+        self,
+        scrim_id: str,
+        stage: str,
+        message_id: int,
+    ) -> IdPwConfig:
+        current = self.get_idpw_config(scrim_id)
+        if current is None or current.start_timestamp is None:
+            raise ValueError("This scrim has no active ID/password reminder schedule.")
+        if stage not in {"three_minute", "one_minute"} or not _positive_id(
+            message_id
+        ):
+            raise ValueError("Invalid ID/password reminder.")
+        updated = IdPwConfig(
+            current.scrim_id,
+            current.target_channel_id,
+            current.fixed_password,
+            current.timezone_name,
+            current.announcement_message_id,
+            current.announcement_channel_id,
+            current.start_timestamp,
+            (
+                message_id
+                if stage == "three_minute"
+                else current.three_minute_reminder_message_id
+            ),
+            (
+                message_id
+                if stage == "one_minute"
+                else current.one_minute_reminder_message_id
+            ),
         )
         with self.transaction():
             self.idpw_configs[scrim_id] = updated

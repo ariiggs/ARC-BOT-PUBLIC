@@ -1,18 +1,43 @@
+import asyncio
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+
+import discord
 
 from main import (
     _format_idpw_announcement,
     _format_idpw_reminder,
     _parse_idpw_input,
     _publish_idpwg,
+    _send_scheduled_idpw_reminder,
+    active_idpw,
+    active_idpw_locks,
     clear_active_idpw,
+    restore_active_idpw,
 )
 
 
 class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        active_idpw.clear()
+        active_idpw_locks.clear()
+
+    async def asyncTearDown(self):
+        tasks = [
+            task
+            for state in active_idpw.values()
+            for task in state.get("tasks", [])
+        ]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        active_idpw.clear()
+        active_idpw_locks.clear()
+
     def make_scrim(self, *, pw_type="fixed", role_id=456, match_maps=None):
         maps = ["Erangel", "Miramar"]
         return SimpleNamespace(
@@ -37,7 +62,10 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
         scrim = self.make_scrim()
         ctx = self.make_context()
         sent_message = SimpleNamespace(id=987)
-        target_channel = SimpleNamespace(send=AsyncMock(return_value=sent_message))
+        target_channel = SimpleNamespace(
+            id=321,
+            send=AsyncMock(return_value=sent_message),
+        )
 
         with (
             patch("main.require_staff_scrim", new=AsyncMock(return_value=scrim)),
@@ -51,7 +79,7 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("main.configured_text_channel", new=AsyncMock(return_value=target_channel)),
             patch("main.clear_active_idpw", new=AsyncMock()),
-            patch("main.repository.set_idpw_announcement"),
+            patch("main.repository.set_idpw_run"),
             patch("main.repository.transaction", return_value=nullcontext()),
             patch("main.time.time", return_value=0),
             patch("main.delete_command_message", new=AsyncMock()),
@@ -145,6 +173,10 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
         config = SimpleNamespace(
             announcement_message_id=202,
             target_channel_id=303,
+            announcement_channel_id=303,
+            start_timestamp=600,
+            three_minute_reminder_message_id=None,
+            one_minute_reminder_message_id=None,
         )
         active = {
             "scrim-1": {
@@ -172,6 +204,7 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         ctx = self.make_context()
         target_channel = SimpleNamespace(
+            id=321,
             send=AsyncMock(return_value=SimpleNamespace(id=987))
         )
 
@@ -187,7 +220,7 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("main.configured_text_channel", new=AsyncMock(return_value=target_channel)),
             patch("main.clear_active_idpw", new=AsyncMock()),
-            patch("main.repository.set_idpw_announcement"),
+            patch("main.repository.set_idpw_run"),
             patch("main.repository.transaction", return_value=nullcontext()),
             patch("main.time.time", return_value=0),
             patch("main.delete_command_message", new=AsyncMock()),
@@ -202,7 +235,10 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
         scrim.match_maps = []
         ctx = self.make_context()
         sent_message = SimpleNamespace(id=987)
-        target_channel = SimpleNamespace(send=AsyncMock(return_value=sent_message))
+        target_channel = SimpleNamespace(
+            id=321,
+            send=AsyncMock(return_value=sent_message),
+        )
 
         with (
             patch("main.require_staff_scrim", new=AsyncMock(return_value=scrim)),
@@ -216,7 +252,7 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("main.configured_text_channel", new=AsyncMock(return_value=target_channel)),
             patch("main.clear_active_idpw", new=AsyncMock()),
-            patch("main.repository.set_idpw_announcement"),
+            patch("main.repository.set_idpw_run"),
             patch("main.repository.transaction", return_value=nullcontext()),
             patch("main.time.time", return_value=0),
             patch("main.delete_command_message", new=AsyncMock()),
@@ -288,6 +324,115 @@ class IdpwgCommandTests(unittest.IsolatedAsyncioTestCase):
             ctx,
             "❌ Format: `!idpwg3 <room_id> / <password> / <minutes>`",
         )
+
+    async def test_failed_schedule_persistence_keeps_old_announcement(self):
+        scrim = self.make_scrim()
+        ctx = self.make_context()
+        old_message = SimpleNamespace(id=111, delete=AsyncMock())
+        old_state = {
+            "message": old_message,
+            "messages": [old_message],
+            "tasks": [],
+        }
+        active_idpw[scrim.id] = old_state
+        new_message = SimpleNamespace(id=222, delete=AsyncMock())
+        target_channel = SimpleNamespace(
+            id=321,
+            send=AsyncMock(return_value=new_message),
+        )
+        config = SimpleNamespace(
+            target_channel_id=321,
+            fixed_password="legacy-secret",
+            timezone_name="UTC",
+        )
+        clear_run = AsyncMock()
+        feedback = AsyncMock()
+
+        with (
+            patch("main.require_staff_scrim", new=AsyncMock(return_value=scrim)),
+            patch("main.repository.get_idpw_config", return_value=config),
+            patch("main.configured_text_channel", new=AsyncMock(return_value=target_channel)),
+            patch(
+                "main.repository.set_idpw_run",
+                side_effect=ValueError("snapshot unavailable"),
+            ),
+            patch("main.clear_active_idpw", new=clear_run),
+            patch("main.send_private_command_feedback", new=feedback),
+            patch("main.time.time", return_value=0),
+        ):
+            await _publish_idpwg(ctx, 1, "ROOM-1 / 5")
+
+        new_message.delete.assert_awaited_once_with()
+        old_message.delete.assert_not_awaited()
+        clear_run.assert_not_awaited()
+        self.assertIs(active_idpw[scrim.id], old_state)
+        feedback.assert_awaited_once()
+
+    async def test_reminder_retries_transient_discord_failure(self):
+        scrim = self.make_scrim()
+        state = {"messages": [], "tasks": []}
+        active = {scrim.id: state}
+        response = SimpleNamespace(
+            status=500,
+            reason="Server Error",
+            text="temporary error",
+        )
+        failure = discord.HTTPException(response, "temporary failure")
+        reminder = SimpleNamespace(id=333, delete=AsyncMock())
+        target_channel = SimpleNamespace(
+            send=AsyncMock(side_effect=[failure, reminder])
+        )
+
+        with (
+            patch("main.active_idpw", active),
+            patch("main.asyncio.sleep", new=AsyncMock()),
+            patch("main.time.time", return_value=0),
+            patch("main.repository.set_idpw_reminder") as persist_reminder,
+        ):
+            await _send_scheduled_idpw_reminder(
+                scrim,
+                state,
+                target_channel,
+                start_timestamp=240,
+                stage="one_minute",
+                confirmed_role_id=456,
+            )
+
+        self.assertEqual(target_channel.send.await_count, 2)
+        self.assertEqual(state["messages"], [reminder])
+        persist_reminder.assert_called_once_with(scrim.id, "one_minute", 333)
+
+    async def test_restart_restores_announcement_and_pending_reminders(self):
+        scrim = self.make_scrim()
+        announcement = SimpleNamespace(id=444)
+        config = SimpleNamespace(
+            scrim_id=scrim.id,
+            start_timestamp=600,
+            announcement_message_id=444,
+            announcement_channel_id=321,
+            three_minute_reminder_message_id=None,
+            one_minute_reminder_message_id=None,
+        )
+        target_channel = SimpleNamespace(
+            fetch_message=AsyncMock(return_value=announcement)
+        )
+        active = {}
+
+        with (
+            patch("main.repository.idpw_configs", {scrim.id: config}),
+            patch("main.repository.get", return_value=scrim),
+            patch("main.configured_text_channel", new=AsyncMock(return_value=target_channel)),
+            patch("main.active_idpw", active),
+            patch("main.time.time", return_value=0),
+        ):
+            await restore_active_idpw()
+            restored = active[scrim.id]
+            tasks = list(restored["tasks"])
+            self.assertIs(restored["message"], announcement)
+            self.assertEqual(len(tasks), 2)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":

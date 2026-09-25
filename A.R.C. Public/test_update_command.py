@@ -12,6 +12,8 @@ class UpdateCommandTests(unittest.IsolatedAsyncioTestCase):
             guild_id=123,
             name=name,
             deleted=False,
+            public_channel_id=1001,
+            staff_channel_id=1002,
         )
 
     def make_context(self):
@@ -23,7 +25,7 @@ class UpdateCommandTests(unittest.IsolatedAsyncioTestCase):
             send=AsyncMock(),
         )
 
-    async def test_one_active_scrim_is_updated_without_selector(self):
+    async def test_one_active_scrim_outside_channel_shows_selector(self):
         ctx = self.make_context()
         scrim = self.make_scrim()
         feedback = AsyncMock()
@@ -32,13 +34,13 @@ class UpdateCommandTests(unittest.IsolatedAsyncioTestCase):
             patch("main.repository.list", return_value=[scrim]),
             patch("main.member_is_staff", return_value=True),
             patch("main.publish_scrim", new=AsyncMock(return_value=True)) as publish,
-            patch("main.send_private_command_feedback", new=feedback),
+            patch("main.delete_command_message", new=AsyncMock()) as delete_command,
         ):
             await update_slots_command(ctx)
 
-        publish.assert_awaited_once_with(scrim)
-        feedback.assert_awaited_once_with(ctx, "The slot board has been updated.")
-        ctx.send.assert_not_awaited()
+        publish.assert_not_awaited()
+        self.assertIsInstance(ctx.send.call_args.kwargs["view"], UpdateScrimSelectView)
+        delete_command.assert_awaited_once_with(ctx)
 
     async def test_multiple_active_scrims_show_selector(self):
         ctx = self.make_context()

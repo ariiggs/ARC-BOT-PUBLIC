@@ -449,7 +449,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 logger.exception("Could not write scrim configuration log")
 
         text = notice or (
-            f"✅ **{_safe_name(updated.name)}** was updated.\n"
+            f"✅ **{_safe_name(updated.name)}** configuration saved.\n"
             f"Changed: {changed_fields}."
         )
         if not board_refreshed:
@@ -487,10 +487,33 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             await interaction.followup.send(ephemeral_notice, ephemeral=True)
 
     class BoundView(discord.ui.View):
+        """A staff-bound view which expires safely instead of going blank."""
+
         def __init__(self, owner_id: int, guild_id: int, *, timeout: float = 900):
             super().__init__(timeout=timeout)
             self.owner_id = owner_id
             self.guild_id = guild_id
+            self._timed_out = False
+
+        async def on_timeout(self) -> None:
+            """Retire controls while leaving the useful configuration summary."""
+            if self._timed_out:
+                return
+            self._timed_out = True
+            for item in self.children:
+                item.disabled = True
+            self.stop()
+            message = getattr(self, "message", None)
+            if message is None:
+                return
+            content = getattr(message, "content", None) or ""
+            notice = "⏱️ This setup panel expired. Run `!setup` to reopen it."
+            if notice not in content:
+                content = f"{content}\n\n{notice}" if content else notice
+            try:
+                await message.edit(content=content, view=self)
+            except discord.HTTPException:
+                logger.exception("Could not retire the expired setup panel")
 
         async def interaction_check(self, interaction: discord.Interaction) -> bool:
             if not setup_authorized(

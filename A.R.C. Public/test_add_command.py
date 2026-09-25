@@ -13,6 +13,7 @@ class AddCommandTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(
             author=SimpleNamespace(id=900),
             guild=SimpleNamespace(id=123),
+            send=AsyncMock(),
         )
 
     def make_scrim(self):
