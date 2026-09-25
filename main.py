@@ -82,6 +82,11 @@ LEADERBOARD_SECTION_GAP = 10
 LEADERBOARD_TABLE_HEADER_HEIGHT = 64
 LEADERBOARD_VERTICAL_ROW_HEIGHT = 60
 LEADERBOARD_HORIZONTAL_ROW_HEIGHT = 80
+LEADERBOARD_VERTICAL_ROW_FONT_SIZE = 21
+LEADERBOARD_HORIZONTAL_ROW_FONT_SIZE = 32
+LEADERBOARD_ROW_FONT_WEIGHT = 700
+LEADERBOARD_DATE_FONT_SIZE = 36
+LEADERBOARD_TEAM_NAME_LEFT_PADDING = 12
 STANDARD_LEADERBOARD_TEAM_COUNT = 20
 LEADERBOARD_FIELD_BASE_WIDTHS = (48, 500, 120, 120, 120, 116)
 
@@ -6875,27 +6880,22 @@ def _build_configured_leaderboard_image(
     draw = ImageDraw.Draw(output, "RGBA")
     date_label = datetime.now(
         timezone_for_name(getattr(scrim, "timezone", "UTC"))
-    ).strftime("%d %b %Y").upper()
-    date_font = _load_font(18, weight=400)
-    date_center_y = margin + header_height // 2
+    ).strftime("%d/%m/%Y")
+    date_font = _load_font(LEADERBOARD_DATE_FONT_SIZE, weight=700)
     draw.text(
-        (width - margin - 75, date_center_y),
+        (width - margin, margin),
         date_label,
         font=date_font,
         fill=text,
-        anchor="mm",
+        anchor="rt",
     )
     if background_path == LEADERBOARD_BACKGROUND:
         scrim_title = str(getattr(scrim, "name", "") or "").strip()
         if scrim_title:
-            date_bbox = draw.textbbox((0, 0), date_label, font=date_font)
-            date_width = date_bbox[2] - date_bbox[0]
-            date_left = width - margin - 75 - date_width // 2
             title_center_x = width // 2
-            title_right_limit = date_left - 24
             title_half_width = min(
                 title_center_x - margin,
-                title_right_limit - title_center_x,
+                width - margin - title_center_x,
             )
             title_font = _fit_font(
                 scrim_title,
@@ -6906,7 +6906,7 @@ def _build_configured_leaderboard_image(
                 weight=LEADERBOARD_BODY_FONT_WEIGHT,
             )
             draw.text(
-                (title_center_x, date_center_y),
+                (title_center_x, margin + header_height // 2),
                 scrim_title,
                 font=title_font,
                 fill=text,
@@ -6927,7 +6927,11 @@ def _build_configured_leaderboard_image(
         (team_limit + 1) // 2 if columns == 2 else team_limit
     )
     split_index = per_column_capacity
-    row_font = 21 if columns == 1 else 18
+    row_font = (
+        LEADERBOARD_HORIZONTAL_ROW_FONT_SIZE
+        if columns == 2
+        else LEADERBOARD_VERTICAL_ROW_FONT_SIZE
+    )
     row_top = table_top + LEADERBOARD_TABLE_HEADER_HEIGHT
 
     for column_index in range(columns):
@@ -6952,10 +6956,10 @@ def _build_configured_leaderboard_image(
             rank = column_index * per_column_capacity + row_index + 1
             rank_text, rank_font = _fit_leaderboard_cell_text(
                 f"{rank:02d}",
-                max_width=field_ranges[0][1] - field_ranges[0][0] - 10,
+                max_width=field_ranges[0][1] - field_ranges[0][0] - 4,
                 max_height=row_height - 8,
                 max_size=row_font,
-                weight=LEADERBOARD_BODY_FONT_WEIGHT,
+                weight=LEADERBOARD_ROW_FONT_WEIGHT,
             )
             draw.text(
                 (field_centers[0], text_y),
@@ -6971,19 +6975,25 @@ def _build_configured_leaderboard_image(
                 row.team_name,
                 max_width=max(
                     1,
-                    field_ranges[1][1] - field_ranges[1][0] - 20,
+                    field_ranges[1][1]
+                    - field_ranges[1][0]
+                    - LEADERBOARD_TEAM_NAME_LEFT_PADDING
+                    - LEADERBOARD_TEAM_NAME_LEFT_PADDING,
                 ),
                 max_height=row_height - 8,
                 max_size=row_font,
                 min_size=8,
-                weight=LEADERBOARD_BODY_FONT_WEIGHT,
+                weight=LEADERBOARD_ROW_FONT_WEIGHT,
             )
             draw.text(
-                (field_centers[1], text_y),
+                (
+                    field_ranges[1][0] + LEADERBOARD_TEAM_NAME_LEFT_PADDING,
+                    text_y,
+                ),
                 team_text,
                 font=team_font,
                 fill=text,
-                anchor="mm",
+                anchor="lm",
             )
             for field_index, value in enumerate(
                 (
@@ -7003,7 +7013,7 @@ def _build_configured_leaderboard_image(
                     ),
                     max_height=row_height - 8,
                     max_size=row_font,
-                    weight=LEADERBOARD_BODY_FONT_WEIGHT,
+                    weight=LEADERBOARD_ROW_FONT_WEIGHT,
                 )
                 draw.text(
                     (field_centers[field_index], text_y),
