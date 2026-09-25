@@ -3645,7 +3645,7 @@ async def _record_match_scores(
         )
         return
     try:
-        processed = repository.upsert_match_scores(
+        processed = repository.replace_match_scores(
             scrim.id,
             scrim.guild_id,
             match_number,
@@ -5622,7 +5622,7 @@ HELP_COPY_TEXT = (
     "SLOTS: !add Team / TAG / @Captain | !confirm 03 04 | !remove 03 | "
     "!open | !close | !remind\n"
     "STATUS: !slots [Scrim] | !update [Scrim] | !res / !lb | "
-    f"!resg1-{MAX_MATCHES} slot kills (best team first, one line per rank)\n"
+    f"!resg1-{MAX_MATCHES} slot kills (best team first; omit missed teams)\n"
     "ROOM: !idpw room / minutes | !idpwg1-25 room / minutes\n"
     "CAPTAINS: !register Team / TAG [/ @Manager] | "
     "!cap add|transfer|remove @User\n"
@@ -5641,7 +5641,7 @@ def build_help_text() -> str:
         "`!remove 03` `!open` `!close` `!remind`\n"
         "**STATUS** `!slots [Scrim]` `!update [Scrim]` `!res`/`!lb` "
         f"`!resg1-{MAX_MATCHES} slot kills` "
-        "(best team first, one line per rank)\n"
+        "(best team first; omit missed teams)\n"
         "**ROOM** `!idpw room / minutes` `!idpwg1-25 room / minutes`\n"
         "**CAPTAINS** `!register Team / TAG [/ @Manager]` "
         "`!cap add|transfer|remove @User`\n"

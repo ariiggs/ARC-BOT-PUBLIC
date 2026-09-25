@@ -2048,6 +2048,54 @@ class ScrimRepository:
                 scrim.match_scores[(score.match_number, score.slot_number)] = score
         return len(scores)
 
+    def replace_match_scores(
+        self,
+        scrim_id: str,
+        guild_id: int,
+        match_number: int,
+        scores: list[MatchScore],
+    ) -> int:
+        """Replace one match's complete submitted result set atomically."""
+        scrim = self.get(scrim_id)
+        if scrim is None or scrim.guild_id != guild_id:
+            raise ValueError("This scrim does not exist on this server.")
+        if (
+            type(match_number) is not int
+            or not 1 <= match_number <= scrim.max_matches
+        ):
+            raise ValueError(
+                f"Match number must be between 1 and {scrim.max_matches}."
+            )
+        if not scores:
+            raise ValueError("At least one team result is required.")
+
+        seen_slots: set[int] = set()
+        for score in scores:
+            if (
+                not isinstance(score, MatchScore)
+                or score.match_number != match_number
+                or score.slot_number not in scrim.slots
+                or scrim.slots[score.slot_number].status == STATUS_AVAILABLE
+                or type(score.kills) is not int
+                or score.kills < 0
+                or type(score.placement) is not int
+                or score.placement < 1
+            ):
+                raise ValueError("Invalid match score.")
+            if score.slot_number in seen_slots:
+                raise ValueError(
+                    f"Slot {score.slot_number} appears more than once."
+                )
+            seen_slots.add(score.slot_number)
+
+        with self.transaction():
+            for key in tuple(scrim.match_scores):
+                if key[0] == match_number:
+                    del scrim.match_scores[key]
+            for score in scores:
+                scrim.match_scores[(score.match_number, score.slot_number)] = score
+        return len(scores)
+
     def get_idpw_config(self, scrim_id: str) -> IdPwConfig | None:
         return self.idpw_configs.get(scrim_id)
 
