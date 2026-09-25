@@ -45,6 +45,8 @@ from main import (
     LEADERBOARD_SECTION_GAP,
     LEADERBOARD_TABLE_HEADER_HEIGHT,
     LEADERBOARD_TITLE_MAX_FONT_SIZE,
+    LEADERBOARD_HORIZONTAL_TEAM_NAME_LEFT_PADDING,
+    LEADERBOARD_TEAM_NAME_LEFT_PADDING,
     HEX_COLOR_GENERATOR_URL,
     LEADERBOARD_VERTICAL_ROW_HEIGHT,
     LEADERBOARD_HORIZONTAL_ROW_HEIGHT,
@@ -2356,8 +2358,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                 rank_calls = [
                     (int(text), position)
                     for text, position in text_calls
-                    if len(text) == 2
-                    and text.isdigit()
+                    if text.isdigit()
                     and 1 <= int(text) <= 20
                 ]
                 rank_columns = {
@@ -2494,6 +2495,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                         rank_left, rank_right = _leaderboard_field_ranges(
                             column_left,
                             column_width,
+                            horizontal=columns == 2,
                         )[0]
                         rank_x_positions.add((rank_left + rank_right) / 2)
                     ranks = [
@@ -2501,12 +2503,12 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                         for text, xy, _ in text_calls
                         if xy[0] in rank_x_positions
                         and text.isdigit()
-                        and len(text) == 2
+                        and 1 <= int(text) <= team_count
                     ]
                     self.assertEqual(
                         ranks,
                         [
-                            f"{rank:02d}"
+                            str(rank)
                             for rank in range(1, team_count + 1)
                         ],
                     )
@@ -2575,20 +2577,29 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                     - column_gap * (columns - 1)
                 ) // columns
                 left = LEADERBOARD_OUTER_MARGIN
-                ranges = _leaderboard_field_ranges(left, column_width)
+                ranges = _leaderboard_field_ranges(
+                    left,
+                    column_width,
+                    horizontal=columns == 2,
+                )
                 centers = [(start + end) / 2 for start, end in ranges]
 
                 for text, field_index, expected_anchor, expected_x in (
-                    ("01", 0, "mm", centers[0]),
+                    ("1", 0, "mm", centers[0]),
                     (
                         "CENTER ME",
                         1,
                         "lm",
-                        ranges[1][0] + 12,
+                        ranges[1][0]
+                        + (
+                            LEADERBOARD_HORIZONTAL_TEAM_NAME_LEFT_PADDING
+                            if columns == 2
+                            else LEADERBOARD_TEAM_NAME_LEFT_PADDING
+                        ),
                     ),
                     ("13", 2, "mm", centers[2]),
-                    ("27", 3, "mm", centers[3]),
-                    ("34", 4, "mm", centers[4]),
+                    ("34", 3, "mm", centers[3]),
+                    ("27", 4, "mm", centers[4]),
                     ("74", 5, "mm", centers[5]),
                 ):
                     with self.subTest(text=text):
@@ -2601,6 +2612,20 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
                             call[3].size,
                             32 if orientation == "horizontal" else 21,
                         )
+
+                if orientation == "horizontal":
+                    self.assertEqual(
+                        (
+                            centers[0],
+                            ranges[1][0]
+                            + LEADERBOARD_HORIZONTAL_TEAM_NAME_LEFT_PADDING,
+                            centers[2],
+                            centers[3],
+                            centers[4],
+                            centers[5],
+                        ),
+                        (68, 132, 534, 650.5, 765, 880),
+                    )
 
     def test_long_team_name_shrinks_and_stays_inside_its_field(self):
         fitted_text, font = _fit_leaderboard_cell_text(

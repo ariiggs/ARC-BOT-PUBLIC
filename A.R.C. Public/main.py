@@ -88,6 +88,9 @@ LEADERBOARD_ROW_FONT_WEIGHT = 700
 LEADERBOARD_DATE_FONT_SIZE = 36
 LEADERBOARD_TITLE_MAX_FONT_SIZE = 96
 LEADERBOARD_TEAM_NAME_LEFT_PADDING = 12
+LEADERBOARD_HORIZONTAL_FIELD_BASE_WIDTHS = (80, 368, 116, 117, 112, 118)
+LEADERBOARD_HORIZONTAL_FIELD_REFERENCE_WIDTH = 920
+LEADERBOARD_HORIZONTAL_TEAM_NAME_LEFT_PADDING = 24
 STANDARD_LEADERBOARD_TEAM_COUNT = 20
 LEADERBOARD_FIELD_BASE_WIDTHS = (48, 500, 120, 120, 120, 116)
 
@@ -8578,15 +8581,29 @@ def _fit_font(
 def _leaderboard_field_ranges(
     left: int,
     total_width: int,
+    *,
+    horizontal: bool = False,
 ) -> tuple[tuple[int, int], ...]:
     """Scale the six leaderboard fields to the width of one table column."""
-    base_total = sum(LEADERBOARD_FIELD_BASE_WIDTHS)
+    base_widths = (
+        LEADERBOARD_HORIZONTAL_FIELD_BASE_WIDTHS
+        if horizontal
+        else LEADERBOARD_FIELD_BASE_WIDTHS
+    )
+    base_total = sum(base_widths)
+    field_total_width = total_width
+    if horizontal:
+        field_total_width = round(
+            total_width
+            * base_total
+            / LEADERBOARD_HORIZONTAL_FIELD_REFERENCE_WIDTH
+        )
     exact_widths = [
-        width * total_width / base_total
-        for width in LEADERBOARD_FIELD_BASE_WIDTHS
+        width * field_total_width / base_total
+        for width in base_widths
     ]
     widths = [int(width) for width in exact_widths]
-    remaining = total_width - sum(widths)
+    remaining = field_total_width - sum(widths)
     order = sorted(
         range(len(widths)),
         key=lambda index: exact_widths[index] - widths[index],
@@ -8849,7 +8866,11 @@ def _build_configured_leaderboard_image(
         else:
             column_rows = rows
 
-        field_ranges = _leaderboard_field_ranges(x, column_width)
+        field_ranges = _leaderboard_field_ranges(
+            x,
+            column_width,
+            horizontal=columns == 2,
+        )
         field_centers = tuple(
             (field_left + field_right) / 2
             for field_left, field_right in field_ranges
@@ -8859,7 +8880,7 @@ def _build_configured_leaderboard_image(
             text_y = y + row_height // 2
             rank = column_index * per_column_capacity + row_index + 1
             rank_text, rank_font = _fit_leaderboard_cell_text(
-                f"{rank:02d}",
+                str(rank),
                 max_width=field_ranges[0][1] - field_ranges[0][0] - 4,
                 max_height=row_height - 8,
                 max_size=row_font,
@@ -8875,14 +8896,19 @@ def _build_configured_leaderboard_image(
             if row_index >= len(column_rows):
                 continue
             row = column_rows[row_index]
+            team_name_padding = (
+                LEADERBOARD_HORIZONTAL_TEAM_NAME_LEFT_PADDING
+                if columns == 2
+                else LEADERBOARD_TEAM_NAME_LEFT_PADDING
+            )
             team_text, team_font = _fit_leaderboard_cell_text(
                 row.team_name,
                 max_width=max(
                     1,
                     field_ranges[1][1]
                     - field_ranges[1][0]
-                    - LEADERBOARD_TEAM_NAME_LEFT_PADDING
-                    - LEADERBOARD_TEAM_NAME_LEFT_PADDING,
+                    - team_name_padding
+                    - team_name_padding,
                 ),
                 max_height=row_height - 8,
                 max_size=row_font,
@@ -8891,7 +8917,7 @@ def _build_configured_leaderboard_image(
             )
             draw.text(
                 (
-                    field_ranges[1][0] + LEADERBOARD_TEAM_NAME_LEFT_PADDING,
+                    field_ranges[1][0] + team_name_padding,
                     text_y,
                 ),
                 team_text,
@@ -8902,8 +8928,8 @@ def _build_configured_leaderboard_image(
             for field_index, value in enumerate(
                 (
                     row.wins,
-                    row.kills,
                     row.placement_points,
+                    row.kills,
                     row.total_points,
                 ),
                 start=2,
