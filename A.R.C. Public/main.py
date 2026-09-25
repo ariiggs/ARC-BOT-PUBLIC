@@ -82,6 +82,7 @@ LEADERBOARD_SECTION_GAP = 10
 LEADERBOARD_TABLE_HEADER_HEIGHT = 64
 LEADERBOARD_VERTICAL_ROW_HEIGHT = 60
 LEADERBOARD_HORIZONTAL_ROW_HEIGHT = 80
+LEADERBOARD_FIELD_BASE_WIDTHS = (48, 500, 120, 120, 120, 116)
 
 
 class LeaderboardBackgroundDimensionsError(ValueError):
@@ -6628,6 +6629,62 @@ def _fit_font(
     return _load_font(min_size, weight=weight)
 
 
+def _leaderboard_field_ranges(
+    left: int,
+    total_width: int,
+) -> tuple[tuple[int, int], ...]:
+    """Scale the six leaderboard fields to the width of one table column."""
+    base_total = sum(LEADERBOARD_FIELD_BASE_WIDTHS)
+    exact_widths = [
+        width * total_width / base_total
+        for width in LEADERBOARD_FIELD_BASE_WIDTHS
+    ]
+    widths = [int(width) for width in exact_widths]
+    remaining = total_width - sum(widths)
+    order = sorted(
+        range(len(widths)),
+        key=lambda index: exact_widths[index] - widths[index],
+        reverse=True,
+    )
+    for index in order[:remaining]:
+        widths[index] += 1
+
+    ranges = []
+    field_left = left
+    for field_width in widths:
+        ranges.append((field_left, field_left + field_width))
+        field_left += field_width
+    return tuple(ranges)
+
+
+def _fit_leaderboard_cell_text(
+    text: object,
+    *,
+    max_width: int,
+    max_height: int,
+    max_size: int,
+    min_size: int = 8,
+    weight: int = 400,
+) -> tuple[str, ImageFont.FreeTypeFont]:
+    """Shrink text to fit a cell, shortening only as a last resort."""
+    text = " ".join(str(text).split())
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    for size in range(max_size, min_size - 1, -1):
+        font = _load_font(size, weight=weight)
+        left, top, right, bottom = probe.textbbox((0, 0), text, font=font)
+        if right - left <= max_width and bottom - top <= max_height:
+            return text, font
+
+    font = _load_font(min_size, weight=weight)
+    ellipsis = "…"
+    for end in range(len(text), -1, -1):
+        candidate = text[:end].rstrip() + ellipsis
+        left, top, right, bottom = probe.textbbox((0, 0), candidate, font=font)
+        if right - left <= max_width and bottom - top <= max_height:
+            return candidate, font
+    return "", font
+
+
 def leaderboard_canvas_dimensions(
     team_count: int,
     orientation: str,
@@ -6871,59 +6928,76 @@ def _build_configured_leaderboard_image(
         else:
             column_rows = rows
 
-        team_x = x + (74 if columns == 1 else 62)
-        wins_x = x + column_width - (390 if columns == 1 else 330)
-        kills_x = x + column_width - (280 if columns == 1 else 245)
-        place_x = x + column_width - (160 if columns == 1 else 135)
-        total_x = x + column_width - 20
+        field_ranges = _leaderboard_field_ranges(x, column_width)
+        field_centers = tuple(
+            (field_left + field_right) / 2
+            for field_left, field_right in field_ranges
+        )
         for row_index in range(per_column_capacity):
             y = row_top + row_index * row_height
             text_y = y + row_height // 2
             rank = column_index * per_column_capacity + row_index + 1
-            draw.text(
-                (x + 34, text_y),
+            rank_text, rank_font = _fit_leaderboard_cell_text(
                 f"{rank:02d}",
-                font=_load_font(
-                    row_font,
-                    weight=LEADERBOARD_BODY_FONT_WEIGHT,
-                ),
+                max_width=field_ranges[0][1] - field_ranges[0][0] - 10,
+                max_height=row_height - 8,
+                max_size=row_font,
+                weight=LEADERBOARD_BODY_FONT_WEIGHT,
+            )
+            draw.text(
+                (field_centers[0], text_y),
+                rank_text,
+                font=rank_font,
                 fill=text,
                 anchor="mm",
             )
             if row_index >= len(column_rows):
                 continue
             row = column_rows[row_index]
-            team_max_width = wins_x - team_x - 20
-            team_font = _fit_font(
+            team_text, team_font = _fit_leaderboard_cell_text(
                 row.team_name,
-                max_width=max(80, team_max_width),
+                max_width=max(
+                    1,
+                    field_ranges[1][1] - field_ranges[1][0] - 20,
+                ),
                 max_height=row_height - 8,
                 max_size=row_font,
-                min_size=13,
+                min_size=8,
                 weight=LEADERBOARD_BODY_FONT_WEIGHT,
             )
             draw.text(
-                (team_x, text_y),
-                row.team_name,
+                (field_centers[1], text_y),
+                team_text,
                 font=team_font,
                 fill=text,
-                anchor="lm",
+                anchor="mm",
             )
-            for value, value_x in (
-                (row.wins, wins_x),
-                (row.kills, kills_x),
-                (row.placement_points, place_x),
-                (row.total_points, total_x),
+            for field_index, value in enumerate(
+                (
+                    row.wins,
+                    row.kills,
+                    row.placement_points,
+                    row.total_points,
+                ),
+                start=2,
             ):
-                draw.text(
-                    (value_x, text_y),
-                    str(value),
-                    font=_load_font(
-                        row_font,
-                        weight=LEADERBOARD_BODY_FONT_WEIGHT,
+                value_text, value_font = _fit_leaderboard_cell_text(
+                    value,
+                    max_width=(
+                        field_ranges[field_index][1]
+                        - field_ranges[field_index][0]
+                        - 10
                     ),
+                    max_height=row_height - 8,
+                    max_size=row_font,
+                    weight=LEADERBOARD_BODY_FONT_WEIGHT,
+                )
+                draw.text(
+                    (field_centers[field_index], text_y),
+                    value_text,
+                    font=value_font,
                     fill=text,
-                    anchor="rm",
+                    anchor="mm",
                 )
     buffer = io.BytesIO()
     output.convert("RGB").save(buffer, format="PNG", optimize=True)
