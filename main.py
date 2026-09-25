@@ -7439,7 +7439,7 @@ def build_help_text(category: str | None = None) -> str:
         return (
             ">>> **A.R.C. HELP**\n"
             "Choose a category below to see commands and their formats. "
-            "Use **Copy text** for the complete help guide."
+            "Select one to enable **Copy text** for that category."
         )
     details = HELP_CATEGORIES[category]
     return (
@@ -7450,11 +7450,19 @@ def build_help_text(category: str | None = None) -> str:
 
 
 class HelpView(ExpiringView):
-    """Owner-only controls for the condensed help message."""
+    """Owner-only controls for the categorized help panel."""
 
     def __init__(self, owner_id: int) -> None:
         super().__init__(timeout=300)
         self.owner_id = owner_id
+        self.selected_category: str | None = None
+        self.copy_text_button = next(
+            item
+            for item in self.children
+            if isinstance(item, discord.ui.Button)
+            and item.label == "Copy text"
+        )
+        self.copy_text_button.disabled = True
         self.timeout_notice = "⏱️ This help panel expired. Run `!help` again."
         category_select = discord.ui.Select(
             placeholder="Choose a help category...",
@@ -7472,11 +7480,19 @@ class HelpView(ExpiringView):
 
         async def select_category(interaction: discord.Interaction) -> None:
             category = category_select.values[0]
-            await interaction.response.edit_message(
-                content=build_help_text(category),
-                view=self,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            previous_category = self.selected_category
+            self.selected_category = category
+            self.copy_text_button.disabled = False
+            try:
+                await interaction.response.edit_message(
+                    content=build_help_text(category),
+                    view=self,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                self.selected_category = previous_category
+                self.copy_text_button.disabled = previous_category is None
+                raise
 
         category_select.callback = select_category
         self.add_item(category_select)
@@ -7500,8 +7516,15 @@ class HelpView(ExpiringView):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
+        if self.selected_category not in HELP_CATEGORIES:
+            await interaction.response.send_message(
+                "Select a help category before copying its text.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
         await interaction.response.send_message(
-            HELP_COPY_TEXT,
+            build_help_text(self.selected_category),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
