@@ -357,9 +357,7 @@ def registration_team_conflict(
     scrim: Scrim, team_name: str, manager_id: int
 ) -> str | None:
     """Report an existing team under the same or a different captain."""
-    normalized = unicodedata.normalize(
-        "NFKC", " ".join(team_name.split())
-    ).casefold()
+    normalized = registration_match_key(team_name)
     teams = (
         (
             slot.team_name,
@@ -375,9 +373,7 @@ def registration_team_conflict(
         for request in getattr(scrim, "pending_registrations", {}).values()
     )
     for existing_name, existing_manager, number, pending in (*teams, *requests):
-        if unicodedata.normalize(
-            "NFKC", " ".join(existing_name.split())
-        ).casefold() != normalized:
+        if registration_match_key(existing_name) != normalized:
             continue
         state = "pending staff review" if pending else "already registered"
         if existing_manager == manager_id:
@@ -392,6 +388,32 @@ def registration_team_conflict(
             f"This team is {state} in slot {number:02d} under a different "
             "captain. Please contact staff if the captain needs to change."
         )
+    return None
+
+
+def registration_match_key(value: str) -> str:
+    return unicodedata.normalize("NFKC", " ".join(value.split())).casefold()
+
+
+def registration_tag_conflict(
+    scrim: Scrim, team_name: str, tag: str
+) -> tuple[str, int, str] | None:
+    """Find another team's use of this tag, pending or assigned."""
+    name_key = registration_match_key(team_name)
+    tag_key = registration_match_key(tag)
+    for slot in scrim.slots.values():
+        if (
+            slot.status != STATUS_AVAILABLE
+            and registration_match_key(slot.tag) == tag_key
+            and registration_match_key(slot.team_name) != name_key
+        ):
+            return slot.team_name, slot.number, slot_status_label(slot)
+    for request in getattr(scrim, "pending_registrations", {}).values():
+        if (
+            registration_match_key(request.tag) == tag_key
+            and registration_match_key(request.team_name) != name_key
+        ):
+            return request.team_name, request.slot_number, "Registration pending"
     return None
 
 
@@ -725,8 +747,10 @@ async def send_private_command_feedback(
 async def send_private_registration_feedback(
     ctx: commands.Context,
     content: str,
+    *,
+    delete_command: bool = True,
 ) -> None:
-    """Send registration errors only to the member who submitted the command."""
+    """DM the submitter; use short-lived channel feedback if DMs are closed."""
     try:
         await ctx.author.send(
             content,
@@ -746,7 +770,24 @@ async def send_private_registration_feedback(
         except discord.HTTPException:
             logger.exception("Could not send temporary registration feedback.")
     finally:
-        await delete_command_message(ctx)
+        if delete_command:
+            await delete_command_message(ctx)
+
+
+async def mark_registration_declined(
+    ctx: commands.Context, scrim: Scrim
+) -> None:
+    """Reject a duplicate without creating a second registration request."""
+    message = getattr(ctx, "message", None)
+    add_reaction = getattr(message, "add_reaction", None)
+    if add_reaction is None:
+        return
+    try:
+        await add_reaction(
+            configured_emoji(scrim, "registration_declined_emoji", "❌")
+        )
+    except discord.HTTPException:
+        logger.exception("Could not mark duplicate registration as declined.")
 
 
 async def send_dm_command_feedback(
@@ -3176,7 +3217,10 @@ async def notify_staff_for_review(scrim: Scrim, slot: SlotSnapshot) -> bool:
 
 
 async def notify_staff_for_registration(
-    scrim: Scrim, request: RegistrationRequest | None
+    scrim: Scrim,
+    request: RegistrationRequest | None,
+    *,
+    tag_match: tuple[str, int, str] | None = None,
 ) -> bool:
     """Send a staff-only review message for a public team registration."""
     if request is None:
@@ -3184,12 +3228,44 @@ async def notify_staff_for_registration(
     channel = await staff_channel(scrim)
     if channel is None or not is_active(scrim):
         return False
+    staff_role_id = None
+    if tag_match is not None:
+        config = repository.get_server_config(scrim.guild_id)
+        staff_role_id = config.staff_role_id if config else None
+        if staff_role_id is None:
+            logger.warning(
+                "Cannot mention staff for matching tag on scrim %s: "
+                "no global staff role is configured.", scrim.id
+            )
+    safe_new = discord.utils.escape_markdown(
+        discord.utils.escape_mentions(request.team_name)
+    )
+    if tag_match is not None:
+        existing_name, existing_number, existing_status = tag_match
+        safe_existing = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(existing_name)
+        )
+        safe_tag = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(request.tag)
+        )
+        content = (
+            f"{f'<@&{staff_role_id}> ' if staff_role_id else ''}"
+            f"⚠️ **Matching team tag: {safe_tag}**\n"
+            f"New registration: **{safe_new}** · Slot {request.slot_number:02d} "
+            f"· <@{request.manager_id}>\n"
+            f"Already used by **{safe_existing}** · Slot "
+            f"{existing_number:02d} · **{existing_status}**\n"
+            "This new registration is pending staff review."
+        )
+    else:
+        content = (
+            f"📝 **Team registration request**\n"
+            f"**{safe_new}** · Slot {request.slot_number:02d}\n"
+            f"Captain: <@{request.manager_id}>"
+        )
     try:
         await channel.send(
-            f"📝 **Team registration request**\n"
-            f"**{discord.utils.escape_markdown(request.team_name)}** · "
-            f"Slot {request.slot_number:02d}\n"
-            f"Captain: <@{request.manager_id}>",
+            content,
             view=SlotReviewView(
                 scrim,
                 SlotSnapshot(
@@ -3204,7 +3280,16 @@ async def notify_staff_for_registration(
                 registration_request=True,
                 registration_request_id=request.request_id,
             ),
-            allowed_mentions=discord.AllowedMentions.none(),
+            allowed_mentions=(
+                discord.AllowedMentions(
+                    everyone=False,
+                    users=False,
+                    roles=[discord.Object(id=staff_role_id)],
+                    replied_user=False,
+                )
+                if staff_role_id is not None
+                else discord.AllowedMentions.none()
+            ),
         )
         return True
     except discord.HTTPException:
@@ -10240,6 +10325,7 @@ async def apply_registration_entry(
     """Create a Reserved slot or a durable unassigned registration request."""
     snapshot: SlotSnapshot | None = None
     auto_accept = getattr(scrim, "registration_auto_accept", False) is True
+    tag_match: tuple[str, int, str] | None = None
     async with scrim.state_lock:
         if not is_active(scrim):
             return None, "The scrim is no longer active.", False, False
@@ -10255,6 +10341,11 @@ async def apply_registration_entry(
         )
         if conflict:
             return None, conflict, False, False
+        tag_match = registration_tag_conflict(
+            scrim, entry.team_name, entry.tag
+        )
+        if tag_match is not None:
+            auto_accept = False
         slot = scrim.slots.get(entry.slot_number)
         if slot is None or not registration_slot_is_available(scrim, slot):
             return None, "The selected slot is no longer available.", False, False
@@ -10307,7 +10398,9 @@ async def apply_registration_entry(
         )
         return snapshot, None, access_ok, board_refreshed
 
-    notified = await notify_staff_for_registration(scrim, request)
+    notified = await notify_staff_for_registration(
+        scrim, request, **({"tag_match": tag_match} if tag_match else {})
+    )
     await send_scrim_log(
         scrim,
         "TEAM REGISTRATION REQUEST",
@@ -10577,7 +10670,10 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
             None,
         )
     if conflict:
-        await send_private_registration_feedback(ctx, conflict)
+        await mark_registration_declined(ctx, scrim)
+        await send_private_registration_feedback(
+            ctx, conflict, delete_command=False
+        )
         return
     if slot_number is None:
         await send_private_command_feedback(
@@ -10600,9 +10696,16 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
         registration_message_id=getattr(getattr(ctx, "message", None), "id", None),
     )
     if error or snapshot is None:
+        async with scrim.state_lock:
+            duplicate = registration_team_conflict(
+                scrim, team_name, manager.id
+            )
+        if duplicate == error:
+            await mark_registration_declined(ctx, scrim)
         await send_private_registration_feedback(
             ctx,
             error or "The registration could not be completed.",
+            delete_command=not (duplicate == error and error is not None),
         )
         return
 
@@ -10614,6 +10717,30 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
             access_ok,
             board_refreshed,
         )
+    if snapshot.status == STATUS_PENDING:
+        async with scrim.state_lock:
+            tag_match = registration_tag_conflict(scrim, team_name, tag)
+        if tag_match:
+            existing_name, existing_number, existing_status = tag_match
+            safe_name = discord.utils.escape_markdown(
+                discord.utils.escape_mentions(existing_name)
+            )
+            safe_tag = discord.utils.escape_markdown(
+                discord.utils.escape_mentions(tag)
+            )
+            notice = (
+                f"Your registration is pending staff review. The tag "
+                f"**{safe_tag}** is already used by **{safe_name}** "
+                f"(slot {existing_number:02d} · {existing_status}). "
+                + (
+                    "Staff have been alerted."
+                    if board_refreshed else
+                    "The staff alert could not be delivered. Please contact staff."
+                )
+            )
+            await send_private_registration_feedback(
+                ctx, notice, delete_command=False
+            )
     message = getattr(ctx, "message", None)
     add_reaction = getattr(message, "add_reaction", None)
     if add_reaction is not None:
@@ -10621,8 +10748,7 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
             await add_reaction(
                 registration_success_reaction(
                     scrim,
-                    accepted=getattr(scrim, "registration_auto_accept", False)
-                    is True,
+                    accepted=snapshot.status == STATUS_RESERVED,
                 )
             )
         except discord.HTTPException:
