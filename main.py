@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -350,6 +351,48 @@ def registration_slot_is_available(scrim: Scrim, slot: Slot | SlotSnapshot) -> b
         request.slot_number == slot.number
         for request in getattr(scrim, "pending_registrations", {}).values()
     )
+
+
+def registration_team_conflict(
+    scrim: Scrim, team_name: str, manager_id: int
+) -> str | None:
+    """Report an existing team under the same or a different captain."""
+    normalized = unicodedata.normalize(
+        "NFKC", " ".join(team_name.split())
+    ).casefold()
+    teams = (
+        (
+            slot.team_name,
+            slot.manager_id,
+            slot.number,
+            False,
+        )
+        for slot in scrim.slots.values()
+        if slot.status != STATUS_AVAILABLE
+    )
+    requests = (
+        (request.team_name, request.manager_id, request.slot_number, True)
+        for request in getattr(scrim, "pending_registrations", {}).values()
+    )
+    for existing_name, existing_manager, number, pending in (*teams, *requests):
+        if unicodedata.normalize(
+            "NFKC", " ".join(existing_name.split())
+        ).casefold() != normalized:
+            continue
+        state = "pending staff review" if pending else "already registered"
+        if existing_manager == manager_id:
+            return (
+                f"Your team is {state} in slot {number:02d}. "
+                "Please wait for the staff decision instead of registering again."
+                if pending else
+                f"Your team is already registered in slot {number:02d}. "
+                "You do not need to register it again."
+            )
+        return (
+            f"This team is {state} in slot {number:02d} under a different "
+            "captain. Please contact staff if the captain needs to change."
+        )
+    return None
 
 
 def release_slot(slot: Slot) -> SlotSnapshot:
@@ -694,6 +737,14 @@ async def send_private_registration_feedback(
             "Could not DM registration feedback to %s.",
             getattr(ctx.author, "id", None),
         )
+        try:
+            await ctx.send(
+                content,
+                delete_after=20,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Could not send temporary registration feedback.")
     finally:
         await delete_command_message(ctx)
 
@@ -10199,6 +10250,11 @@ async def apply_registration_entry(
                 False,
                 False,
             )
+        conflict = registration_team_conflict(
+            scrim, entry.team_name, entry.member.id
+        )
+        if conflict:
+            return None, conflict, False, False
         slot = scrim.slots.get(entry.slot_number)
         if slot is None or not registration_slot_is_available(scrim, slot):
             return None, "The selected slot is no longer available.", False, False
@@ -10511,14 +10567,18 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
             return
 
     async with scrim.state_lock:
-        slot_number = next(
+        conflict = registration_team_conflict(scrim, team_name, manager.id)
+        slot_number = None if conflict else next(
             (
                 slot.number
                 for slot in scrim.slots.values()
-                        if registration_slot_is_available(scrim, slot)
+                if registration_slot_is_available(scrim, slot)
             ),
             None,
         )
+    if conflict:
+        await send_private_registration_feedback(ctx, conflict)
+        return
     if slot_number is None:
         await send_private_command_feedback(
             ctx,
@@ -10540,10 +10600,9 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
         registration_message_id=getattr(getattr(ctx, "message", None), "id", None),
     )
     if error or snapshot is None:
-        await send_private_command_feedback(
+        await send_private_registration_feedback(
             ctx,
             error or "The registration could not be completed.",
-            silent=False,
         )
         return
 
