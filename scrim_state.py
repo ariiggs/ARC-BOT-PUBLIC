@@ -406,6 +406,7 @@ class Scrim:
     emoji_registration_declined: str = DEFAULT_EMOJI_REGISTRATION_DECLINED
     public_message_id: int | None = None
     staff_message_id: int | None = None
+    registration_review_message_id: int | None = None
     is_open: bool = True
     registration_open: bool = True
     operational_messages: dict[str, str] = field(
@@ -498,6 +499,7 @@ class Scrim:
             "emoji_registration_declined": self.emoji_registration_declined,
             "public_message_id": self.public_message_id,
             "staff_message_id": self.staff_message_id,
+            "registration_review_message_id": self.registration_review_message_id,
             "is_open": self.is_open,
             "registration_open": self.registration_open,
             "operational_messages": dict(self.operational_messages),
@@ -994,7 +996,7 @@ class ScrimRepository:
 
     def payload(self) -> dict:
         return {
-            "version": 33,
+            "version": 34,
             "scrims": [s.payload() for s in self.scrims.values()],
             "server_configs": [
                 config.payload() for config in self.server_configs.values()
@@ -1043,7 +1045,7 @@ class ScrimRepository:
             version = payload.get("version")
             if type(version) is not int or version not in (
                 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-                20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33
+                20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34
             ):
                 raise ValueError("Unsupported snapshot version.")
             if not isinstance(payload["scrims"], list):
@@ -1210,6 +1212,8 @@ class ScrimRepository:
                             request.setdefault("registration_message_id", None)
                 if payload["version"] < 22:
                     values.setdefault("registration_open", True)
+                if payload["version"] < 34:
+                    values.setdefault("registration_review_message_id", None)
                 if payload["version"] < 25:
                     values.setdefault(
                         "operational_messages",
@@ -1387,6 +1391,7 @@ class ScrimRepository:
                     "history_channel_id", "registration_channel_id",
                     "registration_role_id", "registration_auto_accept",
                     "public_message_id", "staff_message_id",
+                    "registration_review_message_id",
                     "emoji_available", "emoji_reserved", "emoji_pending",
                     "slot_number_emojis", "emoji_registration_ok",
                     "emoji_registration_accepted", "emoji_registration_declined",
@@ -1500,6 +1505,7 @@ class ScrimRepository:
                     or type(scrim.registration_auto_accept) is not bool
                     or (scrim.public_message_id is not None and not _positive_id(scrim.public_message_id))
                     or (scrim.staff_message_id is not None and not _positive_id(scrim.staff_message_id))
+                    or (scrim.registration_review_message_id is not None and not _positive_id(scrim.registration_review_message_id))
                     or any(
                         not isinstance(getattr(scrim, field_name), str)
                         or not getattr(scrim, field_name).strip()
@@ -1802,7 +1808,7 @@ class ScrimRepository:
             except (KeyError, TypeError, ValueError) as error:
                 raise SlotStorageError("Invalid legacy snapshot; migration was stopped.") from error
             new_payload = {
-                "version": 33,
+                "version": 34,
                 "scrims": [],
                 "server_configs": [],
                 "idpw_configs": [],
@@ -1848,7 +1854,7 @@ class ScrimRepository:
         self.authorized_guild_duration_days = authorized_guild_duration_days
         self.authorized_guild_license_types = authorized_guild_license_types
         self.authorized_admin_ids = authorized_admin_ids
-        if payload.get("version", 0) < 33:
+        if payload.get("version", 0) < 34:
             self.store.save(self.payload())
 
     @contextmanager
@@ -1907,6 +1913,7 @@ class ScrimRepository:
                     "emoji_registration_declined",
                     "public_message_id",
                     "staff_message_id",
+                    "registration_review_message_id",
                     "is_open",
                     "registration_open",
                     "operational_messages",

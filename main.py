@@ -2448,7 +2448,13 @@ async def refresh_public_slots_locked(scrim: Scrim, *, create: bool = False) -> 
 async def publish_scrim(scrim: Scrim) -> bool:
     """Recover, refresh, or create the configured board for one active scrim."""
     async with scrim.board_lock:
-        return await refresh_public_slots_locked(scrim, create=True)
+        board_ok = await refresh_public_slots_locked(scrim, create=True)
+    if (
+        getattr(scrim, "pending_registrations", {})
+        or getattr(scrim, "registration_review_message_id", None)
+    ):
+        await refresh_registration_queue(scrim)
+    return board_ok
 
 
 async def staff_channel(scrim: Scrim):
@@ -3137,6 +3143,8 @@ class SlotReviewView(DurableView):
                 f"{slot_status_label(result)}",
             )
             await interaction.followup.send(text, ephemeral=True)
+            if self.registration_request:
+                await refresh_registration_queue(self.scrim)
             await delete_staff_review_message(interaction)
 
 
@@ -3222,64 +3230,34 @@ async def notify_staff_for_registration(
     *,
     tag_match: tuple[str, int, str] | None = None,
 ) -> bool:
-    """Send a staff-only review message for a public team registration."""
+    """Update the shared queue; separately ping staff for a matching tag."""
     if request is None:
         return False
+    if not await refresh_registration_queue(scrim):
+        return False
+    if tag_match is None:
+        return True
     channel = await staff_channel(scrim)
     if channel is None or not is_active(scrim):
         return False
-    staff_role_id = None
-    if tag_match is not None:
-        config = repository.get_server_config(scrim.guild_id)
-        staff_role_id = config.staff_role_id if config else None
-        if staff_role_id is None:
-            logger.warning(
-                "Cannot mention staff for matching tag on scrim %s: "
-                "no global staff role is configured.", scrim.id
-            )
-    safe_new = discord.utils.escape_markdown(
-        discord.utils.escape_mentions(request.team_name)
+    config = repository.get_server_config(scrim.guild_id)
+    staff_role_id = config.staff_role_id if config else None
+    existing_name, existing_number, existing_status = tag_match
+    safe = lambda value: discord.utils.escape_markdown(
+        discord.utils.escape_mentions(value)
     )
-    if tag_match is not None:
-        existing_name, existing_number, existing_status = tag_match
-        safe_existing = discord.utils.escape_markdown(
-            discord.utils.escape_mentions(existing_name)
-        )
-        safe_tag = discord.utils.escape_markdown(
-            discord.utils.escape_mentions(request.tag)
-        )
-        content = (
-            f"{f'<@&{staff_role_id}> ' if staff_role_id else ''}"
-            f"⚠️ **Matching team tag: {safe_tag}**\n"
-            f"New registration: **{safe_new}** · Slot {request.slot_number:02d} "
-            f"· <@{request.manager_id}>\n"
-            f"Already used by **{safe_existing}** · Slot "
-            f"{existing_number:02d} · **{existing_status}**\n"
-            "This new registration is pending staff review."
-        )
-    else:
-        content = (
-            f"📝 **Team registration request**\n"
-            f"**{safe_new}** · Slot {request.slot_number:02d}\n"
-            f"Captain: <@{request.manager_id}>"
-        )
+    content = (
+        f"{f'<@&{staff_role_id}> ' if staff_role_id else ''}"
+        f"⚠️ **Matching team tag: {safe(request.tag)}**\n"
+        f"New: **{safe(request.team_name)}** · Slot {request.slot_number:02d} "
+        f"· <@{request.manager_id}>\n"
+        f"Already used by **{safe(existing_name)}** · Slot "
+        f"{existing_number:02d} · **{existing_status}**\n"
+        "Held in the registration review queue for staff."
+    )
     try:
         await channel.send(
             content,
-            view=SlotReviewView(
-                scrim,
-                SlotSnapshot(
-                    number=request.slot_number,
-                    status=STATUS_PENDING,
-                    team_name=request.team_name,
-                    tag=request.tag,
-                    manager_id=request.manager_id,
-                    assignment_id=request.assignment_id,
-                    captain_1_id=request.manager_id,
-                ),
-                registration_request=True,
-                registration_request_id=request.request_id,
-            ),
             allowed_mentions=(
                 discord.AllowedMentions(
                     everyone=False,
@@ -3297,6 +3275,360 @@ async def notify_staff_for_registration(
             "Could not send the registration review (%s).", scrim.id
         )
         return False
+
+
+def registration_queue_content(scrim: Scrim) -> str:
+    requests = sorted(
+        getattr(scrim, "pending_registrations", {}).values(),
+        key=lambda request: (request.slot_number, request.request_id),
+    )
+    lines = [f"**Registration review · {len(requests)} pending**"]
+    if not requests:
+        lines.append("No teams waiting for staff review.")
+    visible = 0
+    for request in requests:
+        name = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(request.team_name)
+        )
+        tag = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(request.tag)
+        )
+        line = (
+            f"{configured_emoji(scrim, 'registration_ok_emoji', '🆗')} "
+            f"`{request.slot_number:02d}` **{name}** · {tag} · <@{request.manager_id}>"
+        )
+        if len("\n".join(lines)) + len(line) > 1750:
+            break
+        lines.append(line)
+        visible += 1
+    if len(requests) > visible:
+        lines.append(f"…and {len(requests) - visible} more. Use the selection pages below.")
+    lines.append("\nAccept or Decline opens a private selection and confirmation.")
+    return "\n".join(lines)
+
+
+async def refresh_registration_queue(scrim: Scrim) -> bool:
+    """Keep one durable staff message in sync with pending requests."""
+    async with getattr(scrim, "board_lock", asyncio.Lock()):
+        if not is_active(scrim):
+            return False
+        channel = await staff_channel(scrim)
+        if channel is None or not is_active(scrim):
+            return False
+        message_id = getattr(scrim, "registration_review_message_id", None)
+        if message_id is None and not getattr(scrim, "pending_registrations", {}):
+            return True
+        message = None
+        try:
+            if message_id is not None:
+                try:
+                    message = await channel.fetch_message(message_id)
+                except discord.NotFound:
+                    pass
+            async with scrim.state_lock:
+                if not is_active(scrim):
+                    return False
+                content = registration_queue_content(scrim)
+            if message is None:
+                message = await channel.send(
+                    content,
+                    view=RegistrationQueueView(scrim.id),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                if not is_active(scrim) or type(getattr(message, "id", None)) is not int:
+                    return False
+                with repository.transaction():
+                    if not is_active(scrim):
+                        return False
+                    scrim.registration_review_message_id = message.id
+                await retire_legacy_registration_reviews(scrim, channel)
+            else:
+                await message.edit(
+                    content=content,
+                    view=RegistrationQueueView(scrim.id),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            return True
+        except (discord.HTTPException, AttributeError, SlotStorageError):
+            logger.exception("Could not update registration queue (%s).", scrim.id)
+            return False
+
+
+async def retire_legacy_registration_reviews(scrim: Scrim, channel) -> None:
+    """Remove obsolete per-team controls without deleting historical messages."""
+    history = getattr(channel, "history", None)
+    bot_user_id = getattr(getattr(bot, "user", None), "id", None)
+    if history is None or bot_user_id is None:
+        return
+    try:
+        async for message in history(limit=200):
+            if (
+                not is_active(scrim)
+                or getattr(getattr(message, "author", None), "id", None) != bot_user_id
+            ):
+                continue
+            if not any(
+                str(getattr(item, "custom_id", "")).startswith(
+                    f"slots:staff:{scrim.id}:"
+                )
+                and str(getattr(item, "custom_id", "")).endswith(":reg")
+                for row in getattr(message, "components", ())
+                for item in getattr(row, "children", ())
+            ):
+                continue
+            note = (
+                f"\n\nReview moved to the shared queue "
+                f"(message {scrim.registration_review_message_id})."
+            )
+            content = getattr(message, "content", "") or ""
+            await message.edit(
+                content=(content[: 2000 - len(note)] + note),
+                view=None,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+    except discord.HTTPException:
+        logger.exception("Could not retire all legacy registration controls (%s).", scrim.id)
+
+
+async def registration_queue_allowed(
+    interaction: discord.Interaction, scrim: Scrim, *, message: bool = True
+) -> bool:
+    allowed = (
+        is_active(scrim)
+        and repository.is_guild_authorized(scrim.guild_id)
+        and interaction.guild is not None
+        and interaction.guild.id == scrim.guild_id
+        and interaction.channel_id == scrim.staff_channel_id
+        and member_is_staff(interaction.user, scrim)
+        and (
+            not message
+            or (
+                interaction.message is not None
+                and interaction.message.id
+                == scrim.registration_review_message_id
+            )
+        )
+    )
+    if not allowed:
+        await interaction.response.send_message(
+            "This registration queue is for staff in this scrim's staff channel.",
+            ephemeral=True,
+        )
+    return allowed
+
+
+class RegistrationQueueView(discord.ui.View):
+    def __init__(self, scrim_id: str):
+        super().__init__(timeout=None)
+        self.scrim_id = scrim_id
+        for action, style, emoji in (
+            ("Accept", discord.ButtonStyle.success, "✅"),
+            ("Decline", discord.ButtonStyle.danger, "❌"),
+        ):
+            button = discord.ui.Button(
+                label=action,
+                style=style,
+                emoji=emoji,
+                custom_id=f"slots:regqueue:{scrim_id}:{action.lower()}",
+            )
+            button.callback = self.open_selection
+            self.add_item(button)
+
+    async def open_selection(self, interaction: discord.Interaction) -> None:
+        scrim = repository.get(self.scrim_id)
+        if scrim is None:
+            await interaction.response.send_message("This scrim no longer exists.", ephemeral=True)
+            return
+        if not await registration_queue_allowed(interaction, scrim):
+            return
+        async with scrim.state_lock:
+            requests = sorted(
+                scrim.pending_registrations.values(),
+                key=lambda request: (request.slot_number, request.request_id),
+            )
+        if not requests:
+            await interaction.response.send_message("No registrations are pending.", ephemeral=True)
+            return
+        action = "Accept" if interaction.data["custom_id"].endswith(":accept") else "Decline"
+        view = RegistrationQueueSelectView(scrim.id, interaction.user.id, action, requests)
+        await interaction.response.send_message(
+            view.page_text(), view=view, ephemeral=True
+        )
+
+
+class RegistrationQueueSelectView(discord.ui.View):
+    def __init__(self, scrim_id, owner_id, action, requests, page=0):
+        super().__init__(timeout=180)
+        self.scrim_id, self.owner_id, self.action = scrim_id, owner_id, action
+        self.requests, self.page = requests, page
+        chunk = requests[page * 25 : (page + 1) * 25]
+        options = [
+            discord.SelectOption(
+                label=f"{request.slot_number:02d} · {request.team_name}"[:100],
+                description=f"{request.tag} · captain {request.manager_id}"[:100],
+                value=request.request_id,
+            )
+            for request in chunk
+        ]
+        selector = discord.ui.Select(
+            placeholder=f"Select teams to {action.lower()}",
+            min_values=1, max_values=len(options), options=options,
+        )
+        selector.callback = self.select
+        self.add_item(selector)
+        for label, target in (("Previous", page - 1), ("Next", page + 1)):
+            if 0 <= target < (len(requests) + 24) // 25:
+                button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary)
+                async def navigate(interaction, destination=target):
+                    if not await self.owner_allowed(interaction):
+                        return
+                    view = RegistrationQueueSelectView(
+                        self.scrim_id, self.owner_id, self.action, self.requests, destination
+                    )
+                    await interaction.response.edit_message(content=view.page_text(), view=view)
+                button.callback = navigate
+                self.add_item(button)
+
+    def page_text(self):
+        return (
+            f"**{self.action} registrations** · page {self.page + 1}/"
+            f"{(len(self.requests) + 24) // 25}\n"
+            "Select one or more teams. Nothing changes until you confirm."
+        )
+
+    async def owner_allowed(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This private selection belongs to another staff member.", ephemeral=True)
+            return False
+        scrim = repository.get(self.scrim_id)
+        if scrim is None:
+            await interaction.response.send_message(
+                "This scrim no longer exists.", ephemeral=True
+            )
+            return False
+        return await registration_queue_allowed(interaction, scrim, message=False)
+
+    async def select(self, interaction):
+        if not await self.owner_allowed(interaction):
+            return
+        ids = set(self.children[0].values)
+        chosen = [request for request in self.requests if request.request_id in ids]
+        if not chosen:
+            await interaction.response.send_message(
+                "Select at least one pending team.", ephemeral=True
+            )
+            return
+        view = RegistrationQueueConfirmView(
+            self.scrim_id, self.owner_id, self.action, chosen
+        )
+        await interaction.response.edit_message(
+            content=(
+                f"**Confirm {self.action.lower()} for {len(chosen)} team(s)?**\n"
+                + "\n".join(
+                    f"`{r.slot_number:02d}` {discord.utils.escape_markdown(discord.utils.escape_mentions(r.team_name))}"
+                    for r in chosen
+                )
+            )[:2000],
+            view=view,
+        )
+
+
+class RegistrationQueueConfirmView(discord.ui.View):
+    def __init__(self, scrim_id, owner_id, action, requests):
+        super().__init__(timeout=180)
+        self.scrim_id, self.owner_id, self.action, self.requests = (
+            scrim_id, owner_id, action, requests
+        )
+        confirm = discord.ui.Button(
+            label=f"Confirm {action}", style=(
+                discord.ButtonStyle.success if action == "Accept"
+                else discord.ButtonStyle.danger
+            ),
+        )
+        confirm.callback = self.confirm
+        self.add_item(confirm)
+        cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+        cancel.callback = self.cancel
+        self.add_item(cancel)
+
+    async def cancel(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Not your review.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Review cancelled. No changes made.", view=None)
+
+    async def confirm(self, interaction):
+        scrim = repository.get(self.scrim_id)
+        if interaction.user.id != self.owner_id or scrim is None:
+            await interaction.response.send_message("This review is no longer available.", ephemeral=True)
+            return
+        if not await registration_queue_allowed(interaction, scrim, message=False):
+            return
+        if pause_scrim_if_unconfigured(scrim):
+            await interaction.response.send_message("Scrim configuration is incomplete.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        approved = self.action == "Accept"
+        async with scrim.state_lock:
+            valid = bool(self.requests) and is_active(scrim) and all(
+                (current := scrim.pending_registrations.get(request.request_id)) == request
+                and (slot := scrim.slots.get(request.slot_number)) is not None
+                and slot.status == STATUS_AVAILABLE
+                and slot.assignment_id == request.assignment_id
+                for request in self.requests
+            )
+            if valid:
+                with repository.transaction():
+                    for request in self.requests:
+                        scrim.pending_registrations.pop(request.request_id)
+                        if approved:
+                            slot = scrim.slots[request.slot_number]
+                            slot.assignment_id += 1
+                            slot.status = STATUS_RESERVED
+                            slot.team_name = request.team_name
+                            slot.tag = request.tag
+                            slot.manager_id = request.manager_id
+                            slot.captain_1_id = request.manager_id
+                            slot.captain_2_id = None
+        if not valid:
+            await interaction.followup.send(
+                "The queue changed or a slot became unavailable. Reopen the queue and select again.",
+                ephemeral=True,
+            )
+            return
+        issues = []
+        for request in self.requests:
+            if approved:
+                guild = interaction.guild or bot.get_guild(scrim.guild_id)
+                member = guild.get_member(request.manager_id) if guild else None
+                if member is None and guild is not None:
+                    try:
+                        member = await guild.fetch_member(request.manager_id)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+                if member is None or not await grant_manager_access(scrim, member):
+                    issues.append(f"Captain access for slot {request.slot_number:02d}")
+            if not await update_registration_reaction(scrim, request, approved=approved):
+                issues.append(f"Reaction for slot {request.slot_number:02d}")
+            await send_scrim_log(
+                scrim,
+                "STAFF REGISTRATION APPROVAL" if approved else "STAFF REGISTRATION REJECTION",
+                f"Slot {request.slot_number:02d} · team **{request.team_name}** · "
+                f"{'Reserved' if approved else 'Declined'}",
+            )
+        if approved and not await refresh_public_slots(scrim):
+            issues.append("Public slots board")
+        if not await refresh_registration_queue(scrim):
+            issues.append("Staff registration queue")
+        disable_view_items(self)
+        await interaction.edit_original_response(
+            content=(
+                f"{'✅ Accepted' if approved else '❌ Declined'} "
+                f"{len(self.requests)} team(s)."
+                + (f" ⚠️ Could not update: {', '.join(issues)}." if issues else "")
+            ),
+            view=self,
+        )
 
 
 async def notify_staff_of_manager_action(
@@ -3687,6 +4019,7 @@ async def perform_scrim_reset(scrim: Scrim, invoking_channel) -> str:
                 for slot in scrim.slots.values():
                     slot.clear()
                 scrim.pending_registrations.clear()
+                scrim.registration_review_message_id = None
                 scrim.current_match_counter = 1
         for manager_id in manager_ids:
             await revoke_manager_access_if_unused(scrim, manager_id)
@@ -8794,6 +9127,15 @@ async def setup_hook() -> None:
             bot.add_view(
                 StaffMirrorView(scrim),
                 message_id=scrim.staff_message_id,
+            )
+        if (
+            not scrim.deleted
+            and scrim.registration_review_message_id is not None
+            and scrim.staff_channel_id is not None
+        ):
+            bot.add_view(
+                RegistrationQueueView(scrim.id),
+                message_id=scrim.registration_review_message_id,
             )
     bot.add_dynamic_items(
         ManagerActionButton,
