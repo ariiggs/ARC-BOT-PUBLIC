@@ -2349,6 +2349,20 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             return embed
 
         def ready_to_activate(self) -> bool:
+            if not self.is_edit:
+                try:
+                    validate_slot_range(self.slot_start, self.slot_end)
+                except (TypeError, ValueError):
+                    return False
+                return bool(
+                    self.name.strip()
+                    and self.public_channel_id
+                    and self.staff_channel_id
+                    and self.logs_channel_id
+                    and self.history_channel_id
+                    and self.pending_role_id
+                    and self.confirmed_role_id
+                )
             return all(
                 (
                     self.name.strip(),
@@ -2442,6 +2456,19 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
                     button.callback = required_callback
                     self.add_item(button)
+
+                confirm_button = discord.ui.Button(
+                    label="Confirm",
+                    style=discord.ButtonStyle.success,
+                    disabled=not self.ready_to_activate(),
+                    row=1,
+                )
+
+                async def confirm_callback(interaction: discord.Interaction) -> None:
+                    await self.confirm_and_activate(interaction)
+
+                confirm_button.callback = confirm_callback
+                self.add_item(confirm_button)
 
                 cancel_button = discord.ui.Button(
                     label="Cancel Draft",
@@ -3191,6 +3218,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     self.history_channel_id,
                     self.target_channel_id,
                 )
+                if value is not None
             ]
             if not all(isinstance(channel, discord.TextChannel) for channel in channels):
                 await interaction.response.send_message(
@@ -3217,7 +3245,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 channels[1],
                 (channels[2], "logs"),
                 (channels[3], "history"),
-                (channels[4], "ID/PW target"),
+                *((channels[4], "ID/PW target"),) if self.target_channel_id else (),
             )
             if permission_error:
                 await interaction.response.send_message(
@@ -3250,20 +3278,21 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     is_open=False,
                     slot_start=self.slot_start,
                     slot_end=self.slot_end,
-                    max_matches=self.max_matches,
-                    maps=self.maps,
-                    match_maps=self.match_maps,
+                    max_matches=self.max_matches or len(DEFAULT_MATCH_MAPS),
+                    maps=self.maps or list(DEFAULT_MATCH_MAPS),
+                    match_maps=self.match_maps or list(DEFAULT_MATCH_MAPS),
                     kill_points_value=self.kill_points_value,
                     placement_points_string=self.placement_points_string,
                     leaderboard_layout=self.leaderboard_layout,
                 )
-                repository.save_idpw_config(
-                    scrim.id,
-                    target_channel_id=self.target_channel_id,
-                    fixed_password=self.fixed_pw if self.pw_type == "fixed" else "",
-                    timezone_name=self.timezone_name,
-                    password_type=self.pw_type,
-                )
+                if self.target_channel_id is not None:
+                    repository.save_idpw_config(
+                        scrim.id,
+                        target_channel_id=self.target_channel_id,
+                        fixed_password=self.fixed_pw if self.pw_type == "fixed" else "",
+                        timezone_name=self.timezone_name or DEFAULT_IDPW_TIMEZONE,
+                        password_type=self.pw_type or "dynamic",
+                    )
             except (SlotStorageError, ValueError) as error:
                 if scrim is not None:
                     try:
