@@ -43,6 +43,7 @@ DEFAULT_EMOJI_PENDING = "🟠"
 DEFAULT_EMOJI_CONFIRMED = "🟢"
 DEFAULT_EMOJI_REGISTRATION_OK = "🆗"
 DEFAULT_EMOJI_REGISTRATION_ACCEPTED = "✅"
+DEFAULT_EMOJI_REGISTRATION_DECLINED = "❌"
 DEFAULT_LICENSE_TYPE = "Standard"
 LICENSE_TYPES = ("Standard", "Gold")
 DEFAULT_KILL_POINTS_VALUE = 1
@@ -107,10 +108,12 @@ DEFAULT_SCRIM_EMOJIS = {
 REGISTRATION_EMOJI_FIELDS = (
     "emoji_registration_ok",
     "emoji_registration_accepted",
+    "emoji_registration_declined",
 )
 DEFAULT_REGISTRATION_EMOJIS = {
     "emoji_registration_ok": DEFAULT_EMOJI_REGISTRATION_OK,
     "emoji_registration_accepted": DEFAULT_EMOJI_REGISTRATION_ACCEPTED,
+    "emoji_registration_declined": DEFAULT_EMOJI_REGISTRATION_DECLINED,
 }
 
 
@@ -400,6 +403,7 @@ class Scrim:
     slot_number_emojis: dict[int, str] = field(default_factory=dict)
     emoji_registration_ok: str = DEFAULT_EMOJI_REGISTRATION_OK
     emoji_registration_accepted: str = DEFAULT_EMOJI_REGISTRATION_ACCEPTED
+    emoji_registration_declined: str = DEFAULT_EMOJI_REGISTRATION_DECLINED
     public_message_id: int | None = None
     staff_message_id: int | None = None
     is_open: bool = True
@@ -491,6 +495,7 @@ class Scrim:
             },
             "emoji_registration_ok": self.emoji_registration_ok,
             "emoji_registration_accepted": self.emoji_registration_accepted,
+            "emoji_registration_declined": self.emoji_registration_declined,
             "public_message_id": self.public_message_id,
             "staff_message_id": self.staff_message_id,
             "is_open": self.is_open,
@@ -1384,7 +1389,7 @@ class ScrimRepository:
                     "public_message_id", "staff_message_id",
                     "emoji_available", "emoji_reserved", "emoji_pending",
                     "slot_number_emojis", "emoji_registration_ok",
-                    "emoji_registration_accepted",
+                    "emoji_registration_accepted", "emoji_registration_declined",
                      "emoji_confirmed", "is_open", "registration_open",
                      "operational_messages",
                      "operational_message_refs",
@@ -1899,6 +1904,7 @@ class ScrimRepository:
                     "slot_number_emojis",
                     "emoji_registration_ok",
                     "emoji_registration_accepted",
+                    "emoji_registration_declined",
                     "public_message_id",
                     "staff_message_id",
                     "is_open",
@@ -2032,6 +2038,42 @@ class ScrimRepository:
                 scrim.slot_number_emojis = normalize_slot_number_emojis(
                     scrim.slot_number_emojis
                 )
+        return scrim
+
+    def save_slot_number_emojis(
+        self,
+        scrim_id: str,
+        guild_id: int,
+        updates: dict[int, str],
+    ) -> Scrim:
+        """Atomically set multiple slot-number emoji overrides.
+
+        Every key and emoji is validated before mutating the scrim. Entries not
+        included in ``updates`` are preserved.
+        """
+        try:
+            normalized_updates = normalize_slot_number_emojis(updates)
+        except ValueError:
+            raise
+        scrim = self.get(scrim_id)
+        if scrim is None or scrim.guild_id != guild_id:
+            raise ValueError("This scrim does not exist on this server.")
+        merged = dict(scrim.slot_number_emojis)
+        merged.update(normalized_updates)
+        normalized_merged = normalize_slot_number_emojis(merged)
+        with self.transaction():
+            scrim.slot_number_emojis = normalized_merged
+        return scrim
+
+    def clear_slot_number_emojis(
+        self, scrim_id: str, guild_id: int
+    ) -> Scrim:
+        """Atomically remove every slot-number emoji override for one scrim."""
+        scrim = self.get(scrim_id)
+        if scrim is None or scrim.guild_id != guild_id:
+            raise ValueError("This scrim does not exist on this server.")
+        with self.transaction():
+            scrim.slot_number_emojis = {}
         return scrim
 
     def save_registration_emoji(

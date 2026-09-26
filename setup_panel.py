@@ -10,7 +10,7 @@ from typing import Any
 import discord
 from discord.ext import commands
 
-from global_setup import extract_raw_emoji
+from global_setup import CUSTOM_EMOJI_RE, UNICODE_EMOJI_RE, extract_raw_emoji
 from slot_storage import SlotStorageError
 from scrim_state import (
     DEFAULT_KILL_POINTS_VALUE,
@@ -22,6 +22,7 @@ from scrim_state import (
     DEFAULT_EMOJI_CONFIRMED,
     DEFAULT_EMOJI_REGISTRATION_OK,
     DEFAULT_EMOJI_REGISTRATION_ACCEPTED,
+    DEFAULT_EMOJI_REGISTRATION_DECLINED,
     DEFAULT_PLACEMENT_POINTS_STRING,
     DEFAULT_SLOT_END,
     DEFAULT_SLOT_START,
@@ -61,6 +62,23 @@ def _extract_setup_emoji(value: str) -> str | None:
         iter(re.findall(r"[#*0-9]\ufe0f?\u20e3", value)),
         None,
     )
+
+
+# Match complete emoji tokens, including custom server emojis, flags, ZWJ
+# sequences, and keycaps. A bulk answer may separate them or place them
+# directly next to one another.
+_BULK_EMOJI_RE = re.compile(
+    rf"(?:{CUSTOM_EMOJI_RE.pattern})|(?:[#*0-9]\ufe0f?\u20e3)|"
+    rf"(?:{UNICODE_EMOJI_RE.pattern})"
+)
+
+
+def _parse_slot_emoji_list(value: str) -> list[str]:
+    matches = list(_BULK_EMOJI_RE.finditer(value))
+    leftovers = _BULK_EMOJI_RE.sub("", value)
+    if not matches or re.sub(r"[\s,]+", "", leftovers):
+        raise ValueError("Enter only emojis, separated by spaces, commas, or new lines.")
+    return [match.group(0) for match in matches]
 
 
 def _short_name(value: str, limit: int = 20) -> str:
@@ -3695,6 +3713,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
     def _validate_scrim_emoji(interaction: discord.Interaction, emoji: str) -> None:
         parsed = discord.PartialEmoji.from_str(emoji)
         if parsed.id is None:
+            if emoji.startswith("<"):
+                raise ValueError("That custom emoji is invalid or unavailable in this server.")
             return
         guild = interaction.guild
         if guild is None or guild.id != interaction.guild_id:
@@ -3878,9 +3898,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             async def number_callback(interaction: discord.Interaction) -> None:
                 if await self.interaction_check(interaction):
                     await interaction.response.edit_message(
-                        content=(
-                            "Choose a slot number from 1 to 99, then set or clear "
-                            "that slot's emoji."
+                        content=slot_number_emoji_content(
+                            repository.get(self.scrim_id)
                         ),
                         embed=None,
                         view=SlotNumberEmojiView(
@@ -3900,8 +3919,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 if await self.interaction_check(interaction):
                     await interaction.response.edit_message(
                         content=(
-                            "Customize the staff-review OK emoji and the accepted "
-                            "emoji used after a registration succeeds."
+                            "Customize the staff-review OK, accepted, and declined "
+                            "registration emojis."
                         ),
                         embed=None,
                         view=RegistrationEmojiView(
@@ -4047,6 +4066,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             for label, field in (
                 ("Staff Review OK", "emoji_registration_ok"),
                 ("Accepted", "emoji_registration_accepted"),
+                ("Declined", "emoji_registration_declined"),
             ):
                 button = discord.ui.Button(
                     label=f"Edit {label}", style=discord.ButtonStyle.secondary, row=0
@@ -4085,6 +4105,11 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                         self.scrim_id, self.guild_id,
                         "emoji_registration_accepted",
                         DEFAULT_EMOJI_REGISTRATION_ACCEPTED,
+                    )
+                    scrim = repository.save_registration_emoji(
+                        self.scrim_id, self.guild_id,
+                        "emoji_registration_declined",
+                        DEFAULT_EMOJI_REGISTRATION_DECLINED,
                     )
                 except (SlotStorageError, ValueError) as error:
                     await _send_error(interaction, error)
@@ -4155,29 +4180,192 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             self.add_item(clear_button)
             _add_custom_emoji_back(self, panel, owner_id, guild_id, scrim_id)
 
+    def slot_number_emoji_content(scrim) -> str:
+        if scrim is None:
+            return "That scrim no longer exists."
+        if scrim.slot_start is None or scrim.slot_end is None:
+            return "Configure **Necessary Settings → Slots** before editing slot emojis."
+        configured = ", ".join(
+            f"{number:02d} {emoji}"
+            for number, emoji in sorted(scrim.slot_number_emojis.items())
+            if scrim.slot_start <= int(number) <= scrim.slot_end
+        )
+        return (
+            f"**Slot Number Emojis — {_safe_name(scrim.name)}**\n"
+            f"Current range: **{scrim.slot_start:02d}–{scrim.slot_end:02d}**.\n"
+            "Choose **All Slots** first to enter multiple emojis in one answer. "
+            "Enter one emoji per slot in order, separated by spaces, commas, or "
+            "new lines. The first emoji replaces the first configured slot, "
+            "the second replaces the next, and so on. Unlisted slots keep "
+            "their current display. You can also choose one slot and enter "
+            "one emoji, or enter `DEFAULT` to show its number as text.\n"
+            f"Overrides: {configured or 'none'}"
+        )
+
+    class SlotEmojiInputModal(discord.ui.Modal):
+        emojis = discord.ui.TextInput(
+            label="Emoji or emoji list",
+            placeholder="All Slots: 🔴 🟠 🟡 …  |  Single slot: 🔵 or DEFAULT",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=4000,
+        )
+
+        def __init__(self, owner_id: int, guild_id: int, scrim_id: str, selection: str):
+            super().__init__(
+                title="All Slots — emoji list" if selection == "all"
+                else f"Slot {int(selection):02d} — emoji",
+                timeout=300,
+            )
+            self.owner_id = owner_id
+            self.guild_id = guild_id
+            self.scrim_id = scrim_id
+            self.selection = selection
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            if not setup_authorized(interaction, self.owner_id, self.guild_id):
+                await _deny(interaction)
+                return
+            scrim = repository.get(self.scrim_id)
+            if scrim is None or scrim.guild_id != self.guild_id:
+                await interaction.response.send_message(
+                    "That scrim no longer exists.", ephemeral=True
+                )
+                return
+            if scrim.slot_start is None or scrim.slot_end is None:
+                await interaction.response.send_message(
+                    "Configure Necessary Settings → Slots before editing slot emojis.",
+                    ephemeral=True,
+                )
+                return
+            raw = str(self.emojis.value).strip()
+            if self.selection != "all" and raw.upper() == "DEFAULT":
+                number = int(self.selection)
+                if not scrim.slot_start <= number <= scrim.slot_end:
+                    await interaction.response.send_message(
+                        "That slot is no longer in this scrim's range.", ephemeral=True
+                    )
+                    return
+                try:
+                    updated = repository.save_slot_number_emoji(
+                        self.scrim_id, self.guild_id, number, None
+                    )
+                except (SlotStorageError, ValueError) as error:
+                    await interaction.response.send_message(str(error), ephemeral=True)
+                    return
+                await _publish_emoji_update(updated)
+                await interaction.response.send_message(
+                    f"Slot **{number:02d}** now displays its number.", ephemeral=True
+                )
+                return
+            try:
+                emojis = _parse_slot_emoji_list(raw)
+                numbers = (
+                    list(range(scrim.slot_start, scrim.slot_end + 1))
+                    if self.selection == "all"
+                    else [int(self.selection)]
+                )
+                if self.selection != "all" and not (
+                    scrim.slot_start <= numbers[0] <= scrim.slot_end
+                ):
+                    raise ValueError("That slot is no longer in this scrim's range.")
+                if len(emojis) > len(numbers):
+                    raise ValueError(
+                        f"Enter at most {len(numbers)} emoji"
+                        f"{'s' if len(numbers) != 1 else ''} for this selection."
+                    )
+                for emoji in emojis:
+                    _validate_scrim_emoji(interaction, emoji)
+                updated = repository.save_slot_number_emojis(
+                    self.scrim_id, self.guild_id,
+                    dict(zip(numbers, emojis)),
+                )
+            except (SlotStorageError, ValueError) as error:
+                await interaction.response.send_message(str(error), ephemeral=True)
+                return
+            await _publish_emoji_update(updated)
+            await interaction.response.send_message(
+                f"✅ Saved {len(emojis)} slot emoji"
+                f"{'s' if len(emojis) != 1 else ''}, starting at "
+                f"**{numbers[0]:02d}**. Unlisted slots were not changed.",
+                ephemeral=True,
+            )
+
     class SlotNumberEmojiView(BoundView):
-        def __init__(self, panel, owner_id: int, guild_id: int, scrim_id: str):
+        def __init__(
+            self, panel, owner_id: int, guild_id: int, scrim_id: str,
+            page: int = 0,
+        ):
             super().__init__(owner_id, guild_id, timeout=600)
             self.panel = panel
             self.scrim_id = scrim_id
-            choose = discord.ui.Button(
-                label="Choose Slot Number", emoji="🔢",
-                style=discord.ButtonStyle.primary, row=0,
+            scrim = repository.get(scrim_id)
+            numbers = (
+                list(range(scrim.slot_start, scrim.slot_end + 1))
+                if scrim is not None
+                and scrim.slot_start is not None
+                and scrim.slot_end is not None
+                else []
+            )
+            page_count = max(1, (len(numbers) + 23) // 24)
+            page = min(max(page, 0), page_count - 1)
+            choices = [
+                discord.SelectOption(
+                    label="All Slots", value="all",
+                    description="Set emojis from the first configured slot onward",
+                )
+            ] + [
+                discord.SelectOption(
+                    label=f"Slot {number:02d}", value=str(number),
+                    description="Replace this slot's number emoji",
+                )
+                for number in numbers[page * 24:(page + 1) * 24]
+            ]
+            selector = discord.ui.Select(
+                placeholder="Choose All Slots or one slot", options=choices,
+                disabled=not numbers, row=0,
             )
 
-            async def choose_callback(interaction: discord.Interaction) -> None:
+            async def select_callback(interaction: discord.Interaction) -> None:
                 if await self.interaction_check(interaction):
                     await interaction.response.send_modal(
-                        SlotNumberModal(
-                            self.panel, self.owner_id, self.guild_id, self.scrim_id
+                        SlotEmojiInputModal(
+                            self.owner_id, self.guild_id, self.scrim_id,
+                            selector.values[0],
                         )
                     )
 
-            choose.callback = choose_callback
-            self.add_item(choose)
+            selector.callback = select_callback
+            self.add_item(selector)
+            if page_count > 1:
+                for label, next_page, disabled in (
+                    ("Previous Slots", page - 1, page == 0),
+                    ("Next Slots", page + 1, page == page_count - 1),
+                ):
+                    button = discord.ui.Button(
+                        label=label, style=discord.ButtonStyle.secondary,
+                        disabled=disabled, row=1,
+                    )
+
+                    async def page_callback(
+                        interaction: discord.Interaction, next_page=next_page,
+                    ) -> None:
+                        if await self.interaction_check(interaction):
+                            await interaction.response.edit_message(
+                                content=slot_number_emoji_content(
+                                    repository.get(self.scrim_id)
+                                ),
+                                view=SlotNumberEmojiView(
+                                    self.panel, self.owner_id, self.guild_id,
+                                    self.scrim_id, page=next_page,
+                                ),
+                            )
+
+                    button.callback = page_callback
+                    self.add_item(button)
             reset = discord.ui.Button(
                 label="Restore Slot Number Defaults", emoji="🔄",
-                style=discord.ButtonStyle.danger, row=1,
+                style=discord.ButtonStyle.danger, row=2,
             )
 
             async def reset_callback(interaction: discord.Interaction) -> None:
@@ -4190,10 +4378,9 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     )
                     return
                 try:
-                    for number in list(scrim.slot_number_emojis):
-                        scrim = repository.save_slot_number_emoji(
-                            self.scrim_id, self.guild_id, int(number), None
-                        )
+                    scrim = repository.clear_slot_number_emojis(
+                        self.scrim_id, self.guild_id
+                    )
                 except (SlotStorageError, ValueError) as error:
                     await _send_error(interaction, error)
                     return

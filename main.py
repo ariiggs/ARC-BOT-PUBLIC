@@ -292,6 +292,7 @@ def configured_emoji(
     aliases = {
         "registration_ok_emoji": "emoji_registration_ok",
         "registration_accepted_emoji": "emoji_registration_accepted",
+        "registration_declined_emoji": "emoji_registration_declined",
     }
     emoji = getattr(scrim, field_name, getattr(scrim, aliases.get(field_name, ""), None))
     get_guild = getattr(bot, "get_guild", None)
@@ -457,7 +458,7 @@ def build_slots_message(scrim: Scrim) -> str:
 
 def build_staff_slots_message(scrim: Scrim) -> str:
     return (
-        f"**Staff mirror — {discord.utils.escape_markdown(scrim.name)}**\n"
+        f"**Staff mirror — {discord.utils.escape_markdown(scrim.name or 'Unconfigured scrim')}**\n"
         f"{'OPEN' if scrim.is_open else 'CLOSED'} · updates remain in this channel\n\n"
         + "\n".join(
             slot_display_line(scrim, slot) for slot in scrim.slots.values()
@@ -2204,6 +2205,7 @@ async def refresh_staff_slots_locked(
                 return False
             message = await channel.send(
                 content=build_staff_slots_message(scrim),
+                view=StaffMirrorView(scrim),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             if not is_active(scrim):
@@ -2223,7 +2225,7 @@ async def refresh_staff_slots_locked(
             await message.edit(
                 content=build_staff_slots_message(scrim),
                 embed=None,
-                view=None,
+                view=StaffMirrorView(scrim),
             )
         except (discord.NotFound, discord.Forbidden) as error:
             if (
@@ -2239,6 +2241,7 @@ async def refresh_staff_slots_locked(
                 scrim.staff_message_id = None
             message = await channel.send(
                 content=build_staff_slots_message(scrim),
+                view=StaffMirrorView(scrim),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             if not is_active(scrim):
@@ -2513,40 +2516,30 @@ async def send_reset_history_snapshot(scrim: Scrim) -> bool:
 
 async def grant_manager_access(scrim: Scrim, manager: discord.Member) -> bool:
     """Assign the pending captain role and grant temporary board access."""
-    role_granted = True
-    if scrim.pending_role_id is not None:
-        guild = getattr(manager, "guild", None)
-        get_role = getattr(guild, "get_role", None)
-        role = get_role(scrim.pending_role_id) if get_role is not None else None
-        if role is None or not hasattr(manager, "add_roles"):
-            role_granted = False
-        else:
-            try:
-                await manager.add_roles(
-                    role, reason=f"Pending captain assignment for {scrim.name}"
-                )
-            except discord.HTTPException:
-                logger.exception("Could not assign pending captain role (%s).", scrim.id)
-                role_granted = False
-    try:
-        channel = await configured_text_channel(scrim, scrim.public_channel_id)
-    except discord.HTTPException:
-        logger.exception("Could not resolve public scrim channel (%s).", scrim.id)
-        return False
-    if channel is None or not hasattr(channel, "set_permissions"):
-        return False
-    try:
-        await channel.set_permissions(
-            manager,
-            view_channel=True,
-            read_message_history=True,
-            send_messages=False,
-            reason=f"Scrim manager access for {scrim.name}",
-        )
-        return role_granted
-    except discord.HTTPException:
-        logger.exception("Could not grant manager access (%s).", scrim.id)
-        return False
+    state_lock = getattr(scrim, "state_lock", None) or asyncio.Lock()
+    async with state_lock:
+        if not manager_has_active_assignment(scrim, manager.id):
+            return False
+        role_granted = await sync_captain_roles_locked(scrim, manager.id, manager)
+        try:
+            channel = await configured_text_channel(scrim, scrim.public_channel_id)
+        except discord.HTTPException:
+            logger.exception("Could not resolve public scrim channel (%s).", scrim.id)
+            return False
+        if channel is None or not hasattr(channel, "set_permissions"):
+            return False
+        try:
+            await channel.set_permissions(
+                manager,
+                view_channel=True,
+                read_message_history=True,
+                send_messages=False,
+                reason=f"Scrim manager access for {scrim.name}",
+            )
+            return role_granted
+        except discord.HTTPException:
+            logger.exception("Could not grant manager access (%s).", scrim.id)
+            return False
 
 
 def manager_has_active_assignment(scrim: Scrim, manager_id: int) -> bool:
@@ -2733,54 +2726,85 @@ async def confirm_captain_role(
     *,
     member: discord.Member | None = None,
 ) -> bool:
-    """Swap a captain from the pending role to the confirmed role."""
-    if member is None:
-        guild = bot.get_guild(scrim.guild_id)
-        if guild is None:
-            return False
-        member = guild.get_member(manager_id)
+    """Reconcile captain roles while slot mutations are serialized."""
+    state_lock = getattr(scrim, "state_lock", None) or asyncio.Lock()
+    async with state_lock:
         if member is None:
-            try:
-                member = await guild.fetch_member(manager_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                logger.info(
-                    "Captain %s is no longer resolvable in scrim %s.",
-                    manager_id,
-                    scrim.id,
-                )
+            guild = bot.get_guild(scrim.guild_id)
+            if guild is None:
                 return False
+            member = guild.get_member(manager_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(manager_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    logger.info(
+                        "Captain %s is no longer resolvable in scrim %s.",
+                        manager_id,
+                        scrim.id,
+                    )
+                    return False
+        synced = await sync_captain_roles_locked(
+            scrim, manager_id, member, preserve_pending=True
+        )
+        if not manager_has_active_assignment(scrim, manager_id):
+            await revoke_manager_access(scrim, manager_id, member=member)
+        return synced
+
+
+async def sync_captain_roles_locked(
+    scrim: Scrim,
+    manager_id: int,
+    member: discord.Member,
+    *,
+    preserve_pending: bool = False,
+) -> bool:
+    """Reconcile both captain roles from the latest assignments; caller holds state_lock."""
+    has_pending = any(
+        manager_id in {slot.captain_1_id, slot.captain_2_id}
+        and slot.status in {STATUS_RESERVED, STATUS_PENDING}
+        for slot in scrim.slots.values()
+    )
+    has_confirmed = any(
+        manager_id in {slot.captain_1_id, slot.captain_2_id}
+        and slot.status == STATUS_CONFIRMED
+        for slot in scrim.slots.values()
+    )
     guild = getattr(member, "guild", None)
     get_role = getattr(guild, "get_role", None)
-    confirmed_role = (
-        get_role(scrim.confirmed_role_id)
-        if get_role is not None and scrim.confirmed_role_id is not None
-        else None
+    role_states = (
+        (scrim.pending_role_id, has_pending),
+        (scrim.confirmed_role_id, has_confirmed),
     )
-    pending_role = (
-        get_role(scrim.pending_role_id)
-        if get_role is not None and scrim.pending_role_id is not None
-        else None
-    )
-    try:
-        if confirmed_role is not None and hasattr(member, "add_roles"):
-            await member.add_roles(
-                confirmed_role,
-                reason=f"Confirmed captain assignment for {scrim.name}",
+    synced = True
+    for role_id, should_have in role_states:
+        if role_id == scrim.pending_role_id and should_have and preserve_pending:
+            continue
+        if role_id is None:
+            if should_have:
+                synced = False
+            continue
+        role = get_role(role_id) if get_role is not None else None
+        method = getattr(member, "add_roles" if should_have else "remove_roles", None)
+        if role is None or method is None:
+            if should_have:
+                synced = False
+            continue
+        try:
+            reason = (
+                f"Confirmed captain assignment for {scrim.name}"
+                if role_id == scrim.confirmed_role_id and should_have
+                else f"Pending captain assignment for {scrim.name}"
+                if should_have
+                else f"Remove pending captain role for {scrim.name}"
+                if role_id == scrim.pending_role_id
+                else f"Remove released scrim captain role for {scrim.name}"
             )
-        still_pending = any(
-            manager_id in {slot.captain_1_id, slot.captain_2_id}
-            and slot.status == STATUS_PENDING
-            for slot in scrim.slots.values()
-        )
-        if not still_pending and pending_role is not None and hasattr(member, "remove_roles"):
-            await member.remove_roles(
-                pending_role,
-                reason=f"Remove pending captain role for {scrim.name}",
-            )
-        return confirmed_role is not None
-    except discord.HTTPException:
-        logger.exception("Could not swap captain roles (%s).", scrim.id)
-        return False
+            await method(role, reason=reason)
+        except discord.HTTPException:
+            logger.exception("Could not reconcile captain role (%s).", scrim.id)
+            synced = False
+    return synced
 
 
 async def revoke_manager_access_if_unused(
@@ -2789,9 +2813,13 @@ async def revoke_manager_access_if_unused(
     *,
     member: discord.Member | None = None,
 ) -> bool:
-    if manager_id is None or manager_has_active_assignment(scrim, manager_id):
+    if manager_id is None:
         return True
-    return await revoke_manager_access(scrim, manager_id, member=member)
+    state_lock = getattr(scrim, "state_lock", None) or asyncio.Lock()
+    async with state_lock:
+        if manager_has_active_assignment(scrim, manager_id):
+            return True
+        return await revoke_manager_access(scrim, manager_id, member=member)
 
 
 async def remove_public_controls(scrim: Scrim) -> bool:
@@ -2880,6 +2908,7 @@ class SlotReviewView(DurableView):
         registration_member_id: int | None = None
         approved_registration: RegistrationRequest | None = None
         reviewed_registration: RegistrationRequest | None = None
+        manager_to_revoke = None
         async with self.scrim.state_lock:
             if is_active(self.scrim):
                 current = self.scrim.slots[self.slot.number]
@@ -2923,14 +2952,17 @@ class SlotReviewView(DurableView):
                     with repository.transaction():
                         result = current.snapshot() if not confirm else None
                         if confirm:
+                            current.assignment_id += 1
                             current.status = STATUS_CONFIRMED
                             result = current.snapshot()
                         else:
                             result = release_slot(current)
                     if not confirm and result is not None:
-                        await revoke_manager_access_if_unused(
-                            self.scrim, result.manager_id
-                        )
+                        manager_to_revoke = result.manager_id
+        if manager_to_revoke is not None:
+            await revoke_manager_access_if_unused(
+                self.scrim, manager_to_revoke
+            )
         if result is None:
             disable_view_items(self)
             await interaction.followup.send(
@@ -3052,7 +3084,7 @@ async def update_registration_reaction(
         accepted_emoji = (
             registration_success_reaction(scrim, accepted=True)
             if approved
-            else "❌"
+            else configured_emoji(scrim, "registration_declined_emoji", "❌")
         )
         await message.add_reaction(accepted_emoji)
         bot_user = getattr(bot, "user", None)
@@ -3268,6 +3300,7 @@ class ManagerSlotView(DurableView):
                     already_confirmed = True
                 elif valid and current.status == STATUS_RESERVED:
                     with repository.transaction():
+                        current.assignment_id += 1
                         current.status = STATUS_PENDING
                         result = current.snapshot()
             if already_confirmed:
@@ -3311,6 +3344,7 @@ class ManagerSlotView(DurableView):
                 return
             await interaction.response.defer(ephemeral=True)
 
+        manager_to_revoke = None
         if not confirm:
             async with self.scrim.state_lock:
                 if is_active(self.scrim):
@@ -3324,15 +3358,17 @@ class ManagerSlotView(DurableView):
                         with repository.transaction():
                             result = release_slot(current)
                         if result is not None:
-                            await revoke_manager_access_if_unused(
-                                self.scrim,
-                                result.manager_id,
-                                member=(
-                                    interaction.user
-                                    if isinstance(interaction.user, discord.Member)
-                                    else None
-                                ),
-                            )
+                            manager_to_revoke = result.manager_id
+            if manager_to_revoke is not None:
+                await revoke_manager_access_if_unused(
+                    self.scrim,
+                    manager_to_revoke,
+                    member=(
+                        interaction.user
+                        if isinstance(interaction.user, discord.Member)
+                        else None
+                    ),
+                )
         if result is None:
             await interaction.followup.send(
                 "This request was already processed or the slot was reassigned. "
@@ -8613,7 +8649,22 @@ async def setup_hook() -> None:
         repository.load()
         _loaded = True
     install_setup_panel()
-    bot.add_dynamic_items(ManagerActionButton, StaffActionButton)
+    for scrim in repository.scrims.values():
+        if (
+            not scrim.deleted
+            and scrim.staff_message_id is not None
+            and scrim.staff_channel_id is not None
+        ):
+            bot.add_view(
+                StaffMirrorView(scrim),
+                message_id=scrim.staff_message_id,
+            )
+    bot.add_dynamic_items(
+        ManagerActionButton,
+        StaffActionButton,
+        StaffMirrorActionButton,
+        StaffMirrorTransferButton,
+    )
 
 
 async def migrate_legacy() -> None:
@@ -11212,6 +11263,7 @@ async def confirm_slot(ctx: commands.Context, *, slot_numbers: str) -> None:
             return
         with repository.transaction():
             for slot in slots:
+                slot.assignment_id += 1
                 slot.status = STATUS_CONFIRMED
                 confirmed.append(slot.snapshot())
     manager_confirmations = [
@@ -11423,6 +11475,685 @@ class StaffActionButton(
                 await view.finish_review(interaction, self.confirm)
         except Exception as error:
             await view.on_error(interaction, error, self)
+
+
+async def staff_mirror_interaction_allowed(
+    interaction: discord.Interaction,
+    scrim: Scrim,
+    *,
+    require_mirror_message: bool = False,
+) -> bool:
+    member = getattr(interaction, "user", None)
+    guild = getattr(interaction, "guild", None)
+    message = getattr(interaction, "message", None)
+    allowed = (
+        is_active(scrim)
+        and repository.is_guild_authorized(scrim.guild_id)
+        and guild is not None
+        and guild.id == scrim.guild_id
+        and interaction.channel_id == scrim.staff_channel_id
+        and member_is_staff(member, scrim)
+        and (
+            not require_mirror_message
+            or (
+                message is not None
+                and message.id == scrim.staff_message_id
+            )
+        )
+    )
+    if not allowed:
+        await interaction.response.send_message(
+            "These controls are for staff in this scrim's configured staff channel.",
+            ephemeral=True,
+        )
+    return allowed
+
+
+def staff_slot_identity(slot: Slot | SlotSnapshot) -> str:
+    """Fingerprint the full staged slot state, not only its generation counter."""
+    state = {
+        "assignment_id": slot.assignment_id,
+        "status": slot.status,
+        "team_name": slot.team_name,
+        "tag": slot.tag,
+        "manager_id": slot.manager_id,
+        "captain_1_id": slot.captain_1_id,
+        "captain_2_id": slot.captain_2_id,
+    }
+    return hashlib.sha256(
+        json.dumps(state, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:20]
+
+
+def staff_slot_pair_identity(
+    source: Slot | SlotSnapshot, destination: Slot | SlotSnapshot
+) -> str:
+    return hashlib.sha256(
+        f"{staff_slot_identity(source)}:{staff_slot_identity(destination)}".encode()
+    ).hexdigest()[:20]
+
+
+class StaffMirrorView(discord.ui.View):
+    """Persistent staff-only slot picker attached to the staff mirror."""
+
+    def __init__(self, scrim: Scrim) -> None:
+        super().__init__(timeout=None)
+        options = []
+        for slot in list(scrim.slots.values())[:25]:
+            team = discord.utils.escape_markdown(slot.team_name or "Available")
+            options.append(
+                discord.SelectOption(
+                    label=f"{slot.number:02d} · {team}"[:100],
+                    value=str(slot.number),
+                    description=slot.status.replace("_", " ").title()[:100],
+                )
+            )
+        selector = discord.ui.Select(
+            placeholder="Select a slot to manage",
+            min_values=1,
+            max_values=1,
+            options=options or [
+                discord.SelectOption(label="No slots configured", value="0")
+            ],
+            custom_id="slots:staffmirror:select",
+        )
+        selector.callback = self.select_slot
+        self.add_item(selector)
+        self.scrim_id = scrim.id
+
+    async def select_slot(self, interaction: discord.Interaction) -> None:
+        scrim = repository.get(self.scrim_id)
+        if (
+            scrim is None
+            or not await staff_mirror_interaction_allowed(
+                interaction, scrim, require_mirror_message=True
+            )
+        ):
+            return
+        try:
+            slot_number = int(self.children[0].values[0])
+        except (ValueError, IndexError):
+            await interaction.response.send_message(
+                "Select a valid slot.", ephemeral=True
+            )
+            return
+        slot = scrim.slots.get(slot_number)
+        if slot is None:
+            await interaction.response.send_message(
+                "That slot no longer exists.", ephemeral=True
+            )
+            return
+        snapshot = slot.snapshot()
+        await interaction.response.send_message(
+            content=(
+                f"Staff actions for slot **{slot_number:02d}** · "
+                f"**{discord.utils.escape_markdown(snapshot.team_name or 'Available')}** "
+                f"({slot_status_label(snapshot)})."
+            ),
+            view=StaffMirrorActionView(scrim.id, snapshot),
+            ephemeral=True,
+        )
+
+
+class StaffMirrorActionView(discord.ui.View):
+    """Ephemeral action panel; DynamicItems survive bot restarts."""
+
+    def __init__(self, scrim_id: str, slot: SlotSnapshot) -> None:
+        super().__init__(timeout=None)
+        self.add_item(
+            StaffMirrorActionButton(
+                scrim_id, slot.number, slot.assignment_id,
+                staff_slot_identity(slot), "confirm"
+            )
+        )
+        self.add_item(
+            StaffMirrorActionButton(
+                scrim_id, slot.number, slot.assignment_id,
+                staff_slot_identity(slot), "remove"
+            )
+        )
+        self.add_item(
+            StaffMirrorActionButton(
+                scrim_id, slot.number, slot.assignment_id,
+                staff_slot_identity(slot), "move"
+            )
+        )
+        self.add_item(
+            StaffMirrorActionButton(
+                scrim_id, slot.number, slot.assignment_id,
+                staff_slot_identity(slot), "switch"
+            )
+        )
+
+
+class StaffMirrorRemoveConfirmationView(discord.ui.View):
+    def __init__(
+        self, scrim_id: str, slot_number: int, assignment_id: int,
+        expected_identity: str,
+    ) -> None:
+        super().__init__(timeout=None)
+        self.add_item(
+            StaffMirrorActionButton(
+                scrim_id, slot_number, assignment_id,
+                expected_identity, "remove_confirm"
+            )
+        )
+        self.add_item(
+            StaffMirrorActionButton(
+                scrim_id, slot_number, assignment_id,
+                expected_identity, "remove_cancel"
+            )
+        )
+
+
+class StaffMirrorActionButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=(
+        r"slots:mirror:(?P<scrim>[a-f0-9]{16}):"
+        r"(?P<number>[0-9]{1,2}):(?P<assignment>[0-9]+):"
+        r"(?P<identity>[a-f0-9]{20}):"
+        r"(?P<action>confirm|remove|move|switch|remove_confirm|remove_cancel)"
+    ),
+):
+    def __init__(
+        self, scrim_id: str, number: int, assignment_id: int,
+        expected_identity: str, action: str,
+    ) -> None:
+        self.scrim_id = scrim_id
+        self.number = number
+        self.assignment_id = assignment_id
+        self.expected_identity = expected_identity
+        self.action = action
+        labels = {
+            "confirm": ("Force Confirm", discord.ButtonStyle.success, "✅"),
+            "remove": ("Remove", discord.ButtonStyle.danger, "🗑️"),
+            "move": ("Move Slot", discord.ButtonStyle.primary, "➡️"),
+            "switch": ("Switch Slots", discord.ButtonStyle.secondary, "🔄"),
+            "remove_confirm": ("Confirm Remove", discord.ButtonStyle.danger, "⚠️"),
+            "remove_cancel": ("Cancel", discord.ButtonStyle.secondary, "↩️"),
+        }
+        label, style, emoji = labels[action]
+        super().__init__(
+            discord.ui.Button(
+                label=label,
+                style=style,
+                emoji=emoji,
+                custom_id=(
+                    f"slots:mirror:{scrim_id}:{number}:{assignment_id}:"
+                    f"{expected_identity}:{action}"
+                ),
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match
+    ):
+        return cls(
+            match["scrim"],
+            int(match["number"]),
+            int(match["assignment"]),
+            match["identity"],
+            match["action"],
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        scrim = repository.get(self.scrim_id)
+        if scrim is None:
+            await interaction.response.send_message(
+                "That scrim no longer exists.", ephemeral=True
+            )
+            return
+        if not await staff_mirror_interaction_allowed(interaction, scrim):
+            return
+        if self.action == "remove":
+            slot = scrim.slots.get(self.number)
+            if (
+                slot is None
+                or slot.assignment_id != self.assignment_id
+                or staff_slot_identity(slot) != self.expected_identity
+                or slot.status == STATUS_AVAILABLE
+            ):
+                await interaction.response.send_message(
+                    "That slot has changed. Select it again from the staff mirror.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                f"Remove **{discord.utils.escape_markdown(slot.team_name)}** "
+                f"from slot **{self.number:02d}**? This releases the assignment.",
+                view=StaffMirrorRemoveConfirmationView(
+                    self.scrim_id, self.number, self.assignment_id,
+                    self.expected_identity,
+                ),
+                ephemeral=True,
+            )
+            return
+        if self.action in {"move", "switch"}:
+            slot = scrim.slots.get(self.number)
+            if (
+                slot is None
+                or slot.assignment_id != self.assignment_id
+                or staff_slot_identity(slot) != self.expected_identity
+                or slot.status == STATUS_AVAILABLE
+            ):
+                await interaction.response.send_message(
+                    "That slot has changed. Select it again from the staff mirror.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_modal(
+                StaffMirrorDestinationModal(
+                    self.scrim_id,
+                    self.number,
+                    self.assignment_id,
+                    self.expected_identity,
+                    self.action,
+                )
+            )
+            return
+        if self.action == "remove_cancel":
+            await interaction.response.edit_message(
+                content="Removal cancelled.", view=None
+            )
+            return
+        action = "remove" if self.action == "remove_confirm" else self.action
+        await perform_staff_mirror_action(
+            interaction,
+            scrim,
+            self.number,
+            self.assignment_id,
+            action,
+            expected_identity=self.expected_identity,
+        )
+
+
+class StaffMirrorDestinationModal(discord.ui.Modal):
+    destination = discord.ui.TextInput(
+        label="Destination slot",
+        placeholder="Enter the slot number",
+        min_length=1,
+        max_length=2,
+        required=True,
+    )
+
+    def __init__(
+        self, scrim_id: str, source: int, assignment_id: int,
+        expected_identity: str, action: str,
+    ) -> None:
+        super().__init__(
+            title="Move team to a slot" if action == "move" else "Switch slot assignments",
+            timeout=300,
+        )
+        self.scrim_id = scrim_id
+        self.source = source
+        self.assignment_id = assignment_id
+        self.expected_identity = expected_identity
+        self.action = action
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        scrim = repository.get(self.scrim_id)
+        if scrim is None:
+            await interaction.response.send_message(
+                "That scrim no longer exists.", ephemeral=True
+            )
+            return
+        if not await staff_mirror_interaction_allowed(interaction, scrim):
+            return
+        try:
+            destination = int(str(self.destination.value).strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "Enter a valid destination slot number.", ephemeral=True
+            )
+            return
+        await prepare_staff_mirror_transfer(
+            interaction,
+            scrim,
+            self.source,
+            self.assignment_id,
+            self.action,
+            self.expected_identity,
+            destination=destination,
+        )
+
+
+class StaffMirrorTransferConfirmationView(discord.ui.View):
+    def __init__(
+        self, scrim_id: str, source: SlotSnapshot, destination: SlotSnapshot,
+        action: str, pair_identity: str,
+    ) -> None:
+        super().__init__(timeout=None)
+        self.add_item(
+            StaffMirrorTransferButton(
+                scrim_id, source.number, source.assignment_id,
+                destination.number, destination.assignment_id,
+                pair_identity, f"{action}_confirm",
+            )
+        )
+        self.add_item(
+            StaffMirrorTransferButton(
+                scrim_id, source.number, source.assignment_id,
+                destination.number, destination.assignment_id,
+                pair_identity, "cancel",
+            )
+        )
+
+
+class StaffMirrorTransferButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=(
+        r"slots:transfer:(?P<scrim>[a-f0-9]{16}):"
+        r"(?P<source>[0-9]{1,2}):(?P<srcgen>[0-9]+):"
+        r"(?P<destination>[0-9]{1,2}):(?P<dstgen>[0-9]+):"
+        r"(?P<pair>[a-f0-9]{20}):"
+        r"(?P<action>move_confirm|switch_confirm|cancel)"
+    ),
+):
+    def __init__(
+        self, scrim_id: str, source: int, source_generation: int,
+        destination: int, destination_generation: int, pair_identity: str,
+        action: str,
+    ) -> None:
+        self.scrim_id = scrim_id
+        self.source = source
+        self.source_generation = source_generation
+        self.destination = destination
+        self.destination_generation = destination_generation
+        self.pair_identity = pair_identity
+        self.action = action
+        labels = {
+            "move_confirm": ("Confirm Move", discord.ButtonStyle.success),
+            "switch_confirm": ("Confirm Switch", discord.ButtonStyle.success),
+            "cancel": ("Cancel", discord.ButtonStyle.secondary),
+        }
+        label, style = labels[action]
+        super().__init__(
+            discord.ui.Button(
+                label=label,
+                style=style,
+                custom_id=(
+                    f"slots:transfer:{scrim_id}:{source}:{source_generation}:"
+                    f"{destination}:{destination_generation}:{pair_identity}:{action}"
+                ),
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match: re.Match):
+        return cls(
+            match["scrim"], int(match["source"]), int(match["srcgen"]),
+            int(match["destination"]), int(match["dstgen"]),
+            match["pair"], match["action"],
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        scrim = repository.get(self.scrim_id)
+        if scrim is None:
+            await interaction.response.send_message(
+                "That scrim no longer exists.", ephemeral=True
+            )
+            return
+        if not await staff_mirror_interaction_allowed(interaction, scrim):
+            return
+        if self.action == "cancel":
+            await interaction.response.edit_message(
+                content="Transfer cancelled.", view=None
+            )
+            return
+        action = self.action.removesuffix("_confirm")
+        source = scrim.slots.get(self.source)
+        destination = scrim.slots.get(self.destination)
+        if source is None or destination is None:
+            await interaction.response.send_message(
+                "One of those slots no longer exists.", ephemeral=True
+            )
+            return
+        await perform_staff_mirror_action(
+            interaction,
+            scrim,
+            self.source,
+            self.source_generation,
+            action,
+            expected_identity=staff_slot_identity(source),
+            destination=self.destination,
+            expected_destination_generation=self.destination_generation,
+            expected_pair_identity=self.pair_identity,
+        )
+
+
+async def prepare_staff_mirror_transfer(
+    interaction: discord.Interaction,
+    scrim: Scrim,
+    source_number: int,
+    expected_source_generation: int,
+    action: str,
+    expected_source_identity: str,
+    *,
+    destination: int,
+) -> None:
+    missing = pause_scrim_if_unconfigured(scrim)
+    if missing:
+        await interaction.response.send_message(
+            "This scrim is paused because required settings are missing: "
+            + ", ".join(missing) + ".",
+            ephemeral=True,
+        )
+        return
+    async with scrim.state_lock:
+        source = scrim.slots.get(source_number)
+        target = scrim.slots.get(destination)
+        failure = None
+        if (
+            not is_active(scrim)
+            or source is None
+            or source.assignment_id != expected_source_generation
+            or staff_slot_identity(source) != expected_source_identity
+        ):
+            failure = "The source slot changed. Select it again from the staff mirror."
+        elif destination == source_number:
+            failure = "Choose a different destination slot."
+        elif target is None:
+            failure = "That destination slot does not exist."
+        elif source.status == STATUS_AVAILABLE:
+            failure = "Select an occupied source slot."
+        elif action == "move" and target.status != STATUS_AVAILABLE:
+            failure = "Move requires an Available destination slot."
+        elif action == "switch" and target.status == STATUS_AVAILABLE:
+            failure = "Switch requires two occupied slots."
+        elif action == "move" and any(
+            request.slot_number == destination
+            for request in getattr(scrim, "pending_registrations", {}).values()
+        ):
+            failure = (
+                "That Available slot has a pending registration request; "
+                "review it before moving a team into this slot."
+            )
+        if failure is None:
+            source_snapshot = source.snapshot()
+            target_snapshot = target.snapshot()
+            pair_identity = staff_slot_pair_identity(source, target)
+    if failure is not None:
+        await interaction.response.send_message(failure, ephemeral=True)
+        return
+    await interaction.response.send_message(
+        content=(
+            f"Confirm {action}:\n"
+            f"**{source_number:02d} · {discord.utils.escape_markdown(source_snapshot.team_name)}** "
+            f"→ **{destination:02d} · "
+            f"{discord.utils.escape_markdown(target_snapshot.team_name or 'Available')}**"
+            if action == "move"
+            else (
+                f"Confirm switching **{source_number:02d} · "
+                f"{discord.utils.escape_markdown(source_snapshot.team_name)}** and "
+                f"**{destination:02d} · "
+                f"{discord.utils.escape_markdown(target_snapshot.team_name)}**?"
+            )
+        ),
+        view=StaffMirrorTransferConfirmationView(
+            scrim.id, source_snapshot, target_snapshot, action, pair_identity
+        ),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def perform_staff_mirror_action(
+    interaction: discord.Interaction,
+    scrim: Scrim,
+    source_number: int,
+    expected_assignment_id: int,
+    action: str,
+    *,
+    expected_identity: str | None = None,
+    destination: int | None = None,
+    expected_destination_generation: int | None = None,
+    expected_pair_identity: str | None = None,
+) -> None:
+    missing = pause_scrim_if_unconfigured(scrim)
+    if missing:
+        await interaction.response.send_message(
+            "This scrim is paused because required settings are missing: "
+            + ", ".join(missing) + ".",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    removed: SlotSnapshot | None = None
+    confirmed: SlotSnapshot | None = None
+    summary = ""
+    failure = None
+    async with scrim.state_lock:
+        source = scrim.slots.get(source_number)
+        if (
+            not is_active(scrim)
+            or source is None
+            or source.assignment_id != expected_assignment_id
+            or expected_identity is None
+            or staff_slot_identity(source) != expected_identity
+        ):
+            failure = "That slot has changed. Select it again from the staff mirror."
+        elif action == "confirm":
+            if source.status not in {STATUS_RESERVED, STATUS_PENDING}:
+                failure = "Only Reserved or Pending teams can be confirmed."
+            else:
+                with repository.transaction():
+                    source.assignment_id += 1
+                    source.status = STATUS_CONFIRMED
+                    confirmed = source.snapshot()
+                summary = (
+                    f"Slot {source.number:02d} · team **{source.team_name}**"
+                )
+        elif action == "remove":
+            if source.status == STATUS_AVAILABLE:
+                failure = "That slot is already Available."
+            else:
+                with repository.transaction():
+                    removed = source.snapshot()
+                    source.clear()
+                summary = (
+                    f"Slot {removed.number:02d} · team **{removed.team_name}**"
+                )
+        elif action in {"move", "switch"}:
+            target = scrim.slots.get(destination) if destination is not None else None
+            if destination == source_number:
+                failure = "Choose a different destination slot."
+            elif target is None:
+                failure = "That destination slot does not exist."
+            elif source.status == STATUS_AVAILABLE:
+                failure = "Select an occupied source slot."
+            elif action == "move" and target.status != STATUS_AVAILABLE:
+                failure = "Move requires an Available destination slot."
+            elif action == "switch" and target.status == STATUS_AVAILABLE:
+                failure = "Switch requires two occupied slots."
+            elif (
+                expected_destination_generation is None
+                or target.assignment_id != expected_destination_generation
+                or expected_pair_identity is None
+                or staff_slot_pair_identity(source, target)
+                != expected_pair_identity
+            ):
+                failure = (
+                    "One or both slots changed while the transfer was being "
+                    "confirmed. Select them again from the staff mirror."
+                )
+            elif action == "move" and any(
+                request.slot_number == destination
+                for request in getattr(scrim, "pending_registrations", {}).values()
+            ):
+                failure = (
+                    "That Available slot has a pending registration request; "
+                    "review it before moving a team into this slot."
+                )
+            else:
+                with repository.transaction():
+                    source_state = source.snapshot()
+                    target_state = target.snapshot()
+                    if action == "move":
+                        source.clear()
+                        target.assignment_id += 1
+                        target.status = source_state.status
+                        target.team_name = source_state.team_name
+                        target.tag = source_state.tag
+                        target.manager_id = source_state.manager_id
+                        target.captain_1_id = source_state.captain_1_id
+                        target.captain_2_id = source_state.captain_2_id
+                        summary = (
+                            f"**{source_state.team_name}** moved from slot "
+                            f"{source_number:02d} to slot {destination:02d}."
+                        )
+                    else:
+                        source.assignment_id += 1
+                        target.assignment_id += 1
+                        for slot, state in (
+                            (source, target_state),
+                            (target, source_state),
+                        ):
+                            slot.status = state.status
+                            slot.team_name = state.team_name
+                            slot.tag = state.tag
+                            slot.manager_id = state.manager_id
+                            slot.captain_1_id = state.captain_1_id
+                            slot.captain_2_id = state.captain_2_id
+                        summary = (
+                            f"Teams in slots {source_number:02d} and "
+                            f"{destination:02d} were switched."
+                        )
+    if failure:
+        await interaction.followup.send(failure, ephemeral=True)
+        return
+    if confirmed is not None and confirmed.manager_id is not None:
+        if not await confirm_captain_role(scrim, confirmed.manager_id):
+            summary += " ⚠️ The confirmed captain role could not be updated."
+    if removed is not None:
+        captain_ids = {
+            captain_id
+            for captain_id in (removed.captain_1_id, removed.captain_2_id)
+            if captain_id is not None
+        }
+        access_failures = []
+        for captain_id in captain_ids:
+            if not await revoke_manager_access_if_unused(scrim, captain_id):
+                access_failures.append(captain_id)
+        if access_failures:
+            summary += " ⚠️ Captain access could not be synchronized for " + ", ".join(
+                f"<@{user_id}>" for user_id in access_failures
+            ) + "."
+    board_refreshed = await refresh_public_slots(scrim)
+    if not board_refreshed:
+        summary += " ⚠️ The boards could not be refreshed."
+    action_names = {
+        "confirm": "SLOTS FORCE CONFIRMED",
+        "remove": "SLOTS FORCE REMOVED",
+        "move": "SLOTS MOVED",
+        "switch": "SLOTS SWITCHED",
+    }
+    await send_scrim_log(
+        scrim,
+        action_names[action],
+        f"Staff action by <@{interaction.user.id}> · {summary}",
+    )
+    await interaction.followup.send(f"✅ {summary}", ephemeral=True)
 
 
 install_setup_panel()
