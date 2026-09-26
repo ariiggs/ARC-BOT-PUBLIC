@@ -2297,7 +2297,7 @@ async def refresh_staff_slots_locked(
                 return False
             message = await channel.send(
                 content=build_staff_slots_message(scrim),
-                view=StaffMirrorView(scrim),
+                view=None,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             if not is_active(scrim):
@@ -2317,7 +2317,7 @@ async def refresh_staff_slots_locked(
             await message.edit(
                 content=build_staff_slots_message(scrim),
                 embed=None,
-                view=StaffMirrorView(scrim),
+                view=None,
             )
         except (discord.NotFound, discord.Forbidden) as error:
             if (
@@ -2333,7 +2333,7 @@ async def refresh_staff_slots_locked(
                 scrim.staff_message_id = None
             message = await channel.send(
                 content=build_staff_slots_message(scrim),
-                view=StaffMirrorView(scrim),
+                view=None,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             if not is_active(scrim):
@@ -8362,11 +8362,11 @@ HELP_CATEGORIES = {
     "Getting started": {
         "description": "Setup, server access, and help",
         "text": (
-            "`!help` — open this category panel.\n"
-            "`!setup` — create or configure scrims.\n"
-            "`!set @Staff` — choose the server-wide Staff role.\n"
-            "`!setres` — configure leaderboard appearance and scoring.\n"
-            "`!sub` — view subscription status privately (Server Owner or Bot Manager)."
+            "`!help` — command categories.\n"
+            "`!setup` — configure scrims.\n"
+            "`!set @Staff` — server Staff role.\n"
+            "`!setres` — leaderboard settings.\n"
+            "`!sub` — private status (Owner/Manager)."
         ),
     },
     "Scrims and slots": {
@@ -8376,8 +8376,10 @@ HELP_CATEGORIES = {
             "`!update [Scrim]` — publish or refresh a slot board.\n"
             "`!open` / `!close` — open or close slot interactions/registrations.\n"
             "`!add Team / TAG / @Captain` — add a team to the selected scrim.\n"
-            "`!confirm 03 04` — confirm assigned slots.\n"
-            "`!remove 03 04` — remove assigned slots.\n"
+            "`!confirm 03 [04 ...]` — confirm Reserved/Pending slots.\n"
+            "`!remove 03 [04 ...]` — remove occupied slots.\n"
+            "`!move 03 06` — move to empty slot (`!move 03` lists choices).\n"
+            "`!switch 03 06` — swap occupied teams and their statuses.\n"
             "`!reset` — clear a scrim after confirming the warning.\n"
             "`!remind` — remind reserved teams to confirm.\n"
             "`!say <message>` — publish a staff announcement.\n"
@@ -8391,8 +8393,7 @@ HELP_CATEGORIES = {
             "`!cap add @User` — grant captain access.\n"
             "`!cap transfer @User` — transfer captain access.\n"
             "`!cap remove @User` — remove captain access.\n"
-            "Registration, Manager, and Cap Transfer actions require their "
-            "configured roles and channels."
+            "Configured roles and channels apply."
         ),
     },
     "Match results": {
@@ -8408,11 +8409,10 @@ HELP_CATEGORIES = {
     "Room ID and password": {
         "description": "Fixed or per-match room access details",
         "text": (
-            "`!idpw <room> / <minutes>` — use the saved fixed password.\n"
-            "`!idpw <room> / <password> / <minutes>` — provide a dynamic "
-            "password.\n"
+            "`!idpw <room> / <minutes>` — saved password.\n"
+            "`!idpw <room> / <password> / <minutes>` — dynamic password.\n"
             f"`!idpwg1-{MAX_MATCHES}` accepts the same formats for a specific "
-            "match. The reminder target and time zone come from scrim setup."
+            "match; reminder settings come from scrim setup."
         ),
     },
 }
@@ -9121,15 +9121,6 @@ async def setup_hook() -> None:
     for scrim in repository.scrims.values():
         if (
             not scrim.deleted
-            and scrim.staff_message_id is not None
-            and scrim.staff_channel_id is not None
-        ):
-            bot.add_view(
-                StaffMirrorView(scrim),
-                message_id=scrim.staff_message_id,
-            )
-        if (
-            not scrim.deleted
             and scrim.registration_review_message_id is not None
             and scrim.staff_channel_id is not None
         ):
@@ -9140,8 +9131,6 @@ async def setup_hook() -> None:
     bot.add_dynamic_items(
         ManagerActionButton,
         StaffActionButton,
-        StaffMirrorActionButton,
-        StaffMirrorTransferButton,
     )
 
 
@@ -11915,6 +11904,137 @@ async def remove_team(ctx: commands.Context, *, slot_numbers: str) -> None:
         slot_details,
     )
     await delete_command_message(ctx)
+
+
+async def transfer_slots_command(
+    ctx: commands.Context, *, action: str, slot_numbers: str
+) -> None:
+    scrim = await require_staff_scrim(ctx, silent=False)
+    if scrim is None:
+        return
+    usage = f"!{action} <source> <destination> (for example, !{action} 03 06)"
+    try:
+        numbers = parse_slot_numbers(slot_numbers)
+    except ValueError:
+        numbers = []
+    if action == "move" and len(numbers) == 1:
+        async with scrim.state_lock:
+            source = scrim.slots.get(numbers[0])
+            choices = [
+                slot.number for slot in scrim.slots.values()
+                if slot.number != numbers[0]
+                and registration_slot_is_available(scrim, slot)
+            ]
+        if source is None or source.status == STATUS_AVAILABLE:
+            text = f"Slot {numbers[0]:02d} is not an occupied source slot."
+        else:
+            text = (
+                f"Available destinations for slot {numbers[0]:02d}: "
+                + (", ".join(f"{number:02d}" for number in choices) or "none")
+                + f". Use `!move {numbers[0]:02d} <destination>`."
+            )
+        await send_private_command_feedback(ctx, text, silent=False)
+        return
+    if len(numbers) != 2:
+        await send_private_command_feedback(
+            ctx, f"Use `{usage}` with two different slot numbers.", silent=False
+        )
+        return
+    source_number, destination_number = numbers
+    failure = None
+    summary = None
+    async with scrim.state_lock:
+        source = scrim.slots.get(source_number)
+        target = scrim.slots.get(destination_number)
+        available = [
+            slot.number for slot in scrim.slots.values()
+            if slot.number != source_number
+            and registration_slot_is_available(scrim, slot)
+        ]
+        if not is_active(scrim):
+            failure = "This scrim no longer exists. No slots were changed."
+        elif source is None or target is None:
+            failure = "One or both slot numbers are not in this scrim."
+        elif source.status == STATUS_AVAILABLE:
+            failure = f"Slot {source_number:02d} is empty. Choose an occupied source."
+        elif action == "move" and not registration_slot_is_available(scrim, target):
+            failure = (
+                f"Slot {destination_number:02d} is occupied or held for a "
+                "pending registration. The move was declined."
+            )
+        elif action == "switch" and target.status == STATUS_AVAILABLE:
+            failure = (
+                f"Slot {destination_number:02d} is empty. "
+                "Switch requires two occupied slots."
+            )
+        if failure is None:
+            source_state, target_state = source.snapshot(), target.snapshot()
+            with repository.transaction():
+                if action == "move":
+                    source.clear()
+                    target.assignment_id += 1
+                    target.status = source_state.status
+                    target.team_name = source_state.team_name
+                    target.tag = source_state.tag
+                    target.manager_id = source_state.manager_id
+                    target.captain_1_id = source_state.captain_1_id
+                    target.captain_2_id = source_state.captain_2_id
+                    summary = (
+                        f"Moved **{source_state.team_name}** from "
+                        f"{source_number:02d} to {destination_number:02d}."
+                    )
+                else:
+                    source.assignment_id += 1
+                    target.assignment_id += 1
+                    for slot, state in (
+                        (source, target_state),
+                        (target, source_state),
+                    ):
+                        slot.status = state.status
+                        slot.team_name = state.team_name
+                        slot.tag = state.tag
+                        slot.manager_id = state.manager_id
+                        slot.captain_1_id = state.captain_1_id
+                        slot.captain_2_id = state.captain_2_id
+                    summary = (
+                        f"Switched slots {source_number:02d} and "
+                        f"{destination_number:02d}: **{source_state.team_name}** "
+                        f"↔ **{target_state.team_name}**."
+                    )
+    if failure is not None:
+        if action == "move":
+            choices = ", ".join(f"{number:02d}" for number in available)
+            failure += (
+                f" Available destinations: {choices}."
+                if choices else " No empty destinations are available."
+            )
+        await send_private_command_feedback(ctx, failure, silent=False)
+        return
+    board_ok = await refresh_public_slots(scrim)
+    await send_scrim_log(
+        scrim,
+        "SLOTS MOVED" if action == "move" else "SLOTS SWITCHED",
+        f"Staff <@{ctx.author.id}> · {summary}",
+    )
+    await send_private_command_feedback(
+        ctx,
+        f"✅ {discord.utils.escape_mentions(summary)}"
+        + ("" if board_ok else " ⚠️ The slot board could not be refreshed; run `!update`."),
+        silent=False,
+        delete_after=30,
+    )
+
+
+@bot.command(name="move")
+@commands.guild_only()
+async def move_team(ctx: commands.Context, *, slot_numbers: str = "") -> None:
+    await transfer_slots_command(ctx, action="move", slot_numbers=slot_numbers)
+
+
+@bot.command(name="switch")
+@commands.guild_only()
+async def switch_teams(ctx: commands.Context, *, slot_numbers: str = "") -> None:
+    await transfer_slots_command(ctx, action="switch", slot_numbers=slot_numbers)
 
 
 class StaffActionButton(
