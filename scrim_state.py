@@ -41,6 +41,8 @@ DEFAULT_EMOJI_AVAILABLE = "⚪"
 DEFAULT_EMOJI_RESERVED = "🔵"
 DEFAULT_EMOJI_PENDING = "🟠"
 DEFAULT_EMOJI_CONFIRMED = "🟢"
+DEFAULT_EMOJI_REGISTRATION_OK = "🆗"
+DEFAULT_EMOJI_REGISTRATION_ACCEPTED = "✅"
 DEFAULT_LICENSE_TYPE = "Standard"
 LICENSE_TYPES = ("Standard", "Gold")
 DEFAULT_KILL_POINTS_VALUE = 1
@@ -102,6 +104,45 @@ DEFAULT_SCRIM_EMOJIS = {
     "emoji_pending": DEFAULT_EMOJI_PENDING,
     "emoji_confirmed": DEFAULT_EMOJI_CONFIRMED,
 }
+REGISTRATION_EMOJI_FIELDS = (
+    "emoji_registration_ok",
+    "emoji_registration_accepted",
+)
+DEFAULT_REGISTRATION_EMOJIS = {
+    "emoji_registration_ok": DEFAULT_EMOJI_REGISTRATION_OK,
+    "emoji_registration_accepted": DEFAULT_EMOJI_REGISTRATION_ACCEPTED,
+}
+
+
+def _normalize_custom_emoji(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > 100
+        or any(character in value for character in ("\r", "\n", "\x00"))
+    ):
+        raise ValueError("Emoji must be 1–100 characters.")
+    return value.strip()
+
+
+def normalize_slot_number_emojis(value: object) -> dict[int, str]:
+    """Normalize optional slot-number replacements (1–99) from JSON or callers."""
+    if not isinstance(value, dict):
+        raise ValueError("Slot number emojis must be an object.")
+    normalized: dict[int, str] = {}
+    for number, emoji in value.items():
+        if type(number) is int:
+            slot_number = number
+        elif isinstance(number, str) and re.fullmatch(r"[1-9]\d?", number):
+            slot_number = int(number)
+        else:
+            raise ValueError("Slot number emoji keys must be slot numbers from 1 to 99.")
+        if not MIN_SLOT_NUMBER <= slot_number <= MAX_SLOT_NUMBER or slot_number in normalized:
+            raise ValueError("Slot number emoji keys must be unique numbers from 1 to 99.")
+        normalized[slot_number] = _normalize_custom_emoji(emoji)
+    return dict(sorted(normalized.items()))
+
+
 OPERATIONAL_MESSAGE_KEYS = (
     "open_registration",
     "close_registration",
@@ -340,9 +381,9 @@ def validate_slot_range(start: int, end: int) -> tuple[int, int]:
 class Scrim:
     id: str
     guild_id: int
-    name: str
-    public_channel_id: int
-    staff_channel_id: int
+    name: str | None
+    public_channel_id: int | None
+    staff_channel_id: int | None
     staff_role_id: int | None = None
     pending_role_id: int | None = None
     confirmed_role_id: int | None = None
@@ -356,6 +397,9 @@ class Scrim:
     emoji_reserved: str = DEFAULT_EMOJI_RESERVED
     emoji_pending: str = DEFAULT_EMOJI_PENDING
     emoji_confirmed: str = DEFAULT_EMOJI_CONFIRMED
+    slot_number_emojis: dict[int, str] = field(default_factory=dict)
+    emoji_registration_ok: str = DEFAULT_EMOJI_REGISTRATION_OK
+    emoji_registration_accepted: str = DEFAULT_EMOJI_REGISTRATION_ACCEPTED
     public_message_id: int | None = None
     staff_message_id: int | None = None
     is_open: bool = True
@@ -366,8 +410,8 @@ class Scrim:
     operational_message_refs: dict[str, dict[str, int]] = field(
         default_factory=lambda: dict(DEFAULT_OPERATIONAL_MESSAGE_REFS)
     )
-    slot_start: int = DEFAULT_SLOT_START
-    slot_end: int = DEFAULT_SLOT_END
+    slot_start: int | None = DEFAULT_SLOT_START
+    slot_end: int | None = DEFAULT_SLOT_END
     slots: dict[int, Slot] = field(default_factory=empty_slots)
     timezone: str = DEFAULT_IDPW_TIMEZONE
     maps: list[str] = field(default_factory=lambda: list(DEFAULT_MATCH_MAPS))
@@ -397,6 +441,32 @@ class Scrim:
     board_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     deleted: bool = False
 
+    @property
+    def missing_required_settings(self) -> tuple[str, ...]:
+        missing = []
+        if self.name is None:
+            missing.append("name")
+        if self.public_channel_id is None:
+            missing.append("public_channel_id")
+        if self.staff_channel_id is None:
+            missing.append("staff_channel_id")
+        if self.logs_channel_id is None:
+            missing.append("logs_channel_id")
+        if self.history_channel_id is None:
+            missing.append("history_channel_id")
+        if self.pending_role_id is None:
+            missing.append("pending_role_id")
+        if self.confirmed_role_id is None:
+            missing.append("confirmed_role_id")
+        if self.slot_start is None or self.slot_end is None:
+            missing.append("slot_range")
+        return tuple(missing)
+
+    @property
+    def is_configured(self) -> bool:
+        """Whether required per-scrim settings are present and valid."""
+        return not self.missing_required_settings
+
     def payload(self) -> dict:
         return {
             "id": self.id, "guild_id": self.guild_id, "name": self.name,
@@ -415,6 +485,12 @@ class Scrim:
             "emoji_reserved": self.emoji_reserved,
             "emoji_pending": self.emoji_pending,
             "emoji_confirmed": self.emoji_confirmed,
+            "slot_number_emojis": {
+                str(number): emoji
+                for number, emoji in sorted(self.slot_number_emojis.items())
+            },
+            "emoji_registration_ok": self.emoji_registration_ok,
+            "emoji_registration_accepted": self.emoji_registration_accepted,
             "public_message_id": self.public_message_id,
             "staff_message_id": self.staff_message_id,
             "is_open": self.is_open,
@@ -752,7 +828,7 @@ class ScrimRepository:
     def list(self, guild_id: int) -> list[Scrim]:
         return sorted(
             (s for s in self.scrims.values() if s.guild_id == guild_id and not s.deleted),
-            key=lambda s: (s.name.casefold(), s.id),
+            key=lambda s: ((s.name or "").casefold(), s.id),
         )
 
     def is_guild_authorized(self, guild_id: int) -> bool:
@@ -913,7 +989,7 @@ class ScrimRepository:
 
     def payload(self) -> dict:
         return {
-            "version": 32,
+            "version": 33,
             "scrims": [s.payload() for s in self.scrims.values()],
             "server_configs": [
                 config.payload() for config in self.server_configs.values()
@@ -962,7 +1038,7 @@ class ScrimRepository:
             version = payload.get("version")
             if type(version) is not int or version not in (
                 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-                20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
+                20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33
             ):
                 raise ValueError("Unsupported snapshot version.")
             if not isinstance(payload["scrims"], list):
@@ -1238,16 +1314,53 @@ class ScrimRepository:
                         values.setdefault(
                             field_name, legacy_emojis.get(field_name, default)
                         )
-                values["slots"] = _read_slots(
-                    values["slots"],
-                    values["slot_start"],
-                    values["slot_end"],
+                if payload["version"] < 33:
+                    values.setdefault("slot_number_emojis", {})
+                    for field_name, default in DEFAULT_REGISTRATION_EMOJIS.items():
+                        values.setdefault(field_name, default)
+                values["slot_number_emojis"] = normalize_slot_number_emojis(
+                    values.get("slot_number_emojis", {})
                 )
+                for field_name, default in DEFAULT_REGISTRATION_EMOJIS.items():
+                    values.setdefault(field_name, default)
+                slot_start = values.get("slot_start")
+                slot_end = values.get("slot_end")
+                # An intentionally cleared range is retained as no configured
+                # range while saved slot assignments remain available for repair.
+                if slot_start is None and slot_end is None:
+                    raw_slots = values["slots"]
+                    if not isinstance(raw_slots, list):
+                        raise ValueError("Invalid slot list.")
+                    if raw_slots:
+                        slot_numbers = [
+                            entry.get("number")
+                            for entry in raw_slots
+                            if isinstance(entry, dict)
+                        ]
+                        if len(slot_numbers) != len(raw_slots):
+                            raise ValueError("Invalid slot list.")
+                        values["slots"] = _read_slots(
+                            raw_slots, min(slot_numbers), max(slot_numbers)
+                        )
+                    else:
+                        values["slots"] = {}
+                else:
+                    if slot_start is None or slot_end is None:
+                        raise ValueError("Slot range must be configured together.")
+                    values["slots"] = _read_slots(
+                        values["slots"], slot_start, slot_end
+                    )
+                if slot_start is None and slot_end is None and values["slots"]:
+                    slot_start = min(values["slots"])
+                    slot_end = max(values["slots"])
+                else:
+                    slot_start = slot_start or DEFAULT_SLOT_START
+                    slot_end = slot_end or DEFAULT_SLOT_END
                 values["pending_registrations"] = _read_registration_requests(
                     values["pending_registrations"],
                     values["slots"],
-                    values["slot_start"],
-                    values["slot_end"],
+                    slot_start,
+                    slot_end,
                 )
                 values["match_scores"] = _read_match_scores(
                     values["match_scores"],
@@ -1270,6 +1383,8 @@ class ScrimRepository:
                     "registration_role_id", "registration_auto_accept",
                     "public_message_id", "staff_message_id",
                     "emoji_available", "emoji_reserved", "emoji_pending",
+                    "slot_number_emojis", "emoji_registration_ok",
+                    "emoji_registration_accepted",
                      "emoji_confirmed", "is_open", "registration_open",
                      "operational_messages",
                      "operational_message_refs",
@@ -1286,6 +1401,11 @@ class ScrimRepository:
                 }:
                     raise ValueError("Invalid scrim fields.")
                 scrim = Scrim(**values)
+                if not scrim.is_configured:
+                    # A partial or reset configuration remains visible for
+                    # repair, but cannot inherit active slot/registration state.
+                    scrim.is_open = False
+                    scrim.registration_open = False
                 scrim.leaderboard_accent_colors = (
                     normalize_leaderboard_accent_colors(
                         scrim.leaderboard_accent_colors
@@ -1308,8 +1428,14 @@ class ScrimRepository:
                     or not re.fullmatch(r"[a-f0-9]{16}", scrim.id)
                     or scrim.id in result
                     or not _positive_id(scrim.guild_id)
-                    or not _positive_id(scrim.public_channel_id)
-                    or not _positive_id(scrim.staff_channel_id)
+                    or (
+                        scrim.public_channel_id is not None
+                        and not _positive_id(scrim.public_channel_id)
+                    )
+                    or (
+                        scrim.staff_channel_id is not None
+                        and not _positive_id(scrim.staff_channel_id)
+                    )
                     or (
                         scrim.staff_role_id is not None
                         and not _positive_id(scrim.staff_role_id)
@@ -1351,6 +1477,14 @@ class ScrimRepository:
                         and not _positive_id(scrim.history_channel_id)
                     )
                     or (
+                        scrim.public_channel_id is not None
+                        and not _positive_id(scrim.public_channel_id)
+                    )
+                    or (
+                        scrim.staff_channel_id is not None
+                        and not _positive_id(scrim.staff_channel_id)
+                    )
+                    or (
                         scrim.registration_channel_id is not None
                         and not _positive_id(scrim.registration_channel_id)
                     )
@@ -1371,10 +1505,32 @@ class ScrimRepository:
                         )
                         for field_name in EMOJI_FIELDS
                     )
+                    or any(
+                        not isinstance(getattr(scrim, field_name), str)
+                        or not getattr(scrim, field_name).strip()
+                        or len(getattr(scrim, field_name)) > 100
+                        or any(
+                            character in getattr(scrim, field_name)
+                            for character in ("\r", "\n", "\x00")
+                        )
+                        for field_name in REGISTRATION_EMOJI_FIELDS
+                    )
+                    or normalize_slot_number_emojis(scrim.slot_number_emojis)
+                    != scrim.slot_number_emojis
                     or type(scrim.is_open) is not bool
-                    or validate_slot_range(scrim.slot_start, scrim.slot_end)
-                    != (scrim.slot_start, scrim.slot_end)
-                    or normalize_name(scrim.name) != scrim.name
+                    or type(scrim.registration_open) is not bool
+                    or (
+                        (scrim.slot_start is None) != (scrim.slot_end is None)
+                    )
+                    or (
+                        scrim.slot_start is not None
+                        and validate_slot_range(scrim.slot_start, scrim.slot_end)
+                        != (scrim.slot_start, scrim.slot_end)
+                    )
+                    or (
+                        scrim.name is not None
+                        and normalize_name(scrim.name) != scrim.name
+                    )
                     or not valid_timezone_name(scrim.timezone)
                     or type(scrim.max_matches) is not int
                     or not 1 <= scrim.max_matches <= MAX_MATCHES
@@ -1407,10 +1563,13 @@ class ScrimRepository:
                     or scrim.leaderboard_footer_height not in LEADERBOARD_FOOTER_HEIGHTS
                 ):
                     raise ValueError("Invalid scrim identity or channel.")
-                name_key = (scrim.guild_id, scrim.name.casefold())
-                if name_key in names:
-                    raise ValueError("Scrim names must be unique within a server.")
-                names.add(name_key)
+                if scrim.name is not None:
+                    name_key = (scrim.guild_id, scrim.name.casefold())
+                    if name_key in names:
+                        raise ValueError(
+                            "Scrim names must be unique within a server."
+                        )
+                    names.add(name_key)
                 configured_channels = (
                     scrim.public_channel_id,
                     scrim.staff_channel_id,
@@ -1638,7 +1797,7 @@ class ScrimRepository:
             except (KeyError, TypeError, ValueError) as error:
                 raise SlotStorageError("Invalid legacy snapshot; migration was stopped.") from error
             new_payload = {
-                "version": 32,
+                "version": 33,
                 "scrims": [],
                 "server_configs": [],
                 "idpw_configs": [],
@@ -1684,7 +1843,7 @@ class ScrimRepository:
         self.authorized_guild_duration_days = authorized_guild_duration_days
         self.authorized_guild_license_types = authorized_guild_license_types
         self.authorized_admin_ids = authorized_admin_ids
-        if payload.get("version", 0) < 32:
+        if payload.get("version", 0) < 33:
             self.store.save(self.payload())
 
     @contextmanager
@@ -1737,6 +1896,9 @@ class ScrimRepository:
                     "emoji_reserved",
                     "emoji_pending",
                     "emoji_confirmed",
+                    "slot_number_emojis",
+                    "emoji_registration_ok",
+                    "emoji_registration_accepted",
                     "public_message_id",
                     "staff_message_id",
                     "is_open",
@@ -1843,18 +2005,128 @@ class ScrimRepository:
         scrim = self.get(scrim_id)
         if scrim is None or scrim.guild_id != guild_id:
             raise ValueError("This scrim does not exist on this server.")
+        emoji = _normalize_custom_emoji(emoji)
         with self.transaction():
             setattr(scrim, field_name, emoji)
         return scrim
 
-    def reset_scrim_emojis(self, scrim_id: str, guild_id: int) -> Scrim:
+    def save_slot_number_emoji(
+        self,
+        scrim_id: str,
+        guild_id: int,
+        slot_number: int,
+        emoji: str | None,
+    ) -> Scrim:
+        if type(slot_number) is not int or not MIN_SLOT_NUMBER <= slot_number <= MAX_SLOT_NUMBER:
+            raise ValueError("Slot number must be between 1 and 99.")
         scrim = self.get(scrim_id)
         if scrim is None or scrim.guild_id != guild_id:
             raise ValueError("This scrim does not exist on this server.")
         with self.transaction():
-            for field_name, emoji in DEFAULT_SCRIM_EMOJIS.items():
-                setattr(scrim, field_name, emoji)
+            if emoji is None:
+                scrim.slot_number_emojis.pop(slot_number, None)
+            else:
+                scrim.slot_number_emojis[slot_number] = _normalize_custom_emoji(
+                    emoji
+                )
+                scrim.slot_number_emojis = normalize_slot_number_emojis(
+                    scrim.slot_number_emojis
+                )
         return scrim
+
+    def save_registration_emoji(
+        self, scrim_id: str, guild_id: int, field_name: str, emoji: str
+    ) -> Scrim:
+        if field_name not in REGISTRATION_EMOJI_FIELDS:
+            raise ValueError("Invalid registration emoji field.")
+        scrim = self.get(scrim_id)
+        if scrim is None or scrim.guild_id != guild_id:
+            raise ValueError("This scrim does not exist on this server.")
+        with self.transaction():
+            setattr(scrim, field_name, _normalize_custom_emoji(emoji))
+        return scrim
+
+    def reset_scrim_settings(
+        self, scrim_id: str, guild_id: int, section: str
+    ) -> Scrim:
+        """Restore one setup section (or the whole scrim) to safe defaults.
+
+        Required fields are stored as null, keeping this scrim identifiable but
+        unconfigured. Runtime opening states are forced closed until setup is
+        restored and the operator explicitly opens it again.
+        """
+        aliases = {"registration": "registrations"}
+        section = aliases.get(section, section)
+        valid_sections = {
+            "required",
+            "cap_transfer",
+            "matches_maps",
+            "registrations",
+            "idpw",
+            "emojis",
+            "all",
+        }
+        if section not in valid_sections:
+            raise ValueError("Unknown scrim settings section.")
+        scrim = self.get(scrim_id)
+        if scrim is None or scrim.guild_id != guild_id:
+            raise ValueError("This scrim does not exist on this server.")
+        reset_all = section == "all"
+        with self.transaction():
+            if section == "required" or reset_all:
+                scrim.name = None
+                scrim.public_channel_id = None
+                scrim.staff_channel_id = None
+                scrim.logs_channel_id = None
+                scrim.history_channel_id = None
+                scrim.pending_role_id = None
+                scrim.confirmed_role_id = None
+                scrim.slot_start = None
+                scrim.slot_end = None
+                scrim.is_open = False
+                scrim.registration_open = False
+            if section == "cap_transfer" or reset_all:
+                scrim.cap_channel_id = None
+            if section == "matches_maps" or reset_all:
+                scrim.max_matches = len(DEFAULT_MATCH_MAPS)
+                scrim.maps = list(DEFAULT_MATCH_MAPS)
+                scrim.match_maps = list(DEFAULT_MATCH_MAPS)
+                scrim.current_match_counter = 1
+            if section == "registrations" or reset_all:
+                scrim.registration_channel_id = None
+                scrim.registration_role_id = None
+                scrim.registration_auto_accept = False
+                scrim.registration_open = False
+            if section == "idpw" or reset_all:
+                scrim.pw_type = "fixed"
+                scrim.fixed_pw = ""
+                scrim.timezone = DEFAULT_IDPW_TIMEZONE
+                self.idpw_configs.pop(scrim_id, None)
+            if section == "emojis" or reset_all:
+                for field_name, emoji in DEFAULT_SCRIM_EMOJIS.items():
+                    setattr(scrim, field_name, emoji)
+                scrim.slot_number_emojis = {}
+                for field_name, emoji in DEFAULT_REGISTRATION_EMOJIS.items():
+                    setattr(scrim, field_name, emoji)
+            if reset_all:
+                scrim.operational_messages = dict(DEFAULT_OPERATIONAL_MESSAGES)
+                scrim.operational_message_refs = {}
+                scrim.kill_points_value = DEFAULT_KILL_POINTS_VALUE
+                scrim.placement_points_string = DEFAULT_PLACEMENT_POINTS_STRING
+                scrim.leaderboard_layout = "1_col"
+                scrim.leaderboard_background = DEFAULT_LEADERBOARD_BACKGROUND
+                scrim.leaderboard_accent_color = DEFAULT_LEADERBOARD_ACCENT_COLOR
+                scrim.leaderboard_accent_colors = {}
+                scrim.leaderboard_team_count = DEFAULT_LEADERBOARD_TEAM_COUNT
+                scrim.leaderboard_orientation = DEFAULT_LEADERBOARD_ORIENTATION
+                scrim.leaderboard_header_height = DEFAULT_LEADERBOARD_HEADER_HEIGHT
+                scrim.leaderboard_footer_height = DEFAULT_LEADERBOARD_FOOTER_HEIGHT
+                scrim.is_open = False
+                scrim.registration_open = False
+        return scrim
+
+    def reset_scrim_emojis(self, scrim_id: str, guild_id: int) -> Scrim:
+        return self.reset_scrim_settings(scrim_id, guild_id, "emojis")
 
     def update_operational_message(
         self,
@@ -2439,7 +2711,10 @@ class ScrimRepository:
         existing = self.list(guild_id)
         if len(existing) >= MAX_SCRIMS_PER_GUILD:
             raise ValueError("This server already has 25 scrims.")
-        if any(s.name.casefold() == name.casefold() for s in existing):
+        if any(
+            s.name is not None and s.name.casefold() == name.casefold()
+            for s in existing
+        ):
             raise ValueError("A scrim with this name already exists on this server.")
         requested = set(configured_channels)
         if any(
@@ -2581,9 +2856,9 @@ class ScrimRepository:
         scrim_id: str,
         guild_id: int,
         *,
-        name: str | object = _UNSET,
-        public_channel_id: int | object = _UNSET,
-        staff_channel_id: int | object = _UNSET,
+        name: str | None | object = _UNSET,
+        public_channel_id: int | None | object = _UNSET,
+        staff_channel_id: int | None | object = _UNSET,
         staff_role_id: int | None | object = _UNSET,
         pending_role_id: int | None | object = _UNSET,
         confirmed_role_id: int | None | object = _UNSET,
@@ -2593,8 +2868,8 @@ class ScrimRepository:
         registration_channel_id: int | None | object = _UNSET,
         registration_role_id: int | None | object = _UNSET,
         registration_auto_accept: bool | object = _UNSET,
-        slot_start: int | object = _UNSET,
-        slot_end: int | object = _UNSET,
+        slot_start: int | None | object = _UNSET,
+        slot_end: int | None | object = _UNSET,
         max_matches: int | object = _UNSET,
         maps: list[str] | tuple[str, ...] | object = _UNSET,
         match_maps: list[str] | tuple[str, ...] | object = _UNSET,
@@ -2604,7 +2879,11 @@ class ScrimRepository:
         if scrim is None or scrim.guild_id != guild_id:
             raise ValueError("This scrim does not exist on this server.")
 
-        next_name = scrim.name if name is _UNSET else normalize_name(name)
+        next_name = (
+            scrim.name
+            if name is _UNSET
+            else (None if name is None else normalize_name(name))
+        )
         next_public = (
             scrim.public_channel_id
             if public_channel_id is _UNSET
@@ -2662,7 +2941,10 @@ class ScrimRepository:
             next_registration_auto_accept = False
         next_start = scrim.slot_start if slot_start is _UNSET else slot_start
         next_end = scrim.slot_end if slot_end is _UNSET else slot_end
-        validate_slot_range(next_start, next_end)
+        if (next_start is None) != (next_end is None):
+            raise ValueError("Slot range must be cleared or configured together.")
+        if next_start is not None:
+            validate_slot_range(next_start, next_end)
         next_max_matches = (
             scrim.max_matches if max_matches is _UNSET else max_matches
         )
@@ -2674,7 +2956,10 @@ class ScrimRepository:
             next_max_matches, next_maps, next_match_maps
         )
 
-        if not all(_positive_id(value) for value in (next_public, next_staff)):
+        if any(
+            value is not None and not _positive_id(value)
+            for value in (next_public, next_staff)
+        ):
             raise ValueError("Public and staff channel IDs must be positive integers.")
         if any(
             value is not None and not _positive_id(value)
@@ -2726,7 +3011,11 @@ class ScrimRepository:
             raise ValueError("Configured channels must be different.")
 
         others = [other for other in self.list(guild_id) if other.id != scrim_id]
-        if any(other.name.casefold() == next_name.casefold() for other in others):
+        if next_name is not None and any(
+            other.name is not None
+            and other.name.casefold() == next_name.casefold()
+            for other in others
+        ):
             raise ValueError("A scrim with this name already exists on this server.")
         requested_channels = set(configured_channels)
         if any(
@@ -2763,28 +3052,41 @@ class ScrimRepository:
             scrim.registration_role_id = next_registration_role
             scrim.registration_auto_accept = next_registration_auto_accept
             if (next_start, next_end) != (scrim.slot_start, scrim.slot_end):
-                occupied_outside = [
-                    slot.number
-                    for number, slot in scrim.slots.items()
-                    if not next_start <= number <= next_end
-                    and slot.status != STATUS_AVAILABLE
-                ]
-                if occupied_outside:
-                    numbers = ", ".join(f"{number:02d}" for number in occupied_outside)
-                    raise ValueError(
-                        f"Cannot shrink the range while slots {numbers} are occupied."
-                    )
-                scrim.slots = {
-                    number: scrim.slots.get(number, Slot(number))
-                    for number in range(next_start, next_end + 1)
-                }
-                scrim.slot_start = next_start
-                scrim.slot_end = next_end
+                if next_start is None and next_end is None:
+                    # Keep the old slot records for repair/audit, but pause
+                    # this scrim because its configured range is now absent.
+                    scrim.slot_start = None
+                    scrim.slot_end = None
+                    scrim.is_open = False
+                    scrim.registration_open = False
+                else:
+                    occupied_outside = [
+                        slot.number
+                        for number, slot in scrim.slots.items()
+                        if not next_start <= number <= next_end
+                        and slot.status != STATUS_AVAILABLE
+                    ]
+                    if occupied_outside:
+                        numbers = ", ".join(
+                            f"{number:02d}" for number in occupied_outside
+                        )
+                        raise ValueError(
+                            f"Cannot shrink the range while slots {numbers} are occupied."
+                        )
+                    scrim.slots = {
+                        number: scrim.slots.get(number, Slot(number))
+                        for number in range(next_start, next_end + 1)
+                    }
+                    scrim.slot_start = next_start
+                    scrim.slot_end = next_end
             scrim.max_matches = next_max_matches
             scrim.maps = next_maps
             scrim.match_maps = next_match_maps
             if scrim.current_match_counter > next_max_matches:
                 scrim.current_match_counter = 1
+            if not scrim.is_configured:
+                scrim.is_open = False
+                scrim.registration_open = False
         return scrim
 
     def delete(self, scrim_id: str, guild_id: int) -> Scrim:

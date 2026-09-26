@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 import discord
@@ -15,6 +16,12 @@ from scrim_state import (
     DEFAULT_KILL_POINTS_VALUE,
     DEFAULT_IDPW_TIMEZONE,
     DEFAULT_MATCH_MAPS,
+    DEFAULT_EMOJI_AVAILABLE,
+    DEFAULT_EMOJI_RESERVED,
+    DEFAULT_EMOJI_PENDING,
+    DEFAULT_EMOJI_CONFIRMED,
+    DEFAULT_EMOJI_REGISTRATION_OK,
+    DEFAULT_EMOJI_REGISTRATION_ACCEPTED,
     DEFAULT_PLACEMENT_POINTS_STRING,
     DEFAULT_SLOT_END,
     DEFAULT_SLOT_START,
@@ -43,8 +50,17 @@ async def _delete_command_message(ctx: commands.Context) -> None:
         pass
 
 
-def _safe_name(value: str) -> str:
+def _safe_name(value: str | None) -> str:
+    if value is None or not value.strip():
+        return "Unconfigured scrim"
     return discord.utils.escape_mentions(discord.utils.escape_markdown(value))
+
+
+def _extract_setup_emoji(value: str) -> str | None:
+    return extract_raw_emoji(value) or next(
+        iter(re.findall(r"[#*0-9]\ufe0f?\u20e3", value)),
+        None,
+    )
 
 
 def _short_name(value: str, limit: int = 20) -> str:
@@ -62,10 +78,10 @@ def _role_ref(role_id: int | None) -> str:
 
 
 ADDITIONAL_SETTINGS_SECTIONS = (
-    ("cap_transfer", "Cap Transfer", "🔁"),
     ("matches_maps", "Matches & Maps", "🎮"),
     ("registration", "Registrations", "📝"),
     ("idpw", "ID&PW", "🔐"),
+    ("cap_transfer", "Cap Transfer", "🔁"),
     ("emojis", "Custom Emojis", "🎨"),
 )
 
@@ -107,7 +123,8 @@ def _scrim_configuration_details(scrim, repository) -> str:
         f"Staff role: {_role_ref(scrim.staff_role_id)}\n"
         f"**Pending Captain Role:** {_role_ref(scrim.pending_role_id)}\n"
         f"**Confirmed Captain Role:** {_role_ref(scrim.confirmed_role_id)}\n"
-        f"Slots: {scrim.slot_start:02d}–{scrim.slot_end:02d}\n"
+        f"Slots: "
+        f"{f'{scrim.slot_start:02d}–{scrim.slot_end:02d}' if scrim.slot_start is not None and scrim.slot_end is not None else 'not configured'}\n"
         f"Password mode: **{password_mode}**\n"
         f"Timezone: `{timezone_name}`\n"
         f"Map rotation: {map_details}\n"
@@ -694,10 +711,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     max_values=1,
                     options=[
                         discord.SelectOption(
-                            label=scrim.name[:100],
+                            label=(scrim.name or f"Unconfigured {scrim.id[:12]}")[:100],
                             value=scrim.id,
                             description=(
-                                f"Slots {scrim.slot_start:02d}–{scrim.slot_end:02d}"
+                                (
+                                    f"Slots {scrim.slot_start:02d}–{scrim.slot_end:02d}"
+                                    if scrim.slot_start is not None
+                                    and scrim.slot_end is not None
+                                    else "Required settings need configuration"
+                                )
                             )[:100],
                         )
                         for scrim in self.scrims[:25]
@@ -870,11 +892,49 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             additional_button.callback = additional_callback
             self.add_item(additional_button)
 
+            restore_button = discord.ui.Button(
+                label="Restore All Defaults",
+                emoji="🔄",
+                style=discord.ButtonStyle.danger,
+                row=1,
+            )
+
+            async def restore_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                selected = self.scrim()
+                if selected is None:
+                    await interaction.response.edit_message(
+                        content="That scrim no longer exists.", embed=None, view=None
+                    )
+                    return
+                await interaction.response.edit_message(
+                    content=(
+                        f"Restore every setting for **{_safe_name(selected.name)}**? "
+                        "Required settings will be cleared, this scrim will be paused, "
+                        "and it cannot be used until you configure it again."
+                    ),
+                    embed=None,
+                    view=ScrimResetConfirmationView(
+                        self.panel,
+                        self.owner_id,
+                        self.guild_id,
+                        self.scrim_id,
+                        "all",
+                        ScrimManagementView(
+                            self.panel, self.owner_id, self.guild_id, self.scrim_id
+                        ),
+                    ),
+                )
+
+            restore_button.callback = restore_callback
+            self.add_item(restore_button)
+
             delete_button = discord.ui.Button(
                 label="Delete Scrim",
                 emoji="🟥",
                 style=discord.ButtonStyle.danger,
-                row=0,
+                row=2,
             )
 
             async def delete_callback(interaction: discord.Interaction) -> None:
@@ -907,7 +967,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 label="Back to Selector",
                 emoji="↩️",
                 style=discord.ButtonStyle.secondary,
-                row=1,
+                row=2,
             )
 
             async def back_callback(interaction: discord.Interaction) -> None:
@@ -995,7 +1055,14 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             )
             embed = discord.Embed(
                 title=f"Manage Scrim — {_safe_name(selected.name)}",
-                description="Configuration overview",
+                description=(
+                    "Configuration overview"
+                    if selected.is_configured
+                    else (
+                        "⚠️ This scrim is paused until all required settings are "
+                        "configured again."
+                    )
+                ),
                 color=discord.Color.blurple(),
             )
             required_channels = "\n".join(
@@ -1011,7 +1078,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             embed.add_field(
                 name="Required Settings",
                 value=(
-                    f"🟢 Scrim Name: **{_safe_name(selected.name)}**\n"
+                    f"{'🟢' if selected.name else '🔴'} Scrim Name: "
+                    f"**{_safe_name(selected.name)}**\n"
                     f"{'🟢' if channel_ready else '🔴'} Channels:\n"
                     f"{required_channels}\n"
                     f"{'🟢' if roles_ready else '🔴'} Roles:\n"
@@ -1161,6 +1229,42 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
             back_button.callback = back_callback
             self.add_item(back_button)
+
+            restore_button = discord.ui.Button(
+                label="Restore All Defaults",
+                emoji="🔄",
+                style=discord.ButtonStyle.danger,
+                row=1,
+            )
+
+            async def restore_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                scrim = self.scrim()
+                if scrim is None:
+                    await interaction.response.edit_message(
+                        content="That scrim no longer exists.", embed=None, view=None
+                    )
+                    return
+                await interaction.response.edit_message(
+                    content=(
+                        f"Restore every setting for **{_safe_name(scrim.name)}**? "
+                        "Required settings will be cleared, this scrim will be paused, "
+                        "and it cannot be used until you configure it again."
+                    ),
+                    embed=None,
+                    view=ScrimResetConfirmationView(
+                        self.panel,
+                        self.owner_id,
+                        self.guild_id,
+                        self.scrim_id,
+                        "all",
+                        self,
+                    ),
+                )
+
+            restore_button.callback = restore_callback
+            self.add_item(restore_button)
 
         def content(self) -> str:
             selected = self.scrim()
@@ -1625,7 +1729,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             back_button = discord.ui.Button(
                 label="Back",
                 style=discord.ButtonStyle.secondary,
-                row=3,
+                row=4,
             )
 
             async def back_callback(interaction: discord.Interaction) -> None:
@@ -1638,6 +1742,32 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
             back_button.callback = back_callback
             self.add_item(back_button)
+
+            reset_button = discord.ui.Button(
+                label="Restore Registration Defaults",
+                emoji="🔄",
+                style=discord.ButtonStyle.danger,
+                row=3,
+            )
+
+            async def reset_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                await interaction.response.edit_message(
+                    content="Restore registration channel, role, and mode to defaults?",
+                    embed=None,
+                    view=ScrimResetConfirmationView(
+                        self.grid.panel,
+                        self.grid.owner_id,
+                        self.grid.guild_id,
+                        self.grid.scrim_id,
+                        "registrations",
+                        self.grid,
+                    ),
+                )
+
+            reset_button.callback = reset_callback
+            self.add_item(reset_button)
 
     class MatchCountDropdownView(BoundView):
         def __init__(self, grid: "ConfigurationGridView"):
@@ -2054,6 +2184,49 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             back_button.callback = back_callback
             self.add_item(back_button)
 
+        def _add_reset_button(self) -> None:
+            button = discord.ui.Button(
+                label="Restore Section Defaults",
+                emoji="🔄",
+                style=discord.ButtonStyle.danger,
+                row=1,
+            )
+
+            async def callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                selected = repository.get(self.scrim_id)
+                if selected is None or selected.guild_id != self.guild_id:
+                    await interaction.response.edit_message(
+                        content="That scrim no longer exists.", embed=None, view=None
+                    )
+                    return
+                required_warning = (
+                    " Required settings will be cleared and this scrim will be "
+                    "paused until configured again."
+                    if self.section == "required"
+                    else ""
+                )
+                await interaction.response.edit_message(
+                    content=(
+                        f"Restore **{self.section.replace('_', ' ').title()}** "
+                        f"settings for **{_safe_name(selected.name)}** to defaults?"
+                        f"{required_warning}"
+                    ),
+                    embed=None,
+                    view=ScrimResetConfirmationView(
+                        self.panel,
+                        self.owner_id,
+                        self.guild_id,
+                        self.scrim_id,
+                        self.section,
+                        self,
+                    ),
+                )
+
+            button.callback = callback
+            self.add_item(button)
+
         def _rebuild_edit_section(self) -> None:
             if self.section == "required":
                 specs = (
@@ -2100,7 +2273,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
                 button.callback = cap_transfer_callback
                 self.add_item(button)
-                self._add_edit_back_button(row=1)
+                self._add_reset_button()
+                self._add_edit_back_button(row=2)
                 return
             elif self.section == "registration":
                 button = discord.ui.Button(
@@ -2123,7 +2297,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
                 button.callback = registration_callback
                 self.add_item(button)
-                self._add_edit_back_button(row=1)
+                self._add_reset_button()
+                self._add_edit_back_button(row=2)
                 return
             elif self.section == "idpw":
                 specs = (
@@ -2237,7 +2412,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
                 button.callback = callback
                 self.add_item(button)
-            self._add_edit_back_button(row=1 if self.section != "required" else 2)
+            self._add_reset_button()
+            self._add_edit_back_button(row=2)
 
         def embed(self) -> discord.Embed:
             if self.is_edit and self.section == "cap_transfer":
@@ -2340,7 +2516,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 )
                 settings_value = (
                     f"Matches: **{self.max_matches}** "
-                    f"({self.slot_start:02d}–{self.slot_end:02d} slots)\n"
+                    f"({f'{self.slot_start:02d}–{self.slot_end:02d}' if self.slot_start is not None and self.slot_end is not None else 'slot range not configured'})\n"
                     f"Custom Maps: **{maps_value}**\n"
                     f"Match Maps: **{match_maps_value}**\n"
                     f"PW Mode: **{(self.pw_type or 'not configured').upper()}**\n"
@@ -2376,7 +2552,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 )
             return all(
                 (
-                    self.name.strip(),
+                    (self.name or "").strip(),
                     self.public_channel_id,
                     self.staff_channel_id,
                     self.target_channel_id,
@@ -2517,7 +2693,6 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                         else ""
                     ),
                 ),
-                ("target", "ID/PW Target", "Channel ID", "123456789", self.target_channel_id),
                 (
                     "logs_history",
                     "Logs & History",
@@ -2529,6 +2704,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                         else ""
                     ),
                 ),
+                ("target", "ID/PW Target", "Channel ID", "123456789", self.target_channel_id),
             )
             for setting, label, modal_label, placeholder, default in specs:
                 button = discord.ui.Button(
@@ -3382,15 +3558,287 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 name=name,
             )
 
+    class ScrimResetConfirmationView(BoundView):
+        """Double-check scrim resets and retire boards when required values clear."""
+
+        def __init__(
+            self,
+            panel: SetupPanel,
+            owner_id: int,
+            guild_id: int,
+            scrim_id: str,
+            section: str,
+            return_view: discord.ui.View,
+        ):
+            super().__init__(owner_id, guild_id)
+            self.panel = panel
+            self.scrim_id = scrim_id
+            self.section = section
+            self.return_view = return_view
+
+            confirm = discord.ui.Button(
+                label="Confirm Restore",
+                emoji="⚠️",
+                style=discord.ButtonStyle.danger,
+                row=0,
+            )
+
+            async def confirm_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                current = repository.get(self.scrim_id)
+                if current is None or current.guild_id != self.guild_id:
+                    await interaction.response.edit_message(
+                        content="That scrim no longer exists.", embed=None, view=None
+                    )
+                    return
+                old_public = (
+                    current.public_channel_id,
+                    current.public_message_id,
+                    current.runtime_message,
+                )
+                old_staff = (
+                    current.staff_channel_id,
+                    current.staff_message_id,
+                    current.runtime_staff_message,
+                )
+                await interaction.response.defer()
+                try:
+                    updated = repository.reset_scrim_settings(
+                        self.scrim_id, self.guild_id, self.section
+                    )
+                except (SlotStorageError, ValueError) as error:
+                    logger.exception("Could not restore scrim settings")
+                    await interaction.edit_original_response(
+                        content=f"The settings could not be restored. {error}",
+                        embed=None,
+                        view=self.return_view,
+                    )
+                    return
+
+                if self.section in {"required", "all"}:
+                    await retire_message(interaction.guild, *old_public)
+                    await retire_message(interaction.guild, *old_staff)
+
+                try:
+                    await self.panel.refresh_message()
+                except Exception:
+                    logger.exception("Could not refresh setup after restoring settings")
+
+                next_view = self.return_view
+                if isinstance(self.return_view, ConfigurationGridView):
+                    next_view = ScrimEditView(
+                        self.panel,
+                        self.owner_id,
+                        self.guild_id,
+                        self.scrim_id,
+                        section=self.return_view.section,
+                    )
+                else:
+                    rebuild = getattr(next_view, "rebuild", None)
+                    if callable(rebuild):
+                        rebuild()
+
+                notice = (
+                    "✅ Defaults restored. This scrim is paused and cannot be used "
+                    "until every required setting is configured again."
+                    if not updated.is_configured
+                    else "✅ Defaults restored for this scrim."
+                )
+                await interaction.edit_original_response(
+                    content=notice,
+                    embed=next_view.embed() if hasattr(next_view, "embed") else None,
+                    view=next_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+            confirm.callback = confirm_callback
+            self.add_item(confirm)
+
+            cancel = discord.ui.Button(
+                label="Cancel",
+                emoji="↩️",
+                style=discord.ButtonStyle.secondary,
+                row=0,
+            )
+
+            async def cancel_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                rebuild = getattr(self.return_view, "rebuild", None)
+                if callable(rebuild):
+                    rebuild()
+                await interaction.response.edit_message(
+                    content=(
+                        self.return_view.content()
+                        if hasattr(self.return_view, "content")
+                        else "Restore cancelled."
+                    ),
+                    embed=(
+                        self.return_view.embed()
+                        if hasattr(self.return_view, "embed")
+                        else None
+                    ),
+                    view=self.return_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+            cancel.callback = cancel_callback
+            self.add_item(cancel)
+
     def custom_emoji_content(scrim) -> str:
         return (
-            f"**Custom legend emojis — {_safe_name(scrim.name)}**\n"
-            f"Available: {scrim.emoji_available}\n"
-            f"Reserved: {scrim.emoji_reserved}\n"
-            f"Pending: {scrim.emoji_pending}\n"
-            f"Confirmed: {scrim.emoji_confirmed}\n\n"
-            "Choose a status to edit."
+            f"**Custom Emojis — {_safe_name(scrim.name)}**\n"
+            "Choose the type of emoji customization."
         )
+
+    def _validate_scrim_emoji(interaction: discord.Interaction, emoji: str) -> None:
+        parsed = discord.PartialEmoji.from_str(emoji)
+        if parsed.id is None:
+            return
+        guild = interaction.guild
+        if guild is None or guild.id != interaction.guild_id:
+            raise ValueError("Open this emoji editor in the scrim's server.")
+        server_emoji = guild.get_emoji(parsed.id)
+        if server_emoji is None:
+            raise ValueError(
+                "Custom emojis must belong to this server. Unicode emojis may be used anywhere."
+            )
+        if not server_emoji.is_usable():
+            raise ValueError("The bot cannot use that emoji in this server.")
+
+    async def _publish_emoji_update(scrim) -> None:
+        if not scrim.is_configured or scrim.public_message_id is None:
+            return
+        try:
+            await publish_scrim(scrim)
+        except Exception:
+            logger.exception("Could not refresh the scrim board after an emoji update")
+
+    class EmojiValueModal(discord.ui.Modal):
+        value = discord.ui.TextInput(
+            label="Emoji",
+            placeholder="Paste one emoji or a server emoji like <:name:123456>",
+            required=True,
+            max_length=100,
+        )
+
+        def __init__(
+            self,
+            owner_id: int,
+            guild_id: int,
+            scrim_id: str,
+            *,
+            title: str,
+            save_kind: str,
+            field_name: str | None = None,
+            slot_number: int | None = None,
+        ):
+            super().__init__(title=title[:45], timeout=300)
+            self.owner_id = owner_id
+            self.guild_id = guild_id
+            self.scrim_id = scrim_id
+            self.save_kind = save_kind
+            self.field_name = field_name
+            self.slot_number = slot_number
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            if not setup_authorized(interaction, self.owner_id, self.guild_id):
+                await _deny(interaction)
+                return
+            scrim = repository.get(self.scrim_id)
+            if scrim is None or scrim.guild_id != self.guild_id:
+                await interaction.response.send_message(
+                    "That scrim no longer exists.", ephemeral=True
+                )
+                return
+            emoji = _extract_setup_emoji(str(self.value.value))
+            if emoji is None:
+                await interaction.response.send_message(
+                    "No emoji was found. Nothing was changed.", ephemeral=True
+                )
+                return
+            try:
+                _validate_scrim_emoji(interaction, emoji)
+                if self.save_kind == "status":
+                    updated = repository.save_scrim_emoji(
+                        self.scrim_id, self.guild_id, self.field_name, emoji
+                    )
+                elif self.save_kind == "registration":
+                    updated = repository.save_registration_emoji(
+                        self.scrim_id, self.guild_id, self.field_name, emoji
+                    )
+                else:
+                    updated = repository.save_slot_number_emoji(
+                        self.scrim_id, self.guild_id, self.slot_number, emoji
+                    )
+            except (SlotStorageError, ValueError) as error:
+                await interaction.response.send_message(
+                    str(error), ephemeral=True
+                )
+                return
+            await _publish_emoji_update(updated)
+            await interaction.response.send_message(
+                f"✅ Emoji saved for **{_safe_name(updated.name)}**.",
+                ephemeral=True,
+            )
+
+    class SlotNumberModal(discord.ui.Modal, title="Choose a slot number"):
+        number = discord.ui.TextInput(
+            label="Slot number",
+            placeholder="Enter a number from 1 to 99",
+            required=True,
+            max_length=2,
+        )
+
+        def __init__(self, panel, owner_id: int, guild_id: int, scrim_id: str):
+            super().__init__(timeout=300)
+            self.panel = panel
+            self.owner_id = owner_id
+            self.guild_id = guild_id
+            self.scrim_id = scrim_id
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            if not setup_authorized(interaction, self.owner_id, self.guild_id):
+                await _deny(interaction)
+                return
+            try:
+                number = int(str(self.number.value).strip())
+            except ValueError:
+                await interaction.response.send_message(
+                    "Enter a whole slot number from 1 to 99.", ephemeral=True
+                )
+                return
+            if not 1 <= number <= 99:
+                await interaction.response.send_message(
+                    "Enter a whole slot number from 1 to 99.", ephemeral=True
+                )
+                return
+            scrim = repository.get(self.scrim_id)
+            if scrim is None or scrim.guild_id != self.guild_id:
+                await interaction.response.send_message(
+                    "That scrim no longer exists.", ephemeral=True
+                )
+                return
+            if (
+                scrim.slot_start is not None
+                and scrim.slot_end is not None
+                and not scrim.slot_start <= number <= scrim.slot_end
+            ):
+                await interaction.response.send_message(
+                    f"Choose a slot within the configured range "
+                    f"{scrim.slot_start:02d}–{scrim.slot_end:02d}.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                f"Choose an emoji to replace slot **{number:02d}**. "
+                "The replacement applies when that slot is configured.",
+                view=SlotNumberEmojiEntryView(
+                    self.panel, self.owner_id, self.guild_id, self.scrim_id, number
+                ),
+                ephemeral=True,
+            )
 
     class CustomEmojiMenuView(BoundView):
         def __init__(
@@ -3404,125 +3852,332 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             self.panel = panel
             self.scrim_id = scrim_id
 
-            async def edit_emoji(
-                interaction: discord.Interaction, field_name: str
-            ) -> None:
-                if not await self.interaction_check(interaction):
-                    return
-                scrim = repository.get(self.scrim_id)
-                if scrim is None or scrim.guild_id != self.guild_id:
-                    await _send_error(
-                        interaction,
-                        ValueError("The selected scrim no longer exists."),
-                    )
-                    return
-                await interaction.response.send_message(
-                    "Please mention me and send the new emoji "
-                    "(e.g., `@ARC_Bot <:my_emoji:123>`). "
-                    "To cancel, type `@ARC_Bot cancel`.",
-                    ephemeral=True,
-                )
-
-                def check(message: discord.Message) -> bool:
-                    bot_user = bot.user
-                    return bool(
-                        message.author.id == interaction.user.id
-                        and message.channel.id == interaction.channel_id
-                        and bot_user is not None
-                        and bot_user.mentioned_in(message)
-                    )
-
-                try:
-                    message = await bot.wait_for(
-                        'message', check=check, timeout=60.0
-                    )
-                except asyncio.TimeoutError:
-                    result = "Emoji edit timed out."
-                    message = None
-                else:
-                    if "cancel" in message.content.casefold():
-                        result = "Emoji edit cancelled."
-                    else:
-                        emoji = extract_raw_emoji(message.content)
-                        if emoji is None:
-                            result = (
-                                "No custom or Unicode emoji was found. "
-                                "The emoji was not changed."
-                            )
-                        else:
-                            try:
-                                updated_scrim = repository.save_scrim_emoji(
-                                    self.scrim_id, self.guild_id, field_name, emoji
-                                )
-                            except (SlotStorageError, ValueError):
-                                logger.exception("Could not save custom legend emoji")
-                                result = "The emoji could not be saved."
-                            else:
-                                if updated_scrim.public_message_id is not None:
-                                    try:
-                                        await publish_scrim(updated_scrim)
-                                    except Exception:
-                                        logger.exception(
-                                            "Could not refresh the scrim board after "
-                                            "updating its legend emoji"
-                                        )
-                                result = None
-
-                try:
-                    await interaction.delete_original_response()
-                except discord.HTTPException:
-                    logger.exception("Could not delete the emoji edit prompt")
-                if message is not None:
-                    try:
-                        await message.delete()
-                    except (
-                        discord.NotFound,
-                        discord.Forbidden,
-                        discord.HTTPException,
-                    ):
-                        pass
-                if result:
-                    try:
-                        await interaction.followup.send(result, ephemeral=True)
-                    except discord.HTTPException:
-                        logger.exception("Could not report emoji edit result")
-                scrim = repository.get(self.scrim_id)
-                if scrim is not None and interaction.message is not None:
-                    try:
-                        await interaction.message.edit(
-                            content=custom_emoji_content(scrim),
-                            view=CustomEmojiMenuView(
-                                self.panel,
-                                self.owner_id,
-                                self.guild_id,
-                                self.scrim_id,
-                            ),
-                        )
-                    except discord.HTTPException:
-                        logger.exception("Could not refresh custom emoji menu")
-
-            buttons = (
-                ("Edit Available", "emoji_available"),
-                ("Edit Reserved", "emoji_reserved"),
-                ("Edit Pending", "emoji_pending"),
-                ("Edit Confirmed", "emoji_confirmed"),
+            status_button = discord.ui.Button(
+                label="Slot Status Emojis", emoji="🟢",
+                style=discord.ButtonStyle.primary, row=0,
             )
-            for label, field_name in buttons:
-                button = discord.ui.Button(
-                    label=label,
-                    style=discord.ButtonStyle.secondary,
-                    row=0,
-                )
-                button.callback = lambda interaction, field_name=field_name: (
-                    edit_emoji(interaction, field_name)
-                )
-                self.add_item(button)
+
+            async def status_callback(interaction: discord.Interaction) -> None:
+                if await self.interaction_check(interaction):
+                    await interaction.response.edit_message(
+                        content="Customize Available, Reserved, Pending, or Confirmed slot status.",
+                        embed=None,
+                        view=SlotStatusEmojiView(
+                            self.panel, self.owner_id, self.guild_id, self.scrim_id
+                        ),
+                    )
+
+            status_button.callback = status_callback
+            self.add_item(status_button)
+
+            number_button = discord.ui.Button(
+                label="Slot Number Emojis", emoji="🔢",
+                style=discord.ButtonStyle.primary, row=0,
+            )
+
+            async def number_callback(interaction: discord.Interaction) -> None:
+                if await self.interaction_check(interaction):
+                    await interaction.response.edit_message(
+                        content=(
+                            "Choose a slot number from 1 to 99, then set or clear "
+                            "that slot's emoji."
+                        ),
+                        embed=None,
+                        view=SlotNumberEmojiView(
+                            self.panel, self.owner_id, self.guild_id, self.scrim_id
+                        ),
+                    )
+
+            number_button.callback = number_callback
+            self.add_item(number_button)
+
+            registration_button = discord.ui.Button(
+                label="Registration Status", emoji="📝",
+                style=discord.ButtonStyle.primary, row=0,
+            )
+
+            async def registration_callback(interaction: discord.Interaction) -> None:
+                if await self.interaction_check(interaction):
+                    await interaction.response.edit_message(
+                        content=(
+                            "Customize the staff-review OK emoji and the accepted "
+                            "emoji used after a registration succeeds."
+                        ),
+                        embed=None,
+                        view=RegistrationEmojiView(
+                            self.panel, self.owner_id, self.guild_id, self.scrim_id
+                        ),
+                    )
+
+            registration_button.callback = registration_callback
+            self.add_item(registration_button)
 
             reset = discord.ui.Button(
-                label="Reset to Defaults",
-                emoji="🔄",
-                style=discord.ButtonStyle.danger,
-                row=1,
+                label="Restore All Emoji Defaults", emoji="🔄",
+                style=discord.ButtonStyle.danger, row=1,
+            )
+
+            async def reset_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                try:
+                    scrim = repository.reset_scrim_settings(
+                        self.scrim_id, self.guild_id, "emojis"
+                    )
+                except (SlotStorageError, ValueError) as error:
+                    await _send_error(interaction, error)
+                    return
+                await _publish_emoji_update(scrim)
+                await interaction.response.edit_message(
+                    content=custom_emoji_content(scrim),
+                    embed=None,
+                    view=CustomEmojiMenuView(
+                        self.panel, self.owner_id, self.guild_id, self.scrim_id
+                    ),
+                )
+
+            reset.callback = reset_callback
+            self.add_item(reset)
+
+            back = discord.ui.Button(
+                label="Back to Additional Settings", emoji="↩️",
+                style=discord.ButtonStyle.secondary, row=1,
+            )
+
+            async def back_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                view = AdditionalSettingsMenuView(
+                    self.panel, self.owner_id, self.guild_id, self.scrim_id
+                )
+                await interaction.response.edit_message(
+                    content=view.content(), embed=view.embed(), view=view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+            back.callback = back_callback
+            self.add_item(back)
+
+    class SlotStatusEmojiView(BoundView):
+        def __init__(self, panel, owner_id: int, guild_id: int, scrim_id: str):
+            super().__init__(owner_id, guild_id, timeout=600)
+            self.panel = panel
+            self.scrim_id = scrim_id
+            fields = (
+                ("Available", "emoji_available"),
+                ("Reserved", "emoji_reserved"),
+                ("Pending", "emoji_pending"),
+                ("Confirmed", "emoji_confirmed"),
+            )
+            for label, field_name in fields:
+                button = discord.ui.Button(
+                    label=f"Edit {label}", style=discord.ButtonStyle.secondary, row=0
+                )
+
+                async def edit_callback(
+                    interaction: discord.Interaction, field_name=field_name, label=label
+                ) -> None:
+                    if await self.interaction_check(interaction):
+                        await interaction.response.send_modal(
+                            EmojiValueModal(
+                                self.owner_id, self.guild_id, self.scrim_id,
+                                title=f"Edit {label} emoji", save_kind="status",
+                                field_name=field_name,
+                            )
+                        )
+
+                button.callback = edit_callback
+                self.add_item(button)
+            reset = discord.ui.Button(
+                label="Restore Status Defaults", emoji="🔄",
+                style=discord.ButtonStyle.danger, row=1,
+            )
+
+            async def reset_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                try:
+                    for field, value in (
+                        ("emoji_available", DEFAULT_EMOJI_AVAILABLE),
+                        ("emoji_reserved", DEFAULT_EMOJI_RESERVED),
+                        ("emoji_pending", DEFAULT_EMOJI_PENDING),
+                        ("emoji_confirmed", DEFAULT_EMOJI_CONFIRMED),
+                    ):
+                        scrim = repository.save_scrim_emoji(
+                            self.scrim_id, self.guild_id, field, value
+                        )
+                except (SlotStorageError, ValueError) as error:
+                    await _send_error(interaction, error)
+                    return
+                await _publish_emoji_update(scrim)
+                await interaction.response.edit_message(
+                    content="Slot status emojis restored to defaults.",
+                    view=CustomEmojiMenuView(
+                        self.panel, self.owner_id, self.guild_id, self.scrim_id
+                    ),
+                )
+
+            reset.callback = reset_callback
+            self.add_item(reset)
+            _add_custom_emoji_back(self, panel, owner_id, guild_id, scrim_id)
+
+    def _add_custom_emoji_back(view, panel, owner_id, guild_id, scrim_id) -> None:
+        button = discord.ui.Button(
+            label="Back to Emoji Menu", emoji="↩️",
+            style=discord.ButtonStyle.secondary, row=1,
+        )
+
+        async def callback(interaction: discord.Interaction) -> None:
+            if await view.interaction_check(interaction):
+                menu = CustomEmojiMenuView(panel, owner_id, guild_id, scrim_id)
+                await interaction.response.edit_message(
+                    content=custom_emoji_content(repository.get(scrim_id)),
+                    embed=None,
+                    view=menu,
+                )
+
+        button.callback = callback
+        view.add_item(button)
+
+    class RegistrationEmojiView(BoundView):
+        def __init__(self, panel, owner_id: int, guild_id: int, scrim_id: str):
+            super().__init__(owner_id, guild_id, timeout=600)
+            self.panel = panel
+            self.scrim_id = scrim_id
+            for label, field in (
+                ("Staff Review OK", "emoji_registration_ok"),
+                ("Accepted", "emoji_registration_accepted"),
+            ):
+                button = discord.ui.Button(
+                    label=f"Edit {label}", style=discord.ButtonStyle.secondary, row=0
+                )
+
+                async def edit_callback(
+                    interaction: discord.Interaction,
+                    field=field,
+                    label=label,
+                ) -> None:
+                    if await self.interaction_check(interaction):
+                        await interaction.response.send_modal(
+                            EmojiValueModal(
+                                self.owner_id, self.guild_id, self.scrim_id,
+                                title=f"Edit {label} emoji", save_kind="registration",
+                                field_name=field,
+                            )
+                        )
+
+                button.callback = edit_callback
+                self.add_item(button)
+            reset = discord.ui.Button(
+                label="Restore Registration Defaults", emoji="🔄",
+                style=discord.ButtonStyle.danger, row=1,
+            )
+
+            async def reset_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                try:
+                    scrim = repository.save_registration_emoji(
+                        self.scrim_id, self.guild_id,
+                        "emoji_registration_ok", DEFAULT_EMOJI_REGISTRATION_OK,
+                    )
+                    scrim = repository.save_registration_emoji(
+                        self.scrim_id, self.guild_id,
+                        "emoji_registration_accepted",
+                        DEFAULT_EMOJI_REGISTRATION_ACCEPTED,
+                    )
+                except (SlotStorageError, ValueError) as error:
+                    await _send_error(interaction, error)
+                    return
+                await _publish_emoji_update(scrim)
+                await interaction.response.edit_message(
+                    content="Registration emojis restored to defaults.",
+                    view=CustomEmojiMenuView(
+                        self.panel, self.owner_id, self.guild_id, self.scrim_id
+                    ),
+                )
+
+            reset.callback = reset_callback
+            self.add_item(reset)
+            _add_custom_emoji_back(self, panel, owner_id, guild_id, scrim_id)
+
+    class SlotNumberEmojiEntryView(BoundView):
+        def __init__(
+            self, panel, owner_id: int, guild_id: int, scrim_id: str, slot_number: int
+        ):
+            super().__init__(owner_id, guild_id, timeout=600)
+            self.panel = panel
+            self.scrim_id = scrim_id
+            self.slot_number = slot_number
+            set_button = discord.ui.Button(
+                label="Set Slot Emoji", emoji="🎨",
+                style=discord.ButtonStyle.primary, row=0,
+            )
+
+            async def set_callback(interaction: discord.Interaction) -> None:
+                if await self.interaction_check(interaction):
+                    await interaction.response.send_modal(
+                        EmojiValueModal(
+                            self.owner_id, self.guild_id, self.scrim_id,
+                            title=f"Slot {self.slot_number:02d} emoji",
+                            save_kind="slot",
+                            slot_number=self.slot_number,
+                        )
+                    )
+
+            set_button.callback = set_callback
+            self.add_item(set_button)
+            clear_button = discord.ui.Button(
+                label="Use Slot Number Text", emoji="🔢",
+                style=discord.ButtonStyle.secondary, row=0,
+            )
+
+            async def clear_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                try:
+                    scrim = repository.save_slot_number_emoji(
+                        self.scrim_id, self.guild_id, self.slot_number, None
+                    )
+                except (SlotStorageError, ValueError) as error:
+                    await _send_error(interaction, error)
+                    return
+                await _publish_emoji_update(scrim)
+                await interaction.response.edit_message(
+                    content=(
+                        f"Slot **{self.slot_number:02d}** will display its number "
+                        "as text again."
+                    ),
+                    view=self,
+                )
+
+            clear_button.callback = clear_callback
+            self.add_item(clear_button)
+            _add_custom_emoji_back(self, panel, owner_id, guild_id, scrim_id)
+
+    class SlotNumberEmojiView(BoundView):
+        def __init__(self, panel, owner_id: int, guild_id: int, scrim_id: str):
+            super().__init__(owner_id, guild_id, timeout=600)
+            self.panel = panel
+            self.scrim_id = scrim_id
+            choose = discord.ui.Button(
+                label="Choose Slot Number", emoji="🔢",
+                style=discord.ButtonStyle.primary, row=0,
+            )
+
+            async def choose_callback(interaction: discord.Interaction) -> None:
+                if await self.interaction_check(interaction):
+                    await interaction.response.send_modal(
+                        SlotNumberModal(
+                            self.panel, self.owner_id, self.guild_id, self.scrim_id
+                        )
+                    )
+
+            choose.callback = choose_callback
+            self.add_item(choose)
+            reset = discord.ui.Button(
+                label="Restore Slot Number Defaults", emoji="🔄",
+                style=discord.ButtonStyle.danger, row=1,
             )
 
             async def reset_callback(interaction: discord.Interaction) -> None:
@@ -3530,77 +4185,29 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     return
                 scrim = repository.get(self.scrim_id)
                 if scrim is None or scrim.guild_id != self.guild_id:
-                    await _send_error(
-                        interaction,
-                        ValueError("The selected scrim no longer exists."),
+                    await interaction.response.send_message(
+                        "That scrim no longer exists.", ephemeral=True
                     )
                     return
                 try:
-                    scrim = repository.reset_scrim_emojis(
-                        self.scrim_id, self.guild_id
-                    )
-                except (SlotStorageError, ValueError):
-                    logger.exception("Could not reset custom legend emojis")
-                    await _send_error(
-                        interaction,
-                        ValueError("The emojis could not be reset."),
-                    )
+                    for number in list(scrim.slot_number_emojis):
+                        scrim = repository.save_slot_number_emoji(
+                            self.scrim_id, self.guild_id, int(number), None
+                        )
+                except (SlotStorageError, ValueError) as error:
+                    await _send_error(interaction, error)
                     return
+                await _publish_emoji_update(scrim)
                 await interaction.response.edit_message(
-                    content=custom_emoji_content(scrim),
+                    content="Slot number emoji overrides cleared.",
                     view=CustomEmojiMenuView(
-                        self.panel,
-                        self.owner_id,
-                        self.guild_id,
-                        self.scrim_id,
+                        self.panel, self.owner_id, self.guild_id, self.scrim_id
                     ),
                 )
-                try:
-                    confirmation = await interaction.followup.send(
-                        "✅ Emojis have been reset to default.",
-                        ephemeral=True,
-                        wait=True,
-                    )
-                    if confirmation is not None:
-                        await confirmation.delete(delay=5)
-                except (
-                    discord.NotFound,
-                    discord.Forbidden,
-                    discord.HTTPException,
-                ):
-                    logger.exception("Could not report emoji reset")
 
             reset.callback = reset_callback
             self.add_item(reset)
-
-            back = discord.ui.Button(
-                label="Back to Additional Settings",
-                emoji="↩️",
-                style=discord.ButtonStyle.primary,
-                row=2,
-            )
-
-            async def back_callback(interaction: discord.Interaction) -> None:
-                if not await self.interaction_check(interaction):
-                    return
-                scrim = repository.get(self.scrim_id)
-                if scrim is None or scrim.guild_id != self.guild_id:
-                    await interaction.response.edit_message(
-                        content="That scrim no longer exists.", view=None
-                    )
-                    return
-                edit_view = AdditionalSettingsMenuView(
-                    self.panel, self.owner_id, self.guild_id, self.scrim_id
-                )
-                await interaction.response.edit_message(
-                    content=edit_view.content(),
-                    embed=edit_view.embed(),
-                    view=edit_view,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-
-            back.callback = back_callback
-            self.add_item(back)
+            _add_custom_emoji_back(self, panel, owner_id, guild_id, scrim_id)
 
     class IdPwPasswordModal(discord.ui.Modal, title="Set match password"):
         password = discord.ui.TextInput(
@@ -4806,7 +5413,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 f"Staff channel: {_channel_ref(scrim.staff_channel_id)}\n"
                 f"Logs channel: {_channel_ref(scrim.logs_channel_id)}\n"
                 f"History channel: {_channel_ref(scrim.history_channel_id)}\n\n"
-                f"Slots: {scrim.slot_start:02d}–{scrim.slot_end:02d} "
+                f"Slots: "
+                f"{f'{scrim.slot_start:02d}–{scrim.slot_end:02d}' if scrim.slot_start is not None and scrim.slot_end is not None else 'not configured'} "
                 f"({len(scrim.slots)} total)\n"
                 f"Games: {scrim.max_matches}\n"
                 f"Maps: {', '.join(scrim.maps)}\n\n"
@@ -5023,8 +5631,14 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             self.edit_view = edit_view
             scrim = repository.get(edit_view.scrim_id)
             if scrim is not None:
-                self.slot_start.default = f"{scrim.slot_start:02d}"
-                self.slot_count.default = str(scrim.slot_end - scrim.slot_start + 1)
+                self.slot_start.default = (
+                    f"{scrim.slot_start:02d}" if scrim.slot_start is not None else ""
+                )
+                self.slot_count.default = (
+                    str(scrim.slot_end - scrim.slot_start + 1)
+                    if scrim.slot_start is not None and scrim.slot_end is not None
+                    else ""
+                )
 
         async def on_submit(self, interaction: discord.Interaction) -> None:
             if not setup_authorized(

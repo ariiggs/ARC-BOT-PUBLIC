@@ -196,6 +196,118 @@ def is_active(scrim: Scrim) -> bool:
     return not scrim.deleted and repository.get(scrim.id) is scrim
 
 
+def scrim_configuration_errors(scrim: Scrim) -> tuple[str, ...]:
+    """Return the missing required values that keep one scrim paused.
+
+    The storage model's readiness helper is authoritative when present. The
+    field checks below retain compatibility with older model instances and make
+    runtime gates fail closed when required values have explicitly been cleared.
+    Lightweight legacy callers that do not expose setup fields remain usable.
+    """
+    missing = getattr(scrim, "missing_required_settings", None)
+    if missing is not None:
+        try:
+            values = tuple(missing)
+        except TypeError:
+            values = ()
+        if values:
+            return values
+    is_configured = getattr(scrim, "is_configured", None)
+    if isinstance(is_configured, bool) and is_configured:
+        return ()
+    ready = getattr(scrim, "configuration_ready", None)
+    if callable(ready):
+        try:
+            if ready():
+                return ()
+        except (TypeError, ValueError):
+            pass
+
+    required = (
+        ("name", "scrim name"),
+        ("public_channel_id", "public slots channel"),
+        ("staff_channel_id", "staff channel"),
+        ("pending_role_id", "pending captain role"),
+        ("confirmed_role_id", "confirmed captain role"),
+        ("slot_start", "slot range"),
+        ("slot_end", "slot range"),
+    )
+    errors = tuple(
+        label
+        for field, label in required
+        if hasattr(scrim, field)
+        and (
+            getattr(scrim, field) is None
+            or (field == "name" and not str(getattr(scrim, field)).strip())
+        )
+    )
+    if not any(hasattr(scrim, field) for field, _ in required):
+        return ()
+    if errors:
+        return tuple(dict.fromkeys(errors))
+    return ("required settings",) if callable(ready) or is_configured is False else ()
+
+
+def scrim_configuration_ready(scrim: Scrim) -> bool:
+    return not scrim_configuration_errors(scrim)
+
+
+def pause_scrim_if_unconfigured(scrim: Scrim) -> tuple[str, ...]:
+    """Persist a closed runtime state whenever required configuration is absent."""
+    errors = scrim_configuration_errors(scrim)
+    if not errors:
+        return ()
+    if is_active(scrim) and (
+        getattr(scrim, "is_open", False)
+        or getattr(scrim, "registration_open", False)
+    ):
+        with repository.transaction():
+            if is_active(scrim):
+                scrim.is_open = False
+                scrim.registration_open = False
+    return errors
+
+
+def emoji_is_available_in_guild(emoji: str | None, guild: object | None) -> bool:
+    """Unicode emoji are universal; custom emoji must belong to this guild."""
+    if not isinstance(emoji, str) or not emoji.strip():
+        return False
+    match = re.fullmatch(r"<a?:[A-Za-z0-9_]{2,32}:(\d+)>", emoji.strip())
+    if match is None:
+        return not emoji.strip().startswith("<")
+    if guild is None:
+        return False
+    emoji_id = int(match.group(1))
+    get_emoji = getattr(guild, "get_emoji", None)
+    if get_emoji is not None:
+        return get_emoji(emoji_id) is not None
+    return any(getattr(item, "id", None) == emoji_id for item in getattr(guild, "emojis", ()))
+
+
+def configured_emoji(
+    scrim: Scrim,
+    field_name: str,
+    default: str,
+) -> str:
+    aliases = {
+        "registration_ok_emoji": "emoji_registration_ok",
+        "registration_accepted_emoji": "emoji_registration_accepted",
+    }
+    emoji = getattr(scrim, field_name, getattr(scrim, aliases.get(field_name, ""), None))
+    get_guild = getattr(bot, "get_guild", None)
+    guild = get_guild(getattr(scrim, "guild_id", 0)) if get_guild else None
+    if emoji_is_available_in_guild(emoji, guild):
+        return emoji
+    return default
+
+
+def registration_success_reaction(scrim: Scrim, *, accepted: bool) -> str:
+    """Select the success reaction for auto-accept or staff-review registration."""
+    if accepted:
+        return configured_emoji(scrim, "registration_accepted_emoji", "✅")
+    return configured_emoji(scrim, "registration_ok_emoji", "🆗")
+
+
 def assignment_fingerprint(scrim: Scrim) -> str:
     generations = ",".join(
         f"{slot.number}:{slot.assignment_id}" for slot in scrim.slots.values()
@@ -210,12 +322,13 @@ def slot_status_emoji(scrim: Scrim, slot: Slot | SlotSnapshot) -> str:
         STATUS_PENDING: "emoji_pending",
         STATUS_CONFIRMED: "emoji_confirmed",
     }.get(slot.status, "emoji_available")
-    return getattr(scrim, field_name, {
+    fallback = {
         "emoji_available": "⚪",
         "emoji_reserved": "🔵",
         "emoji_pending": "🟠",
         "emoji_confirmed": "🟢",
-    }[field_name])
+    }[field_name]
+    return configured_emoji(scrim, field_name, fallback)
 
 
 def slot_status_label(slot: Slot | SlotSnapshot) -> str:
@@ -280,7 +393,19 @@ class ExpiringView(discord.ui.View):
 
 
 def slot_display_line(scrim: Scrim, slot: Slot) -> str:
-    prefix = f"`{slot.number:02d}`{FIGURE_SPACE}{slot_status_emoji(scrim, slot)}"
+    number_emojis = getattr(scrim, "slot_number_emojis", {}) or {}
+    number_emoji = number_emojis.get(
+        str(slot.number), number_emojis.get(slot.number)
+    )
+    get_guild = getattr(bot, "get_guild", None)
+    if emoji_is_available_in_guild(
+        number_emoji,
+        get_guild(getattr(scrim, "guild_id", 0)) if get_guild else None,
+    ):
+        number_text = number_emoji
+    else:
+        number_text = f"`{slot.number:02d}`"
+    prefix = f"{number_text}{FIGURE_SPACE}{slot_status_emoji(scrim, slot)}"
     if slot.status == STATUS_AVAILABLE:
         return prefix
     tag = slot.tag or "—"
@@ -304,17 +429,24 @@ def slot_display_line(scrim: Scrim, slot: Slot) -> str:
 
 def build_slots_message(scrim: Scrim) -> str:
     emojis = {
-        "available": scrim.emoji_available,
-        "reserved": scrim.emoji_reserved,
-        "pending": scrim.emoji_pending,
-        "confirmed": scrim.emoji_confirmed,
+        "available": configured_emoji(scrim, "emoji_available", "⚪"),
+        "reserved": configured_emoji(scrim, "emoji_reserved", "🔵"),
+        "pending": configured_emoji(scrim, "emoji_pending", "🟠"),
+        "confirmed": configured_emoji(scrim, "emoji_confirmed", "🟢"),
     }
     legend = (
         f"{emojis['available']} Available · {emojis['reserved']} Reserved · "
         f"{emojis['pending']} Pending · {emojis['confirmed']} Confirmed"
     )
+    heading = f"**{discord.utils.escape_markdown(scrim.name or 'Scrim setup incomplete')}**"
+    missing = scrim_configuration_errors(scrim)
+    if missing:
+        heading += (
+            "\n⚠️ **Scrim paused:** required settings are missing. "
+            "Complete `!setup` before opening slots or registrations."
+        )
     return (
-        f"**{discord.utils.escape_markdown(scrim.name)}**\n"
+        f"{heading}\n"
         f"{legend}\n\n"
         + "\n".join(
             slot_display_line(scrim, slot) for slot in scrim.slots.values()
@@ -457,6 +589,18 @@ async def require_staff_scrim(
             silent=silent,
         )
         return None
+    command_name = getattr(getattr(ctx, "command", None), "name", "")
+    if command_name not in {"close", "c", "reset"}:
+        missing = pause_scrim_if_unconfigured(scrim)
+        if missing:
+            await send_private_command_feedback(
+                ctx,
+                "This scrim is paused because required settings are missing: "
+                + ", ".join(missing)
+                + ". Complete the !setup configuration before using it.",
+                silent=silent,
+            )
+            return None
     return scrim
 
 
@@ -1185,12 +1329,24 @@ async def require_registration_staff_channel(
             silent=True,
         )
         return None
+    command_name = getattr(getattr(ctx, "command", None), "name", "")
+    if command_name not in {"close", "c"} and scrim_configuration_errors(scrim):
+        pause_scrim_if_unconfigured(scrim)
+        await send_private_command_feedback(
+            ctx,
+            "This scrim is paused because required settings are missing. "
+            "Complete the !setup configuration before using registrations.",
+            silent=False,
+        )
+        return None
     return scrim
 
 
 async def set_registration_channel_open(
     ctx: commands.Context, scrim: Scrim, is_open: bool
 ) -> bool:
+    if is_open and pause_scrim_if_unconfigured(scrim):
+        return False
     role_id = getattr(scrim, "registration_role_id", None)
     if role_id is None or ctx.guild is None:
         return False
@@ -2111,6 +2267,9 @@ async def refresh_public_slots(scrim: Scrim) -> bool:
 async def refresh_public_slots_locked(scrim: Scrim, *, create: bool = False) -> bool:
     if not is_active(scrim):
         return False
+    pause_scrim_if_unconfigured(scrim)
+    if scrim.public_channel_id is None:
+        return False
     try:
         channel = await configured_text_channel(scrim, scrim.public_channel_id)
         if channel is None or not is_active(scrim):
@@ -2707,6 +2866,15 @@ class SlotReviewView(DurableView):
         return allowed
 
     async def finish_review(self, interaction: discord.Interaction, confirm: bool) -> None:
+        missing = pause_scrim_if_unconfigured(self.scrim)
+        if missing:
+            await interaction.response.send_message(
+                "This scrim is paused because required settings are missing: "
+                + ", ".join(missing)
+                + ".",
+                ephemeral=True,
+            )
+            return
         await interaction.response.defer(ephemeral=True)
         result: SlotSnapshot | None = None
         registration_member_id: int | None = None
@@ -2881,10 +3049,23 @@ async def update_registration_reaction(
         if channel is None:
             return False
         message = await channel.fetch_message(request.registration_message_id)
-        await message.add_reaction("✅" if approved else "❌")
+        accepted_emoji = (
+            registration_success_reaction(scrim, accepted=True)
+            if approved
+            else "❌"
+        )
+        await message.add_reaction(accepted_emoji)
         bot_user = getattr(bot, "user", None)
         if bot_user is not None:
-            await message.remove_reaction("🆗", bot_user)
+            for old_emoji in {
+                configured_emoji(scrim, "registration_ok_emoji", "🆗"),
+                "🆗",
+            }:
+                if old_emoji != accepted_emoji:
+                    try:
+                        await message.remove_reaction(old_emoji, bot_user)
+                    except discord.NotFound:
+                        continue
         return True
     except (discord.NotFound, discord.Forbidden, discord.HTTPException, AttributeError):
         logger.exception(
@@ -2973,6 +3154,7 @@ class ManagerSlotView(DurableView):
     def __init__(self, scrim: Scrim) -> None:
         super().__init__(timeout=None)
         self.scrim = scrim
+        pause_scrim_if_unconfigured(scrim)
         self.assignments = {
             slot.number: slot.snapshot() for slot in scrim.slots.values()
             if not slot_is_assignable(slot)
@@ -2993,6 +3175,15 @@ class ManagerSlotView(DurableView):
         cancellation_confirmed: bool = False,
         expected_board_id: int | None = None,
     ) -> None:
+        missing = pause_scrim_if_unconfigured(self.scrim)
+        if missing:
+            await interaction.response.send_message(
+                "This scrim is paused because required settings are missing: "
+                + ", ".join(missing)
+                + ".",
+                ephemeral=True,
+            )
+            return
         if not (
             interaction_matches_scrim(interaction, self.scrim)
             if assignment is None
@@ -3271,6 +3462,15 @@ class ManagerActionButton(
                 "This scrim no longer exists.", ephemeral=True
             )
             return
+        missing = pause_scrim_if_unconfigured(scrim)
+        if missing:
+            await interaction.response.send_message(
+                "This scrim is paused because required settings are missing: "
+                + ", ".join(missing)
+                + ".",
+                ephemeral=True,
+            )
+            return
         view = ManagerSlotView(scrim)
         try:
             if not interaction_matches_scrim(interaction, scrim):
@@ -3533,6 +3733,16 @@ async def open_scrim(ctx: commands.Context) -> None:
     registration_scrim = resolve_registration_scrim(ctx)
     if registration_scrim is not None:
         if await require_registration_staff_channel(ctx) is None:
+            return
+        missing = pause_scrim_if_unconfigured(registration_scrim)
+        if missing:
+            await send_private_command_feedback(
+                ctx,
+                "This scrim cannot be opened while required settings are missing: "
+                + ", ".join(missing)
+                + ". Complete the !setup configuration first.",
+                silent=False,
+            )
             return
         if not await set_registration_channel_open(ctx, registration_scrim, True):
             await send_private_command_feedback(
@@ -9848,6 +10058,10 @@ async def apply_add_entries(
     async with scrim.state_lock:
         if not is_active(scrim):
             unavailable.append("The scrim is no longer active.")
+        elif pause_scrim_if_unconfigured(scrim):
+            unavailable.append(
+                "The scrim is paused because required settings are missing."
+            )
         else:
             for entry in entries:
                 slot = scrim.slots.get(entry.slot_number)
@@ -9927,6 +10141,13 @@ async def apply_registration_entry(
     async with scrim.state_lock:
         if not is_active(scrim):
             return None, "The scrim is no longer active.", False, False
+        if pause_scrim_if_unconfigured(scrim):
+            return (
+                None,
+                "This scrim is paused because required settings are missing.",
+                False,
+                False,
+            )
         slot = scrim.slots.get(entry.slot_number)
         if slot is None or not registration_slot_is_available(scrim, slot):
             return None, "The selected slot is no longer available.", False, False
@@ -10191,6 +10412,16 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
             silent=False,
         )
         return
+    missing = pause_scrim_if_unconfigured(scrim)
+    if missing:
+        await send_private_command_feedback(
+            ctx,
+            "This scrim is paused because required settings are missing: "
+            + ", ".join(missing)
+            + ". Complete the !setup configuration before registering.",
+            silent=False,
+        )
+        return
     if not getattr(scrim, "registration_open", True):
         await send_private_command_feedback(
             ctx,
@@ -10278,9 +10509,11 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
     if add_reaction is not None:
         try:
             await add_reaction(
-                "✅"
-                if getattr(scrim, "registration_auto_accept", False) is True
-                else "🆗"
+                registration_success_reaction(
+                    scrim,
+                    accepted=getattr(scrim, "registration_auto_accept", False)
+                    is True,
+                )
             )
         except discord.HTTPException:
             logger.exception("Could not acknowledge successful registration.")
