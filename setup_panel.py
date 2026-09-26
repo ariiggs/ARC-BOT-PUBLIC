@@ -66,6 +66,7 @@ ADDITIONAL_SETTINGS_SECTIONS = (
     ("matches_maps", "Matches & Maps", "🎮"),
     ("registration", "Registrations", "📝"),
     ("idpw", "ID&PW", "🔐"),
+    ("emojis", "Custom Emojis", "🎨"),
 )
 
 
@@ -1112,6 +1113,16 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                             view=None,
                         )
                         return
+                    if section == "emojis":
+                        await interaction.response.edit_message(
+                            content=custom_emoji_content(self.scrim()),
+                            embed=None,
+                            view=CustomEmojiMenuView(
+                                self.panel, self.owner_id, self.guild_id, self.scrim_id
+                            ),
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                        return
                     edit_view = ScrimEditView(
                         self.panel,
                         self.owner_id,
@@ -1171,7 +1182,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 title=f"Additional Settings — {_safe_name(selected.name)}",
                 description=(
                     "Cap Transfer (`!cap`), Matches & Maps, Registrations, "
-                    "and ID&PW are optional. "
+                    "ID&PW, and Custom Emojis are optional. "
                     "This panel shows configuration only; live registration and "
                     "slot states are handled elsewhere."
                 ),
@@ -3563,7 +3574,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             self.add_item(reset)
 
             back = discord.ui.Button(
-                label="Back to Configuration",
+                label="Back to Additional Settings",
                 emoji="↩️",
                 style=discord.ButtonStyle.primary,
                 row=2,
@@ -3578,11 +3589,12 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                         content="That scrim no longer exists.", view=None
                     )
                     return
-                edit_view = ScrimEditView(
+                edit_view = AdditionalSettingsMenuView(
                     self.panel, self.owner_id, self.guild_id, self.scrim_id
                 )
                 await interaction.response.edit_message(
                     content=edit_view.content(),
+                    embed=edit_view.embed(),
                     view=edit_view,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
