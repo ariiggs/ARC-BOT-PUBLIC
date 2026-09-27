@@ -113,6 +113,24 @@ class GuildAuthorizationTests(unittest.TestCase):
 
             self.assertEqual(repository.list_authorizations(), [(123, None, 0)])
 
+    def test_diamond_authorization_is_local_and_durable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SlotStateStore(Path(directory) / "state.sqlite3")
+            repository = ScrimRepository(store)
+            repository.load()
+
+            repository.authorize_guild(123, days=30, license_type="Diamond")
+            self.assertTrue(repository.is_guild_authorized(123))
+            self.assertEqual(repository.get_server_license_type(123), "Diamond")
+
+            reloaded = ScrimRepository(store)
+            reloaded.load()
+            self.assertEqual(
+                reloaded.list_authorizations(license_type="Diamond"),
+                repository.list_authorizations(license_type="Diamond"),
+            )
+            self.assertEqual(reloaded.get_server_license_type(123), "Diamond")
+
     def test_reauthorizing_replaces_and_renews_the_duration(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = ScrimRepository(
@@ -193,7 +211,7 @@ class GuildAuthorizationTests(unittest.TestCase):
             migrated = ScrimRepository(store)
             migrated.load()
             self.assertEqual(migrated.list_authorized_admin_ids(), [])
-            self.assertEqual(migrated.payload()["version"], 32)
+            self.assertEqual(migrated.payload()["version"], 34)
 
 
 if __name__ == "__main__":

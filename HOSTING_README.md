@@ -41,9 +41,12 @@ Le rôle du bot doit être placé au-dessus des rôles qu'il doit gérer.
 
 ## Premier démarrage
 
-1. Depuis un contexte accessible au propriétaire du bot, autoriser le serveur
-   avant de l'inviter avec `!auth add <Guild_ID> <Days|unlimited>`. La whitelist est vide
-   par défaut. La valeur `0` signifie que l'accès n'expire jamais.
+1. Ouvrir un DM avec chaque bot et envoyer `!auth`. Le bot Beta gère uniquement
+   ses propres licences, et le bot Public gère uniquement les siennes. Choisir
+   **Standard**, **Gold** ou **Diamond**, puis utiliser **Add** pour saisir l'ID
+   du serveur et sa durée. `0` ou `unlimited` signifie que l'accès n'expire
+   jamais. Le panneau est privé et n'est accessible qu'au propriétaire du bot
+   ou à un utilisateur ajouté avec `!admin add`.
 2. Le propriétaire du serveur lance `!set @Staff`.
 3. Les membres ayant le rôle Staff global lancent `!setup`.
 4. Créer un scrim et sélectionner son rôle Manager et ses salons.
@@ -55,6 +58,46 @@ Le rôle du bot doit être placé au-dessus des rôles qu'il doit gérer.
    - les salons logs et historique ;
    - le salon public dédié aux commandes `!cap`.
 6. Utiliser **Show/refresh slots** ou `!slots` pour publier le board.
+
+## Autorisations locales Beta et Public
+
+Chaque bot conserve ses autorisations dans sa propre base SQLite persistante
+`data/slots.sqlite3`. Le bot Beta et le bot Public ont chacun leur panneau
+`!auth` en DM ; aucune API Replit ni variable `ARC_AUTH_API_URL`,
+`ARC_AUTH_API_TOKEN` ou `ARC_AUTH_PRODUCT` n'est nécessaire pour les licences.
+Conserver le fichier SQLite existant de chaque hébergement lors des mises à
+jour : il contient également les scrims, les équipes et les réglages. Avant de
+retirer un ancien service partagé, vérifier les licences Standard, Gold et
+Diamond, ainsi que leurs expirations, dans le DM de **chaque** bot. Une
+autorisation créée uniquement dans un service partagé n'est pas copiée
+automatiquement dans les fichiers SQLite des hébergements.
+
+Les commandes `!admin` sont masquées et réservées au propriétaire du bot :
+
+```text
+!admin add @User
+!admin remove @User
+!admin list
+```
+
+Elles gèrent les utilisateurs autorisés à administrer la whitelist. `!auth`
+ouvre en DM le panneau privé des autorisations locales de ce bot. Le
+propriétaire du bot peut ajouter ou modifier une autorisation ; le propriétaire
+et les utilisateurs ajoutés avec `!admin add` peuvent en retirer une.
+
+Un utilisateur non autorisé reçoit un message d'accès refusé, puis son
+invocation est supprimée. Les commandes préfixées Discord ne supportent pas
+les réponses éphémères natives ; le bot utilise donc une réponse temporaire
+et supprime l'invocation.
+
+Un serveur non autorisé reçoit un message d'information dans son premier salon
+accessible, puis le bot le quitte. Une autorisation temporaire est refusée
+automatiquement dès que sa durée est écoulée ; le panneau affiche le nom du
+serveur, son ID, la durée configurée et sa date d'expiration.
+
+Le board public affiche les slots numérotés, par défaut de `03` à `25`,
+la légende des états et les boutons **Confirm** / **Cancel**. Le staff mirror
+affiche la même liste sans les contrôles publics.
 
 ## Connexion à Interactive
 
@@ -83,39 +126,6 @@ Après le redémarrage du bot et de l'API, un membre Staff peut utiliser
 `!interactive` dans Discord. Le bouton ouvre la page et les changements
 effectués dans celle-ci sont validés et enregistrés par le processus ARC Beta
 avant que les boards Discord soient rafraîchis.
-
-Les commandes `!admin` sont masquées et réservées au propriétaire du bot :
-
-```text
-!admin add @User
-!admin remove @User
-!admin list
-```
-
-Elles gèrent les utilisateurs autorisés à administrer la whitelist. Les
-commandes `!auth` sont masquées et accessibles au propriétaire du bot ainsi
-qu'aux utilisateurs ajoutés avec `!admin add` :
-
-```text
-!auth add <Guild_ID> <Days|unlimited>
-!auth remove <Guild_ID>
-!auth list
-```
-
-Un utilisateur non autorisé reçoit un message d'accès refusé, puis son
-invocation est supprimée. Les commandes préfixées Discord ne supportent pas
-les réponses éphémères natives ; le bot utilise donc une réponse temporaire
-et supprime l'invocation.
-
-Un serveur non autorisé reçoit un message d'information dans son premier salon
-accessible, puis le bot le quitte immédiatement. Une autorisation temporaire est
-refusée automatiquement dès que son nombre de jours est écoulé. `!auth list`
-affiche le nom du serveur, son ID, la durée configurée et la date d'expiration
-si elle est temporaire.
-
-Le board public affiche les slots numérotés, par défaut de `03` à `25`,
-la légende des états et les boutons **Confirm** / **Cancel**. Le staff mirror
-affiche la même liste sans les contrôles publics.
 
 ## Commandes principales
 

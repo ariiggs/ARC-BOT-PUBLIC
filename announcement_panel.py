@@ -82,7 +82,7 @@ def announcement_marker(tier: str, guild_id: int, body: str) -> str:
 
 
 def recipient_is_currently_eligible(repository, guild_id: int, tier: str) -> bool:
-    """Check each recipient against the repository's freshly refreshed auth."""
+    """Check each recipient against the bot's locally persisted authorization."""
     return (
         repository.is_guild_authorized(guild_id)
         and repository.get_server_license_type(guild_id)
@@ -136,14 +136,12 @@ class AnnouncementWizard(discord.ui.View):
         owner_id: int,
         bot,
         repository,
-        shared_authorization,
         configured_text_channel,
     ) -> None:
         super().__init__(timeout=600)
         self.owner_id = owner_id
         self.bot = bot
         self.repository = repository
-        self.shared_authorization = shared_authorization
         self.configured_text_channel = configured_text_channel
         self.message: discord.Message | None = None
         self.tier: str | None = None
@@ -296,14 +294,6 @@ class AnnouncementWizard(discord.ui.View):
         expected_revision: int,
     ) -> None:
         await interaction.response.defer()
-        if not await self.shared_authorization.refresh_current(force=True):
-            await interaction.followup.send(
-                "The shared authorization service is unavailable. No server "
-                "list can be prepared.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
         if self.revision != expected_revision or self.confirmation_started:
             await interaction.followup.send(
                 "This tier selection is stale. No server selection was opened.",
@@ -379,14 +369,6 @@ class AnnouncementWizard(discord.ui.View):
     ) -> None:
         expected_revision = self.revision
         await interaction.response.defer()
-        if not await self.shared_authorization.refresh_current(force=True):
-            await interaction.followup.send(
-                "The shared authorization service is unavailable. No servers "
-                "were selected; try again when it is online.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
         if expected_revision != self.revision or self.confirmation_started:
             await interaction.followup.send(
                 "This server-selection modal is stale; no destinations were "
@@ -835,21 +817,6 @@ class AnnouncementWizard(discord.ui.View):
             embed=None,
         )
         try:
-            if not await self.shared_authorization.refresh_current(force=True):
-                await interaction.followup.send(
-                    "The shared authorization service is unavailable. Nothing "
-                    "was sent in this attempt. You may retry the same confirmed "
-                    "snapshot after it recovers.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-                self.send_in_progress = False
-                if self.confirm_button is not None:
-                    self.confirm_button.disabled = False
-                    self.confirm_button.label = "Confirm and send"
-                await self._edit_anchor("", embed=self.preview_embed())
-                return
-
             targets, errors = await self.resolve_targets(
                 snapshot.guild_ids,
                 snapshot.tier,
@@ -865,8 +832,8 @@ class AnnouncementWizard(discord.ui.View):
                     snapshot.tier,
                 ):
                     reports.append(
-                        f"`{guild_id}` — skipped: fresh authorization validation "
-                        "failed or the current license is outside the selected tier."
+                        f"`{guild_id}` — skipped: local authorization was revoked "
+                        "or the current license is outside the selected tier."
                     )
                     continue
                 if self.bot.get_guild(guild_id) is None:
@@ -1210,7 +1177,6 @@ class AnnouncementTextModal(discord.ui.Modal, title="Write announcement"):
 def install_announcement_command(
     bot,
     repository,
-    shared_authorization,
     configured_text_channel,
 ) -> None:
     @bot.command(name="staffannounce", hidden=True)
@@ -1229,17 +1195,10 @@ def install_announcement_command(
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return
-        if not await shared_authorization.refresh_current(force=True):
-            await ctx.author.send(
-                "The shared authorization service is unavailable. "
-                "No announcement can be prepared."
-            )
-            return
         wizard = AnnouncementWizard(
             owner_id=ctx.author.id,
             bot=bot,
             repository=repository,
-            shared_authorization=shared_authorization,
             configured_text_channel=configured_text_channel,
         )
         try:
