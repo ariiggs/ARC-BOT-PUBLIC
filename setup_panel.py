@@ -1188,6 +1188,10 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     label=label,
                     emoji=emoji,
                     style=discord.ButtonStyle.primary,
+                    disabled=(
+                        section == "emojis"
+                        and not _gold_emoji_license_enabled(self.guild_id)
+                    ),
                     row=0,
                 )
 
@@ -1196,6 +1200,10 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     section=section,
                 ) -> None:
                     if not await self.interaction_check(interaction):
+                        return
+                    if section == "emojis" and not await _emoji_license_check(
+                        interaction, self.guild_id
+                    ):
                         return
                     if self.scrim() is None:
                         await interaction.response.edit_message(
@@ -3289,9 +3297,11 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     if (
                         self.leaderboard_layout == "2_col"
                         and repository.get_server_license_type(self.guild_id)
-                        != "Gold"
+                        == "Standard"
                     ):
-                        raise ValueError("The 2-column layout requires a Gold license.")
+                        raise ValueError(
+                            "The 2-column layout requires a Gold or Diamond license."
+                        )
                 else:
                     raise ValueError("Unknown configuration setting.")
             except (TypeError, ValueError) as error:
@@ -3608,11 +3618,19 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 label="Confirm Restore",
                 emoji="⚠️",
                 style=discord.ButtonStyle.danger,
+                disabled=(
+                    self.section == "emojis"
+                    and not _gold_emoji_license_enabled(self.guild_id)
+                ),
                 row=0,
             )
 
             async def confirm_callback(interaction: discord.Interaction) -> None:
                 if not await self.interaction_check(interaction):
+                    return
+                if self.section == "emojis" and not await _emoji_license_check(
+                    interaction, self.guild_id
+                ):
                     return
                 current = repository.get(self.scrim_id)
                 if current is None or current.guild_id != self.guild_id:
@@ -3720,6 +3738,20 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             "Choose the type of emoji customization."
         )
 
+    def _gold_emoji_license_enabled(guild_id: int) -> bool:
+        return repository.get_server_license_type(guild_id) != "Standard"
+
+    async def _emoji_license_check(
+        interaction: discord.Interaction, guild_id: int
+    ) -> bool:
+        if _gold_emoji_license_enabled(guild_id):
+            return True
+        await interaction.response.send_message(
+            "Custom emoji customization is available to Gold and Diamond licenses only.",
+            ephemeral=True,
+        )
+        return False
+
     def _validate_scrim_emoji(interaction: discord.Interaction, emoji: str) -> None:
         parsed = discord.PartialEmoji.from_str(emoji)
         if parsed.id is None:
@@ -3775,6 +3807,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
         async def on_submit(self, interaction: discord.Interaction) -> None:
             if not setup_authorized(interaction, self.owner_id, self.guild_id):
                 await _deny(interaction)
+                return
+            if not await _emoji_license_check(interaction, self.guild_id):
                 return
             scrim = repository.get(self.scrim_id)
             if scrim is None or scrim.guild_id != self.guild_id:
@@ -3832,6 +3866,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             if not setup_authorized(interaction, self.owner_id, self.guild_id):
                 await _deny(interaction)
                 return
+            if not await _emoji_license_check(interaction, self.guild_id):
+                return
             try:
                 number = int(str(self.number.value).strip())
             except ValueError:
@@ -3884,11 +3920,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
             status_button = discord.ui.Button(
                 label="Slot Status Emojis", emoji="🟢",
-                style=discord.ButtonStyle.primary, row=0,
+                style=discord.ButtonStyle.primary,
+                disabled=not _gold_emoji_license_enabled(self.guild_id),
+                row=0,
             )
 
             async def status_callback(interaction: discord.Interaction) -> None:
                 if await self.interaction_check(interaction):
+                    if not await _emoji_license_check(interaction, self.guild_id):
+                        return
                     await interaction.response.edit_message(
                         content="Customize Available, Reserved, Pending, or Confirmed slot status.",
                         embed=None,
@@ -3902,11 +3942,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
             number_button = discord.ui.Button(
                 label="Slot Number Emojis", emoji="🔢",
-                style=discord.ButtonStyle.primary, row=0,
+                style=discord.ButtonStyle.primary,
+                disabled=not _gold_emoji_license_enabled(self.guild_id),
+                row=0,
             )
 
             async def number_callback(interaction: discord.Interaction) -> None:
                 if await self.interaction_check(interaction):
+                    if not await _emoji_license_check(interaction, self.guild_id):
+                        return
                     await interaction.response.edit_message(
                         content=slot_number_emoji_content(
                             repository.get(self.scrim_id)
@@ -3922,11 +3966,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
             registration_button = discord.ui.Button(
                 label="Registration Status", emoji="📝",
-                style=discord.ButtonStyle.primary, row=0,
+                style=discord.ButtonStyle.primary,
+                disabled=not _gold_emoji_license_enabled(self.guild_id),
+                row=0,
             )
 
             async def registration_callback(interaction: discord.Interaction) -> None:
                 if await self.interaction_check(interaction):
+                    if not await _emoji_license_check(interaction, self.guild_id):
+                        return
                     await interaction.response.edit_message(
                         content=(
                             "Customize the staff-review OK, accepted, and declined "
@@ -3943,11 +3991,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
             reset = discord.ui.Button(
                 label="Restore All Emoji Defaults", emoji="🔄",
-                style=discord.ButtonStyle.danger, row=1,
+                style=discord.ButtonStyle.danger,
+                disabled=not _gold_emoji_license_enabled(self.guild_id),
+                row=1,
             )
 
             async def reset_callback(interaction: discord.Interaction) -> None:
                 if not await self.interaction_check(interaction):
+                    return
+                if not await _emoji_license_check(interaction, self.guild_id):
                     return
                 try:
                     scrim = repository.reset_scrim_settings(
@@ -4000,13 +4052,18 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             )
             for label, field_name in fields:
                 button = discord.ui.Button(
-                    label=f"Edit {label}", style=discord.ButtonStyle.secondary, row=0
+                    label=f"Edit {label}",
+                    style=discord.ButtonStyle.secondary,
+                    disabled=not _gold_emoji_license_enabled(self.guild_id),
+                    row=0,
                 )
 
                 async def edit_callback(
                     interaction: discord.Interaction, field_name=field_name, label=label
                 ) -> None:
                     if await self.interaction_check(interaction):
+                        if not await _emoji_license_check(interaction, self.guild_id):
+                            return
                         await interaction.response.send_modal(
                             EmojiValueModal(
                                 self.owner_id, self.guild_id, self.scrim_id,
@@ -4019,11 +4076,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 self.add_item(button)
             reset = discord.ui.Button(
                 label="Restore Status Defaults", emoji="🔄",
-                style=discord.ButtonStyle.danger, row=1,
+                style=discord.ButtonStyle.danger,
+                disabled=not _gold_emoji_license_enabled(self.guild_id),
+                row=1,
             )
 
             async def reset_callback(interaction: discord.Interaction) -> None:
                 if not await self.interaction_check(interaction):
+                    return
+                if not await _emoji_license_check(interaction, self.guild_id):
                     return
                 try:
                     for field, value in (
@@ -4079,7 +4140,10 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 ("Declined", "emoji_registration_declined"),
             ):
                 button = discord.ui.Button(
-                    label=f"Edit {label}", style=discord.ButtonStyle.secondary, row=0
+                    label=f"Edit {label}",
+                    style=discord.ButtonStyle.secondary,
+                    disabled=not _gold_emoji_license_enabled(self.guild_id),
+                    row=0,
                 )
 
                 async def edit_callback(
@@ -4088,6 +4152,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     label=label,
                 ) -> None:
                     if await self.interaction_check(interaction):
+                        if not await _emoji_license_check(interaction, self.guild_id):
+                            return
                         await interaction.response.send_modal(
                             EmojiValueModal(
                                 self.owner_id, self.guild_id, self.scrim_id,
@@ -4100,11 +4166,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 self.add_item(button)
             reset = discord.ui.Button(
                 label="Restore Registration Defaults", emoji="🔄",
-                style=discord.ButtonStyle.danger, row=1,
+                style=discord.ButtonStyle.danger,
+                disabled=not _gold_emoji_license_enabled(self.guild_id),
+                row=1,
             )
 
             async def reset_callback(interaction: discord.Interaction) -> None:
                 if not await self.interaction_check(interaction):
+                    return
+                if not await _emoji_license_check(interaction, self.guild_id):
                     return
                 try:
                     scrim = repository.save_registration_emoji(
@@ -4146,11 +4216,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             self.slot_number = slot_number
             set_button = discord.ui.Button(
                 label="Set Slot Emoji", emoji="🎨",
-                style=discord.ButtonStyle.primary, row=0,
+                style=discord.ButtonStyle.primary,
+                disabled=not _gold_emoji_license_enabled(self.guild_id),
+                row=0,
             )
 
             async def set_callback(interaction: discord.Interaction) -> None:
                 if await self.interaction_check(interaction):
+                    if not await _emoji_license_check(interaction, self.guild_id):
+                        return
                     await interaction.response.send_modal(
                         EmojiValueModal(
                             self.owner_id, self.guild_id, self.scrim_id,
@@ -4164,11 +4238,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             self.add_item(set_button)
             clear_button = discord.ui.Button(
                 label="Use Slot Number Text", emoji="🔢",
-                style=discord.ButtonStyle.secondary, row=0,
+                style=discord.ButtonStyle.secondary,
+                disabled=not _gold_emoji_license_enabled(self.guild_id),
+                row=0,
             )
 
             async def clear_callback(interaction: discord.Interaction) -> None:
                 if not await self.interaction_check(interaction):
+                    return
+                if not await _emoji_license_check(interaction, self.guild_id):
                     return
                 try:
                     scrim = repository.save_slot_number_emoji(
@@ -4235,6 +4313,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
         async def on_submit(self, interaction: discord.Interaction) -> None:
             if not setup_authorized(interaction, self.owner_id, self.guild_id):
                 await _deny(interaction)
+                return
+            if not await _emoji_license_check(interaction, self.guild_id):
                 return
             scrim = repository.get(self.scrim_id)
             if scrim is None or scrim.guild_id != self.guild_id:
@@ -4333,11 +4413,14 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             ]
             selector = discord.ui.Select(
                 placeholder="Choose All Slots or one slot", options=choices,
-                disabled=not numbers, row=0,
+                disabled=not numbers or not _gold_emoji_license_enabled(self.guild_id),
+                row=0,
             )
 
             async def select_callback(interaction: discord.Interaction) -> None:
                 if await self.interaction_check(interaction):
+                    if not await _emoji_license_check(interaction, self.guild_id):
+                        return
                     await interaction.response.send_modal(
                         SlotEmojiInputModal(
                             self.owner_id, self.guild_id, self.scrim_id,
@@ -4375,11 +4458,15 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     self.add_item(button)
             reset = discord.ui.Button(
                 label="Restore Slot Number Defaults", emoji="🔄",
-                style=discord.ButtonStyle.danger, row=2,
+                style=discord.ButtonStyle.danger,
+                disabled=not _gold_emoji_license_enabled(self.guild_id),
+                row=2,
             )
 
             async def reset_callback(interaction: discord.Interaction) -> None:
                 if not await self.interaction_check(interaction):
+                    return
+                if not await _emoji_license_check(interaction, self.guild_id):
                     return
                 scrim = repository.get(self.scrim_id)
                 if scrim is None or scrim.guild_id != self.guild_id:
@@ -5457,6 +5544,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             async def configure_emojis(interaction: discord.Interaction) -> None:
                 if not await self.interaction_check(interaction):
                     return
+                if not await _emoji_license_check(interaction, self.guild_id):
+                    return
                 scrim = repository.get(self.scrim_id)
                 if scrim is None or scrim.guild_id != self.guild_id:
                     await interaction.response.send_message(
@@ -5527,6 +5616,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 label="Custom Emojis",
                 emoji="🎨",
                 style=discord.ButtonStyle.secondary,
+                disabled=not _gold_emoji_license_enabled(self.guild_id),
                 row=4,
             )
             back_button = discord.ui.Button(

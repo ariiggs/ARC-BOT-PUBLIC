@@ -49,6 +49,13 @@ from scrim_state import (
     parse_placement_points,
     timezone_for_name,
 )
+from shared_authorization import (
+    AUTHORIZATION_CACHE_SECONDS,
+    ARC_PRODUCTS,
+    SharedAuthorizationClient,
+    SharedAuthorizationError,
+)
+from announcement_panel import install_announcement_command
 
 logging.basicConfig(
     level=logging.INFO,
@@ -140,6 +147,8 @@ state_store = SlotStateStore(
     os.getenv("SLOTS_DB_PATH", str(Path(__file__).parent / "data" / "slots.sqlite3"))
 )
 repository = ScrimRepository(state_store)
+ARC_AUTH_PRODUCT = os.getenv("ARC_AUTH_PRODUCT", "public").strip().casefold()
+shared_authorization = SharedAuthorizationClient(ARC_AUTH_PRODUCT, repository)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -153,6 +162,7 @@ _loaded = False
 active_idpw: dict[str, dict[str, object]] = {}
 active_idpw_locks: dict[str, asyncio.Lock] = {}
 logs_coverage_snapshots_sent: set[str] = set()
+_shared_auth_refresh_task: asyncio.Task | None = None
 
 
 class UnauthorizedGuild(commands.CheckFailure):
@@ -161,6 +171,10 @@ class UnauthorizedGuild(commands.CheckFailure):
 
 class UnauthorizedAuthAdmin(commands.CheckFailure):
     """Raised when a user without bot-admin access invokes !auth."""
+
+
+class SharedAuthorizationUnavailable(commands.CheckFailure):
+    """Raised when the shared authorization service has no usable snapshot."""
 
 
 async def whitelist_check(ctx: commands.Context) -> bool:
@@ -173,7 +187,13 @@ async def whitelist_check(ctx: commands.Context) -> bool:
         or command_name in {"sub", "status"}
     ):
         return True
-    if ctx.guild is None or repository.is_guild_authorized(ctx.guild.id):
+    if ctx.guild is None:
+        return True
+    if shared_authorization.requires_shared_api:
+        refreshed = await shared_authorization.refresh_current()
+        if not refreshed and not shared_authorization.has_snapshot:
+            raise SharedAuthorizationUnavailable()
+    if repository.is_guild_authorized(ctx.guild.id):
         return True
     raise UnauthorizedGuild()
 
@@ -285,11 +305,20 @@ def emoji_is_available_in_guild(emoji: str | None, guild: object | None) -> bool
     return any(getattr(item, "id", None) == emoji_id for item in getattr(guild, "emojis", ()))
 
 
+def emoji_customization_enabled(scrim: Scrim) -> bool:
+    guild_id = getattr(scrim, "guild_id", None)
+    if guild_id is None:
+        return True
+    return repository.get_server_license_type(guild_id) != "Standard"
+
+
 def configured_emoji(
     scrim: Scrim,
     field_name: str,
     default: str,
 ) -> str:
+    if not emoji_customization_enabled(scrim):
+        return default
     aliases = {
         "registration_ok_emoji": "emoji_registration_ok",
         "registration_accepted_emoji": "emoji_registration_accepted",
@@ -459,7 +488,11 @@ class ExpiringView(discord.ui.View):
 
 
 def slot_display_line(scrim: Scrim, slot: Slot) -> str:
-    number_emojis = getattr(scrim, "slot_number_emojis", {}) or {}
+    number_emojis = (
+        getattr(scrim, "slot_number_emojis", {}) or {}
+        if emoji_customization_enabled(scrim)
+        else {}
+    )
     number_emoji = number_emojis.get(
         str(slot.number), number_emojis.get(slot.number)
     )
@@ -928,6 +961,15 @@ async def _send_scheduled_idpw_reminder(
     for attempt in range(len(retry_delays) + 1):
         if active_idpw.get(scrim.id) is not state:
             return
+        if (
+            (
+                shared_authorization.requires_shared_api
+                and not shared_authorization.has_snapshot
+            )
+            or not repository.is_guild_authorized(scrim.guild_id)
+        ):
+            await clear_active_idpw(scrim.id)
+            return
         remaining = start_timestamp - time.time()
         if remaining <= 0:
             return
@@ -977,6 +1019,11 @@ async def _send_scheduled_idpw_reminder(
 
 async def restore_active_idpw() -> None:
     """Reattach persisted ID/PW announcements and resume pending reminders."""
+    if (
+        shared_authorization.requires_shared_api
+        and not shared_authorization.has_snapshot
+    ):
+        return
     now = time.time()
     for config in tuple(repository.idpw_configs.values()):
         if (
@@ -987,7 +1034,7 @@ async def restore_active_idpw() -> None:
         ):
             continue
         scrim = repository.get(config.scrim_id)
-        if scrim is None:
+        if scrim is None or not repository.is_guild_authorized(scrim.guild_id):
             continue
         try:
             channel = await configured_text_channel(
@@ -2207,6 +2254,16 @@ async def subscription_status(ctx: commands.Context) -> None:
     if not is_owner and not is_manager:
         await send_dm_command_feedback(ctx, access_denied)
         return
+
+    if shared_authorization.requires_shared_api:
+        refreshed = await shared_authorization.refresh_current()
+        if not refreshed and not shared_authorization.has_snapshot:
+            await send_dm_command_feedback(
+                ctx,
+                "The shared authorization service is temporarily unavailable. "
+                "Please try again shortly.",
+            )
+            return
 
     authorized, expires_at, duration_days = repository.get_guild_subscription(
         ctx.guild.id
@@ -6048,7 +6105,7 @@ def _leaderboard_scrim_profile(scrim: Scrim) -> tuple[str, int]:
         "leaderboard_team_count",
         DEFAULT_LEADERBOARD_TEAM_COUNT,
     )
-    if repository.get_server_license_type(scrim.guild_id) != "Gold":
+    if repository.get_server_license_type(scrim.guild_id) == "Standard":
         team_count = STANDARD_LEADERBOARD_TEAM_COUNT
     return orientation, team_count
 
@@ -6679,7 +6736,7 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
                 title="Scrim no longer exists",
                 color=discord.Color.red(),
             )
-        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
+        is_gold = repository.get_server_license_type(self.guild_id) != "Standard"
         orientation, team_count = _leaderboard_scrim_profile(scrim)
         background_metadata = _current_leaderboard_background_metadata(scrim)
         saved_background_url = background_metadata.get("attachment_url")
@@ -6700,7 +6757,7 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
             title=f"Edit Leaderboard — {discord.utils.escape_markdown(scrim.name)}",
             description=(
                 "Standard is fixed at 20 teams in either orientation. "
-                "Gold can choose the team count. Backgrounds are available "
+                "Gold and Diamond can choose the team count. Backgrounds are available "
                 "for each license-available profile."
                 if not is_gold
                 else
@@ -6763,20 +6820,20 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         teams_button = discord.ui.Button(
             label=(
                 "Teams to Display"
-                if repository.get_server_license_type(self.guild_id) == "Gold"
-                else "Teams to Display · Gold"
+                if repository.get_server_license_type(self.guild_id) != "Standard"
+                else "Teams to Display · Gold+"
             ),
             emoji="🔢",
             style=discord.ButtonStyle.primary,
-            disabled=repository.get_server_license_type(self.guild_id) != "Gold",
+            disabled=repository.get_server_license_type(self.guild_id) == "Standard",
             row=0,
         )
 
         async def teams_callback(interaction: discord.Interaction) -> None:
-            if repository.get_server_license_type(self.guild_id) != "Gold":
+            if repository.get_server_license_type(self.guild_id) == "Standard":
                 await interaction.response.send_message(
                     "Standard licenses are locked to 20 teams. "
-                    "Gold licenses can change the team count.",
+                    "Gold and Diamond licenses can change the team count.",
                     ephemeral=True,
                 )
                 return
@@ -7580,14 +7637,14 @@ class LeaderboardTeamCountView(LeaderboardPanelView):
             if scrim is not None
             else STANDARD_LEADERBOARD_TEAM_COUNT
         )
-        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
+        is_gold = repository.get_server_license_type(self.guild_id) != "Standard"
         return discord.Embed(
             title="Teams to Display",
             description=(
                 f"Current setting: **{current} teams**."
                 if is_gold
                 else "Standard licenses are locked to **20 teams**. "
-                "Gold licenses can change this setting."
+                "Gold and Diamond licenses can change this setting."
             ),
             color=discord.Color.blurple(),
         )
@@ -7595,7 +7652,7 @@ class LeaderboardTeamCountView(LeaderboardPanelView):
     def rebuild(self) -> None:
         self.clear_items()
         scrim = repository.get(self.scrim_id)
-        is_gold = repository.get_server_license_type(self.guild_id) == "Gold"
+        is_gold = repository.get_server_license_type(self.guild_id) != "Standard"
         current = (
             _leaderboard_scrim_profile(scrim)[1]
             if scrim is not None
@@ -7618,10 +7675,10 @@ class LeaderboardTeamCountView(LeaderboardPanelView):
             )
 
             async def select_callback(interaction: discord.Interaction) -> None:
-                if repository.get_server_license_type(self.guild_id) != "Gold":
+                if repository.get_server_license_type(self.guild_id) == "Standard":
                     await interaction.response.send_message(
                         "Standard licenses are locked to 20 teams. "
-                        "Gold licenses can change the team count.",
+                        "Gold and Diamond licenses can change the team count.",
                         ephemeral=True,
                     )
                     return
@@ -7716,7 +7773,7 @@ class LeaderboardOrientationView(LeaderboardPanelView):
             else DEFAULT_LEADERBOARD_ORIENTATION
         )
         description = f"Current setting: **{current.title()}**."
-        if repository.get_server_license_type(self.guild_id) != "Gold":
+        if repository.get_server_license_type(self.guild_id) == "Standard":
             description += (
                 "\nStandard licenses use 20 teams in either orientation."
             )
@@ -8627,10 +8684,27 @@ async def admin_list(ctx: commands.Context) -> None:
     await send_dm_command_feedback(ctx, message)
 
 
-def build_auth_panel_embed() -> discord.Embed:
+def arc_product_label(product: str) -> str:
+    return "A.R.C. Beta" if product == "beta" else "A.R.C. Public"
+
+
+def build_auth_panel_embed(product: str | None = None) -> discord.Embed:
+    if product is None:
+        description = "Choose which bot's guild authorizations to manage."
+        if not shared_authorization.configured:
+            description += (
+                "\n\nShared storage is not connected. Until "
+                "`ARC_AUTH_API_URL` and `ARC_AUTH_API_TOKEN` are configured, "
+                "only this bot's local authorization list can be managed."
+            )
+    else:
+        description = (
+            f"Managing **{arc_product_label(product)}**. "
+            "Choose a license tier."
+        )
     return discord.Embed(
         title="💎 A.R.C. Authorization Manager",
-        description="Choose a version to view and manage its guild authorizations.",
+        description=description,
         color=discord.Color.blurple(),
     )
 
@@ -8646,23 +8720,62 @@ def authorization_time_left_text(
     return subscription_remaining_text(expires_at)
 
 
-async def build_auth_tier_embed(license_type: str) -> discord.Embed:
-    if license_type not in LICENSE_TYPES:
-        raise ValueError("Choose a Standard or Gold version.")
-    authorizations = repository.list_authorizations(
+async def authorization_rows(
+    product: str,
+    license_type: str,
+) -> list[tuple[int, datetime | None, int]]:
+    if product not in ARC_PRODUCTS:
+        raise ValueError("Choose ARC Beta or ARC Public.")
+    if shared_authorization.configured:
+        records = await shared_authorization.list_authorizations(product)
+        return [
+            (record.guild_id, record.expires_at, record.duration_days)
+            for record in records
+            if record.license_type == license_type
+        ]
+    if shared_authorization.requires_shared_api:
+        raise SharedAuthorizationError(
+            "Set both `ARC_AUTH_API_URL` and `ARC_AUTH_API_TOKEN` before "
+            "using shared authorizations."
+        )
+    if product != ARC_AUTH_PRODUCT:
+        raise SharedAuthorizationError(
+            "Shared storage is not connected. This bot can only manage its own "
+            "local authorization list."
+        )
+    return repository.list_authorizations(
         include_expired=True,
         license_type=license_type,
     )
+
+
+async def build_auth_tier_embed(
+    product: str,
+    license_type: str,
+) -> discord.Embed:
+    if license_type not in LICENSE_TYPES:
+        raise ValueError("Choose a Standard, Gold, or Diamond version.")
+    authorizations = await authorization_rows(product, license_type)
     embed = discord.Embed(
-        title=f"💎 {license_type} Version — Guild Authorizations",
+        title=(
+            f"💎 {arc_product_label(product)} — "
+            f"{license_type} Guild Authorizations"
+        ),
         color=(
             discord.Color.gold()
             if license_type == "Gold"
-            else discord.Color.green()
+            else (
+                discord.Color.blue()
+                if license_type == "Diamond"
+                else discord.Color.green()
+            )
         ),
     )
     if not authorizations:
-        embed.description = f"No guilds are assigned to the {license_type} version."
+        embed.description = (
+            f"No guilds are assigned to the {license_type} version of "
+            f"{arc_product_label(product)}."
+        )
         return embed
 
     visible_authorizations = authorizations[:25]
@@ -8701,11 +8814,11 @@ def parse_auth_duration(value: str) -> int:
         duration_days = int(normalized)
     except ValueError as error:
         raise ValueError(
-            "Duration must be a non-negative number of days or `unlimited`."
+            "Duration must be 0–100,000 days or `unlimited`."
         ) from error
-    if duration_days < 0:
+    if duration_days < 0 or duration_days > 100_000:
         raise ValueError(
-            "Duration must be a non-negative number of days or `unlimited`."
+            "Duration must be 0–100,000 days or `unlimited`."
         )
     return duration_days
 
@@ -8718,6 +8831,7 @@ class AuthAdminPanelView(DurableView):
             "⏱️ This private authorization panel expired. Run `!auth` again "
             "to reopen it in your DMs."
         )
+        self.selected_product: str | None = None
         self.selected_tier: str | None = None
         self.message: discord.Message | None = None
         self.rebuild()
@@ -8762,6 +8876,31 @@ class AuthAdminPanelView(DurableView):
 
     def rebuild(self) -> None:
         self.clear_items()
+        async def close_panel(interaction: discord.Interaction) -> None:
+            self.stop()
+            await interaction.response.defer()
+            await delete_message_or_clear(
+                self.message or getattr(interaction, "message", None),
+                log_context="closed authorization panel",
+                fallback_content="Authorization panel closed.",
+            )
+
+        if self.selected_product is None:
+            for product in ARC_PRODUCTS:
+                async def select_product(
+                    interaction: discord.Interaction,
+                    selected_product: str = product,
+                ) -> None:
+                    await self.show_product(interaction, selected_product)
+
+                self._add_button(
+                    arc_product_label(product),
+                    discord.ButtonStyle.primary,
+                    select_product,
+                )
+            self._add_button("Close", discord.ButtonStyle.secondary, close_panel)
+            return
+
         if self.selected_tier is None:
             for tier in LICENSE_TYPES:
                 async def select_tier(
@@ -8776,22 +8915,24 @@ class AuthAdminPanelView(DurableView):
                     select_tier,
                 )
 
-            async def close_panel(interaction: discord.Interaction) -> None:
-                self.stop()
-                await interaction.response.defer()
-                await delete_message_or_clear(
-                    self.message or getattr(interaction, "message", None),
-                    log_context="closed authorization panel",
-                    fallback_content="Authorization panel closed.",
+            async def return_to_products(interaction: discord.Interaction) -> None:
+                self.selected_product = None
+                self.rebuild()
+                await interaction.response.edit_message(
+                    content="",
+                    embed=build_auth_panel_embed(),
+                    view=self,
                 )
 
             self._add_button(
-                "Close",
+                "Choose Bot",
                 discord.ButtonStyle.secondary,
-                close_panel,
+                return_to_products,
             )
+            self._add_button("Close", discord.ButtonStyle.secondary, close_panel)
             return
 
+        selected_product = self.selected_product
         selected_tier = self.selected_tier
 
         async def add_guild(interaction: discord.Interaction) -> None:
@@ -8805,15 +8946,25 @@ class AuthAdminPanelView(DurableView):
                 )
                 return
             await interaction.response.send_modal(
-                AuthAddGuildModal(self, selected_tier)
+                AuthAddGuildModal(self, selected_product, selected_tier)
             )
 
         async def remove_guild(interaction: discord.Interaction) -> None:
             await interaction.response.send_modal(
-                AuthRemoveGuildModal(self, selected_tier)
+                AuthRemoveGuildModal(self, selected_product, selected_tier)
             )
 
-        async def return_to_versions(interaction: discord.Interaction) -> None:
+        async def return_to_tiers(interaction: discord.Interaction) -> None:
+            self.selected_tier = None
+            self.rebuild()
+            await interaction.response.edit_message(
+                content="",
+                embed=build_auth_panel_embed(selected_product),
+                view=self,
+            )
+
+        async def return_to_products(interaction: discord.Interaction) -> None:
+            self.selected_product = None
             self.selected_tier = None
             self.rebuild()
             await interaction.response.edit_message(
@@ -8824,7 +8975,27 @@ class AuthAdminPanelView(DurableView):
 
         self._add_button("Add", discord.ButtonStyle.success, add_guild)
         self._add_button("Remove", discord.ButtonStyle.danger, remove_guild)
-        self._add_button("Return", discord.ButtonStyle.secondary, return_to_versions)
+        self._add_button("Return", discord.ButtonStyle.secondary, return_to_tiers)
+        self._add_button(
+            "Choose Bot",
+            discord.ButtonStyle.secondary,
+            return_to_products,
+        )
+        self._add_button("Close", discord.ButtonStyle.secondary, close_panel)
+
+    async def show_product(
+        self,
+        interaction: discord.Interaction,
+        product: str,
+    ) -> None:
+        self.selected_product = product
+        self.selected_tier = None
+        self.rebuild()
+        await interaction.response.edit_message(
+            content="",
+            embed=build_auth_panel_embed(product),
+            view=self,
+        )
 
     async def show_tier(
         self,
@@ -8834,7 +9005,17 @@ class AuthAdminPanelView(DurableView):
         self.selected_tier = license_type
         self.rebuild()
         await interaction.response.defer()
-        embed = await build_auth_tier_embed(license_type)
+        try:
+            embed = await build_auth_tier_embed(
+                self.selected_product or ARC_AUTH_PRODUCT,
+                license_type,
+            )
+        except SharedAuthorizationError as error:
+            embed = discord.Embed(
+                title="Shared authorizations unavailable",
+                description=str(error),
+                color=discord.Color.red(),
+            )
         await interaction.edit_original_response(
             content="",
             embed=embed,
@@ -8843,12 +9024,27 @@ class AuthAdminPanelView(DurableView):
         )
 
     async def refresh_panel(self) -> None:
-        if self.message is None or self.selected_tier is None:
+        if (
+            self.message is None
+            or self.selected_product is None
+            or self.selected_tier is None
+        ):
             return
+        try:
+            embed = await build_auth_tier_embed(
+                self.selected_product,
+                self.selected_tier,
+            )
+        except SharedAuthorizationError as error:
+            embed = discord.Embed(
+                title="Shared authorizations unavailable",
+                description=str(error),
+                color=discord.Color.red(),
+            )
         try:
             await self.message.edit(
                 content="",
-                embed=await build_auth_tier_embed(self.selected_tier),
+                embed=embed,
                 view=self,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -8865,9 +9061,18 @@ class AuthAdminPanelView(DurableView):
 
 
 class AuthAddGuildModal(discord.ui.Modal):
-    def __init__(self, panel: AuthAdminPanelView, license_type: str):
-        super().__init__(title=f"Add {license_type} authorization", timeout=300)
+    def __init__(
+        self,
+        panel: AuthAdminPanelView,
+        product: str,
+        license_type: str,
+    ):
+        super().__init__(
+            title=f"Add {arc_product_label(product)} {license_type}",
+            timeout=300,
+        )
         self.panel = panel
+        self.product = product
         self.license_type = license_type
         self.guild_id_input = discord.ui.TextInput(
             label="Guild ID",
@@ -8895,24 +9100,51 @@ class AuthAddGuildModal(discord.ui.Modal):
                 ephemeral=True,
             )
             return
+        await interaction.response.defer(ephemeral=True)
         try:
             guild_id = int(str(self.guild_id_input.value).strip())
             duration_days = parse_auth_duration(str(self.duration_input.value))
-            already_authorized = guild_id in repository.authorized_guild_ids
-            repository.authorize_guild(
-                guild_id,
-                duration_days,
-                license_type=self.license_type,
-            )
-        except (TypeError, ValueError) as error:
-            await interaction.response.send_message(
+            if shared_authorization.configured:
+                existing = await shared_authorization.list_authorizations(
+                    self.product
+                )
+                already_authorized = any(
+                    record.guild_id == guild_id for record in existing
+                )
+                await shared_authorization.authorize_guild(
+                    self.product,
+                    guild_id,
+                    duration_days,
+                    self.license_type,
+                )
+                if self.product == ARC_AUTH_PRODUCT:
+                    await shared_authorization.refresh_current(force=True)
+            elif shared_authorization.requires_shared_api:
+                raise SharedAuthorizationError(
+                    "Set both `ARC_AUTH_API_URL` and `ARC_AUTH_API_TOKEN` "
+                    "before using shared authorizations."
+                )
+            elif self.product != ARC_AUTH_PRODUCT:
+                raise SharedAuthorizationError(
+                    "Shared storage is not connected. This bot can only "
+                    "manage its own local authorization list."
+                )
+            else:
+                already_authorized = guild_id in repository.authorized_guild_ids
+                repository.authorize_guild(
+                    guild_id,
+                    duration_days,
+                    license_type=self.license_type,
+                )
+        except (SharedAuthorizationError, TypeError, ValueError) as error:
+            await interaction.followup.send(
                 f"Could not authorize that guild: {error}",
                 ephemeral=True,
             )
             return
         except SlotStorageError:
             logger.exception("Could not save guild authorization.")
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "The authorization could not be saved. Please try again.",
                 ephemeral=True,
             )
@@ -8924,10 +9156,10 @@ class AuthAddGuildModal(discord.ui.Modal):
             else f"for {duration_days} day(s)"
         )
         status = "updated" if already_authorized else "added"
-        await interaction.response.defer(ephemeral=True)
         await self.panel.refresh_panel()
         await interaction.followup.send(
-            f"Guild `{guild_id}` authorization {status} as **{self.license_type}** "
+            f"Guild `{guild_id}` authorization {status} for "
+            f"**{arc_product_label(self.product)} — {self.license_type}** "
             f"{duration_text}.",
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -8935,9 +9167,18 @@ class AuthAddGuildModal(discord.ui.Modal):
 
 
 class AuthRemoveGuildModal(discord.ui.Modal):
-    def __init__(self, panel: AuthAdminPanelView, license_type: str):
-        super().__init__(title=f"Remove {license_type} authorization", timeout=300)
+    def __init__(
+        self,
+        panel: AuthAdminPanelView,
+        product: str,
+        license_type: str,
+    ):
+        super().__init__(
+            title=f"Remove {arc_product_label(product)} {license_type}",
+            timeout=300,
+        )
         self.panel = panel
+        self.product = product
         self.license_type = license_type
         self.guild_id_input = discord.ui.TextInput(
             label="Guild ID",
@@ -8954,46 +9195,74 @@ class AuthRemoveGuildModal(discord.ui.Modal):
                 ephemeral=True,
             )
             return
+        await interaction.response.defer(ephemeral=True)
         try:
             guild_id = int(str(self.guild_id_input.value).strip())
-            tier_authorizations = repository.list_authorizations(
-                include_expired=True,
-                license_type=self.license_type,
+            tier_authorizations = await authorization_rows(
+                self.product,
+                self.license_type,
             )
-        except (TypeError, ValueError) as error:
-            await interaction.response.send_message(
+        except (SharedAuthorizationError, TypeError, ValueError) as error:
+            await interaction.followup.send(
                 f"Could not remove that guild: {error}",
                 ephemeral=True,
             )
             return
         if guild_id not in {item[0] for item in tier_authorizations}:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Guild `{guild_id}` is not assigned to the "
-                f"**{self.license_type}** version.",
+                f"**{self.license_type}** version of "
+                f"**{arc_product_label(self.product)}**.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return
         try:
-            repository.revoke_guild(guild_id)
-        except (TypeError, ValueError) as error:
-            await interaction.response.send_message(
+            if shared_authorization.configured:
+                removed = await shared_authorization.revoke_guild(
+                    self.product,
+                    guild_id,
+                )
+                if removed and self.product == ARC_AUTH_PRODUCT:
+                    await shared_authorization.refresh_current(force=True)
+            elif shared_authorization.requires_shared_api:
+                raise SharedAuthorizationError(
+                    "Set both `ARC_AUTH_API_URL` and `ARC_AUTH_API_TOKEN` "
+                    "before using shared authorizations."
+                )
+            elif self.product != ARC_AUTH_PRODUCT:
+                raise SharedAuthorizationError(
+                    "Shared storage is not connected. This bot can only "
+                    "manage its own local authorization list."
+                )
+            else:
+                removed = repository.revoke_guild(guild_id)
+        except (SharedAuthorizationError, TypeError, ValueError) as error:
+            await interaction.followup.send(
                 f"Could not remove that guild: {error}",
                 ephemeral=True,
             )
             return
         except SlotStorageError:
             logger.exception("Could not save guild revocation.")
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "The authorization could not be removed. Please try again.",
                 ephemeral=True,
             )
             return
+        if not removed:
+            await interaction.followup.send(
+                f"Guild `{guild_id}` is no longer assigned to "
+                f"**{arc_product_label(self.product)}**.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
 
-        await interaction.response.defer(ephemeral=True)
         await self.panel.refresh_panel()
         await interaction.followup.send(
-            f"Guild `{guild_id}` was removed from the **{self.license_type}** version.",
+            f"Guild `{guild_id}` was removed from the "
+            f"**{arc_product_label(self.product)} — {self.license_type}** version.",
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -9041,6 +9310,13 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
         await send_private_command_feedback(
             ctx,
             "I could not save that change. Please try again.",
+            silent=False,
+        )
+    elif isinstance(original, SharedAuthorizationUnavailable):
+        await send_private_command_feedback(
+            ctx,
+            "The shared authorization service is temporarily unavailable. "
+            "Please try again shortly.",
             silent=False,
         )
     elif isinstance(original, UnauthorizedGuild):
@@ -9174,37 +9450,103 @@ async def migrate_legacy() -> None:
         return
     try:
         scrim = repository.claim_legacy(guild.id, staff.id)
-        await publish_scrim(scrim)
         logger.info("Imported v1 state into scrim %s.", scrim.id)
     except Exception:
         logger.exception("v1 migration failed; state was retained.")
 
 
-@bot.event
-async def on_ready() -> None:
-    if bot.user is not None:
-        logger.info("Bot connected as %s (ID: %s)", bot.user, bot.user.id)
-    await migrate_legacy()
+async def restore_authorized_runtime_state() -> None:
+    if (
+        shared_authorization.requires_shared_api
+        and not shared_authorization.has_snapshot
+    ):
+        return
     await restore_active_idpw()
+    authorized_scrims = [
+        scrim
+        for scrim in list(repository.scrims.values())
+        if repository.is_guild_authorized(scrim.guild_id)
+    ]
     results = await asyncio.gather(
-        *(
-            publish_scrim(scrim)
-            for scrim in list(repository.scrims.values())
-            if repository.is_guild_authorized(scrim.guild_id)
-        ),
+        *(publish_scrim(scrim) for scrim in authorized_scrims),
         return_exceptions=True,
     )
     for result in results:
         if isinstance(result, Exception):
             logger.error("Board recovery failed.", exc_info=result)
-    for scrim in list(repository.scrims.values()):
-        if repository.is_guild_authorized(scrim.guild_id):
-            await send_scrim_log_coverage_snapshot(scrim)
+    for scrim in authorized_scrims:
+        await send_scrim_log_coverage_snapshot(scrim)
+
+
+async def refresh_shared_authorizations_periodically() -> None:
+    while not bot.is_closed():
+        await asyncio.sleep(AUTHORIZATION_CACHE_SECONDS)
+        had_snapshot = shared_authorization.has_snapshot
+        refreshed = await shared_authorization.refresh_current(force=True)
+        if not refreshed:
+            logger.warning("The shared authorization cache could not be refreshed.")
+        elif not had_snapshot:
+            await restore_authorized_runtime_state()
+
+
+@bot.event
+async def on_ready() -> None:
+    global _shared_auth_refresh_task
+    if bot.user is not None:
+        logger.info("Bot connected as %s (ID: %s)", bot.user, bot.user.id)
+    if shared_authorization.requires_shared_api:
+        refreshed = await shared_authorization.refresh_current(force=True)
+        if not refreshed and not shared_authorization.has_snapshot:
+            logger.error(
+                "Shared authorizations are unavailable; guild commands and "
+                "board recovery will wait for a successful sync."
+            )
+        if (
+            _shared_auth_refresh_task is None
+            or _shared_auth_refresh_task.done()
+        ):
+            _shared_auth_refresh_task = asyncio.create_task(
+                refresh_shared_authorizations_periodically()
+            )
+    await migrate_legacy()
+    await restore_authorized_runtime_state()
 
 
 @bot.event
 async def on_guild_join(guild: discord.Guild) -> None:
     """Leave immediately after notifying a guild outside the whitelist."""
+    if shared_authorization.requires_shared_api:
+        refreshed = await shared_authorization.refresh_current(force=True)
+        if not refreshed:
+            channel = guild.system_channel
+            if not isinstance(channel, discord.TextChannel):
+                me = guild.me
+                channel = next(
+                    (
+                        candidate
+                        for candidate in guild.text_channels
+                        if me is None
+                        or candidate.permissions_for(me).send_messages
+                    ),
+                    None,
+                )
+            if channel is not None:
+                try:
+                    await channel.send(
+                        "⚠️ A.R.C. could not verify this server's authorization "
+                        "right now. The bot will stay connected and retry shortly."
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.exception(
+                        "Could not report shared authorization service failure "
+                        "in guild %s.",
+                        guild.id,
+                    )
+            logger.error(
+                "Could not verify authorization after joining guild %s.",
+                guild.id,
+            )
+            return
     if repository.is_guild_authorized(guild.id):
         return
 
@@ -12815,6 +13157,12 @@ async def perform_staff_mirror_action(
     await interaction.followup.send(f"✅ {summary}", ephemeral=True)
 
 
+install_announcement_command(
+    bot,
+    repository,
+    shared_authorization,
+    configured_text_channel,
+)
 install_setup_panel()
 
 

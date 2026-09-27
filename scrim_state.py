@@ -45,7 +45,7 @@ DEFAULT_EMOJI_REGISTRATION_OK = "🆗"
 DEFAULT_EMOJI_REGISTRATION_ACCEPTED = "✅"
 DEFAULT_EMOJI_REGISTRATION_DECLINED = "❌"
 DEFAULT_LICENSE_TYPE = "Standard"
-LICENSE_TYPES = ("Standard", "Gold")
+LICENSE_TYPES = ("Standard", "Gold", "Diamond")
 DEFAULT_KILL_POINTS_VALUE = 1
 DEFAULT_PLACEMENT_POINTS_STRING = "10 6 5 4 3 2 1"
 LEADERBOARD_LAYOUTS = ("1_col", "2_col")
@@ -827,6 +827,46 @@ class ScrimRepository:
         self.authorized_guild_duration_days: dict[int, int] = {}
         self.authorized_guild_license_types: dict[int, str] = {}
         self.authorized_admin_ids: set[int] = set()
+        self.shared_authorizations: dict[
+            int, tuple[datetime | None, int, str]
+        ] | None = None
+
+    def set_shared_authorizations(self, records: list[dict]) -> None:
+        """Replace the in-memory authorization view from the shared service."""
+        snapshot: dict[int, tuple[datetime | None, int, str]] = {}
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError("Invalid shared authorization record.")
+            guild_id = record.get("guildId")
+            license_type = record.get("licenseType")
+            duration_days = record.get("durationDays")
+            expires_at = record.get("expiresAt")
+            if (
+                isinstance(guild_id, bool)
+                or not str(guild_id).isdigit()
+                or not _positive_id(int(guild_id))
+                or license_type not in LICENSE_TYPES
+                or type(duration_days) is not int
+                or duration_days < 0
+            ):
+                raise ValueError("Invalid shared authorization record.")
+            if expires_at is not None and not isinstance(expires_at, datetime):
+                if not isinstance(expires_at, str):
+                    raise ValueError("Invalid shared authorization expiration.")
+                try:
+                    expires_at = datetime.fromisoformat(expires_at)
+                except ValueError as error:
+                    raise ValueError(
+                        "Invalid shared authorization expiration."
+                    ) from error
+            if expires_at is not None:
+                if expires_at.tzinfo is None:
+                    raise ValueError(
+                        "Shared authorization expiration must include a timezone."
+                    )
+                expires_at = expires_at.astimezone(timezone.utc)
+            snapshot[int(guild_id)] = (expires_at, duration_days, license_type)
+        self.shared_authorizations = snapshot
 
     def get(self, scrim_id: str) -> Scrim | None:
         scrim = self.scrims.get(scrim_id)
@@ -839,6 +879,12 @@ class ScrimRepository:
         )
 
     def is_guild_authorized(self, guild_id: int) -> bool:
+        if self.shared_authorizations is not None:
+            authorization = self.shared_authorizations.get(guild_id)
+            if authorization is None:
+                return False
+            expires_at = authorization[0]
+            return expires_at is None or expires_at > datetime.now(timezone.utc)
         if guild_id not in self.authorized_guild_ids:
             return False
         expires_at = self.authorized_guild_expires_at.get(guild_id)
@@ -846,6 +892,11 @@ class ScrimRepository:
 
     def get_server_license_type(self, guild_id: int) -> str:
         """Return the active authorization tier, falling back to legacy config."""
+        if self.shared_authorizations is not None:
+            authorization = self.shared_authorizations.get(guild_id)
+            if authorization is None or not self.is_guild_authorized(guild_id):
+                return DEFAULT_LICENSE_TYPE
+            return authorization[2]
         authorized_license = self.authorized_guild_license_types.get(guild_id)
         if authorized_license is not None:
             return (
@@ -862,6 +913,11 @@ class ScrimRepository:
         """Return durable subscription state, including expired authorizations."""
         if not _positive_id(guild_id):
             raise ValueError("The guild ID must be a positive integer.")
+        if self.shared_authorizations is not None:
+            authorization = self.shared_authorizations.get(guild_id)
+            if authorization is None:
+                return False, None, None
+            return True, authorization[0], authorization[1]
         if guild_id not in self.authorized_guild_ids:
             return False, None, None
         return (
@@ -880,9 +936,23 @@ class ScrimRepository:
         license_type: str | None = None,
     ) -> list[tuple[int, datetime | None, int]]:
         if license_type is not None and license_type not in LICENSE_TYPES:
-            raise ValueError("Choose a Standard or Gold license.")
+            raise ValueError("Choose a Standard, Gold, or Diamond license.")
         now = datetime.now(timezone.utc)
         authorizations = []
+        if self.shared_authorizations is not None:
+            for guild_id, (expires_at, duration_days, stored_license_type) in sorted(
+                self.shared_authorizations.items()
+            ):
+                if license_type is not None and stored_license_type != license_type:
+                    continue
+                if (
+                    not include_expired
+                    and expires_at is not None
+                    and expires_at <= now
+                ):
+                    continue
+                authorizations.append((guild_id, expires_at, duration_days))
+            return authorizations
         for guild_id in sorted(self.authorized_guild_ids):
             expires_at = self.authorized_guild_expires_at.get(guild_id)
             stored_license_type = self.authorized_guild_license_types.get(guild_id)
@@ -922,7 +992,7 @@ class ScrimRepository:
         if license_type is None:
             license_type = self.get_server_license_type(guild_id)
         if license_type not in LICENSE_TYPES:
-            raise ValueError("Choose a Standard or Gold license.")
+            raise ValueError("Choose a Standard, Gold, or Diamond license.")
         duration_days = 0 if days is None else days
         expires_at = (
             datetime.now(timezone.utc) + timedelta(days=duration_days)
@@ -2003,6 +2073,12 @@ class ScrimRepository:
             self.server_configs[guild_id] = config
         return config
 
+    def _require_gold_emoji_license(self, guild_id: int) -> None:
+        if self.get_server_license_type(guild_id) == "Standard":
+            raise ValueError(
+                "Custom emoji customization is available to Gold and Diamond licenses only."
+            )
+
     def save_scrim_emoji(
         self, scrim_id: str, guild_id: int, field_name: str, emoji: str
     ) -> Scrim:
@@ -2018,6 +2094,7 @@ class ScrimRepository:
         scrim = self.get(scrim_id)
         if scrim is None or scrim.guild_id != guild_id:
             raise ValueError("This scrim does not exist on this server.")
+        self._require_gold_emoji_license(guild_id)
         emoji = _normalize_custom_emoji(emoji)
         with self.transaction():
             setattr(scrim, field_name, emoji)
@@ -2035,6 +2112,7 @@ class ScrimRepository:
         scrim = self.get(scrim_id)
         if scrim is None or scrim.guild_id != guild_id:
             raise ValueError("This scrim does not exist on this server.")
+        self._require_gold_emoji_license(guild_id)
         with self.transaction():
             if emoji is None:
                 scrim.slot_number_emojis.pop(slot_number, None)
@@ -2065,6 +2143,7 @@ class ScrimRepository:
         scrim = self.get(scrim_id)
         if scrim is None or scrim.guild_id != guild_id:
             raise ValueError("This scrim does not exist on this server.")
+        self._require_gold_emoji_license(guild_id)
         merged = dict(scrim.slot_number_emojis)
         merged.update(normalized_updates)
         normalized_merged = normalize_slot_number_emojis(merged)
@@ -2079,6 +2158,7 @@ class ScrimRepository:
         scrim = self.get(scrim_id)
         if scrim is None or scrim.guild_id != guild_id:
             raise ValueError("This scrim does not exist on this server.")
+        self._require_gold_emoji_license(guild_id)
         with self.transaction():
             scrim.slot_number_emojis = {}
         return scrim
@@ -2091,6 +2171,7 @@ class ScrimRepository:
         scrim = self.get(scrim_id)
         if scrim is None or scrim.guild_id != guild_id:
             raise ValueError("This scrim does not exist on this server.")
+        self._require_gold_emoji_license(guild_id)
         with self.transaction():
             setattr(scrim, field_name, _normalize_custom_emoji(emoji))
         return scrim
@@ -2120,6 +2201,12 @@ class ScrimRepository:
         scrim = self.get(scrim_id)
         if scrim is None or scrim.guild_id != guild_id:
             raise ValueError("This scrim does not exist on this server.")
+        if section == "emojis":
+            self._require_gold_emoji_license(guild_id)
+        reset_emoji_settings = section == "emojis" or (
+            section == "all"
+            and self.get_server_license_type(guild_id) != "Standard"
+        )
         reset_all = section == "all"
         with self.transaction():
             if section == "required" or reset_all:
@@ -2151,7 +2238,7 @@ class ScrimRepository:
                 scrim.fixed_pw = ""
                 scrim.timezone = DEFAULT_IDPW_TIMEZONE
                 self.idpw_configs.pop(scrim_id, None)
-            if section == "emojis" or reset_all:
+            if reset_emoji_settings:
                 for field_name, emoji in DEFAULT_SCRIM_EMOJIS.items():
                     setattr(scrim, field_name, emoji)
                 scrim.slot_number_emojis = {}
@@ -2357,7 +2444,7 @@ class ScrimRepository:
             or next_footer_height not in LEADERBOARD_FOOTER_HEIGHTS
         ):
             raise ValueError("Invalid leaderboard configuration.")
-        is_gold = self.get_server_license_type(guild_id) == "Gold"
+        is_gold = self.get_server_license_type(guild_id) != "Standard"
         if (
             not is_gold
             and leaderboard_team_count is not _UNSET
