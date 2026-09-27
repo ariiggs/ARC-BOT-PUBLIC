@@ -126,7 +126,7 @@ def _scrim_configuration_details(scrim, repository) -> str:
     map_details = (
         f"**{max_matches} Matches Configured** ({', '.join(maps)})"
         if maps
-        else f"**{max_matches} Matches Configured** (custom maps not configured)"
+        else "Not configured"
     )
     return (
         f"Name: **{_safe_name(scrim.name)}**\n"
@@ -146,7 +146,7 @@ def _scrim_configuration_details(scrim, repository) -> str:
         f"Password mode: **{password_mode}**\n"
         f"Timezone: `{timezone_name}`\n"
         f"Map rotation: {map_details}\n"
-        f"Current match: **{current_match}** / {max_matches}\n"
+        f"{f'Current match: **{current_match}** / {max_matches}' + chr(10) if maps else ''}"
         f"Leaderboard: **{kill_points_value} point(s)/kill**, "
         f"placements `{placement_points}`, layout **{leaderboard_layout}**\n"
         f"ID/PW target: "
@@ -389,7 +389,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             try:
                 await interaction.edit_original_response(
                     content=text,
-                    view=None,
+                    view=success_view,
                 )
             except discord.HTTPException:
                 logger.exception("Could not report a scrim save validation error")
@@ -402,7 +402,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                         "The change could not be saved. "
                         "Please try again."
                     ),
-                    view=None,
+                    view=success_view,
                 )
             except discord.HTTPException:
                 logger.exception("Could not report a scrim save error")
@@ -1048,7 +1048,12 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             assigned_maps = sum(
                 bool(game_map) for game_map in match_maps[:matches]
             )
-            matches_ready = matches > 0
+            matches_ready = bool(
+                maps
+                and matches > 0
+                and len(match_maps) == matches
+                and all(game_map in maps for game_map in match_maps)
+            )
             registration_channel = getattr(
                 selected, "registration_channel_id", None
             )
@@ -1922,7 +1927,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                             label=option.label,
                             value=option.value,
                             default=(
-                                self.grid.match_maps[match_number] == option.value
+                                match_number < len(self.grid.match_maps)
+                                and self.grid.match_maps[match_number] == option.value
                             ),
                         )
                         for option in map_options
@@ -2135,13 +2141,16 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             return f"🟢 {display or value}" if value else "🔴 Missing"
 
         def _resize_match_maps(self) -> None:
-            """Keep assignments aligned with the match count and fill new slots."""
+            """Keep every assignment valid when the pool or match count changes."""
+            if not self.maps:
+                self.match_maps = []
+                return
             existing = list(self.match_maps)
             self.match_maps = [
                 (
                     existing[index]
                     if index < len(existing) and existing[index] in self.maps
-                    else self.maps[index] if index < len(self.maps) else ""
+                    else self.maps[index] if index < len(self.maps) else self.maps[0]
                 )
                 for index in range(self.max_matches)
             ]
@@ -2264,7 +2273,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 )
             elif self.section == "matches_maps":
                 specs = (
-                    ("matches", "Matches", "Match count", f"1-{MAX_MATCHES}", self.max_matches),
+                    ("matches", "Matches", "Match count", f"1-{MAX_MATCHES}", self.max_matches if self.maps else ""),
                     ("maps", "Maps", "Map rotation (optional)", "Erangel, Miramar, Sanhok", ", ".join(self.maps)),
                 )
             elif self.section == "cap_transfer":
@@ -2533,7 +2542,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     f"Registration role: {self._mention_role(self.registration_role_id)}"
                 )
                 settings_value = (
-                    f"Matches: **{self.max_matches}** "
+                    f"Matches: **{self.max_matches if self.maps else 'Not configured'}** "
                     f"({f'{self.slot_start:02d}–{self.slot_end:02d}' if self.slot_start is not None and self.slot_end is not None else 'slot range not configured'})\n"
                     f"Custom Maps: **{maps_value}**\n"
                     f"Match Maps: **{match_maps_value}**\n"
@@ -2788,7 +2797,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 self.add_item(button)
 
             settings = (
-                ("matches", "Matches", "Match count", f"1-{MAX_MATCHES}", self.max_matches),
+                ("matches", "Matches", "Match count", f"1-{MAX_MATCHES}", self.max_matches or ""),
                 (
                     "maps",
                     "Custom Maps",
@@ -3233,7 +3242,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                         self.match_maps = []
                     else:
                         _, self.maps = _match_configuration_from_values(
-                            self.max_matches, raw_value
+                            self.max_matches or len(DEFAULT_MATCH_MAPS), raw_value
                         )
                         self._resize_match_maps()
                 elif setting == "pw_mode":
@@ -3349,6 +3358,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                             "maps": list(self.maps),
                             "match_maps": list(self.match_maps),
                         },
+                        success_view=self,
                     )
                 elif setting == "leaderboard":
                     await interaction.response.defer()
@@ -3484,8 +3494,8 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                     slot_start=self.slot_start,
                     slot_end=self.slot_end,
                     max_matches=self.max_matches or len(DEFAULT_MATCH_MAPS),
-                    maps=self.maps or list(DEFAULT_MATCH_MAPS),
-                    match_maps=self.match_maps or list(DEFAULT_MATCH_MAPS),
+                    maps=list(self.maps),
+                    match_maps=list(self.match_maps),
                     kill_points_value=self.kill_points_value,
                     placement_points_string=self.placement_points_string,
                     leaderboard_layout=self.leaderboard_layout,

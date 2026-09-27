@@ -4445,7 +4445,7 @@ async def _parse_idpw_input(
 
 def _format_idpw_announcement(
     *,
-    match_number: int,
+    match_number: int | None,
     room_id: str,
     password: str,
     start_time: str,
@@ -4465,7 +4465,8 @@ def _format_idpw_announcement(
             f"{start_label} : {start_time}",
         )
     )
-    lines = [f"# __**Match {match_number}**__"]
+    title = f"Match {match_number}" if match_number is not None else "Next Match"
+    lines = [f"# __**{title}**__"]
     if separate_role_mention:
         lines.append("")
     lines.append(f"**{chr(10).join(detail_lines)}**")
@@ -4550,6 +4551,17 @@ async def _publish_idpw_locked(
             ctx, "The number of minutes must be at least 1."
         )
         return
+    if specific_match and (
+        requested_match is None
+        or not 1 <= requested_match <= scrim.max_matches
+        or not _match_map_for_scrim(scrim, requested_match)
+    ):
+        await send_private_command_feedback(
+            ctx,
+            "Set up Matches & Maps and assign a map to this match in `!setup` "
+            "before using `!idpwgN`.",
+        )
+        return
     target_channel = await configured_text_channel(scrim, config.target_channel_id)
     if target_channel is None:
         await send_private_command_feedback(
@@ -4563,7 +4575,7 @@ async def _publish_idpw_locked(
         start_timestamp, tz=timezone_for_name(config.timezone_name)
     )
     heure_formatee = local_start.strftime("%H:%M")
-    match_number = requested_match or scrim.current_match_counter
+    match_number = requested_match if specific_match else None
     if password is None:
         password = getattr(scrim, "fixed_pw", "") or config.fixed_password
     message_content = _format_idpw_announcement(
@@ -4572,8 +4584,8 @@ async def _publish_idpw_locked(
         password=password,
         start_time=heure_formatee,
         confirmed_role_id=scrim.confirmed_role_id,
-        map_name=_match_map_for_scrim(scrim, match_number),
-        start_label="Start Time" if specific_match else "Start",
+        map_name=_match_map_for_scrim(scrim, requested_match) if specific_match else None,
+        start_label="Start Time",
         separate_role_mention=specific_match,
     )
     role_mentions = discord.AllowedMentions(
@@ -4622,21 +4634,21 @@ async def _publish_idpw_locked(
     await clear_active_idpw(scrim.id, preserve_message_id=message.id)
     state = {"message": message, "messages": [message], "tasks": []}
     active_idpw[scrim.id] = state
-    try:
-        with repository.transaction():
-            current_match = requested_match or scrim.current_match_counter
-            scrim.current_match_counter = current_match % scrim.max_matches + 1
-    except SlotStorageError:
-        logger.exception(
-            "Could not advance the match counter after ID/PW for scrim %s.",
-            scrim.id,
-        )
-        await send_private_command_feedback(
-            ctx,
-            "The room details and reminders are active, but the match counter "
-            "could not be advanced. Check it in setup before the next match.",
-            delete_after=30,
-        )
+    if specific_match:
+        try:
+            with repository.transaction():
+                scrim.current_match_counter = requested_match % scrim.max_matches + 1
+        except SlotStorageError:
+            logger.exception(
+                "Could not advance the match counter after ID/PW for scrim %s.",
+                scrim.id,
+            )
+            await send_private_command_feedback(
+                ctx,
+                "The room details and reminders are active, but the match counter "
+                "could not be advanced. Check it in setup before the next match.",
+                delete_after=30,
+            )
     tasks = state["tasks"]
     if minutes > 3:
         tasks.append(

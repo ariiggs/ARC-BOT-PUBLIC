@@ -419,9 +419,9 @@ class Scrim:
     slot_end: int | None = DEFAULT_SLOT_END
     slots: dict[int, Slot] = field(default_factory=empty_slots)
     timezone: str = DEFAULT_IDPW_TIMEZONE
-    maps: list[str] = field(default_factory=lambda: list(DEFAULT_MATCH_MAPS))
+    maps: list[str] = field(default_factory=list)
     max_matches: int = len(DEFAULT_MATCH_MAPS)
-    match_maps: list[str] = field(default_factory=lambda: list(DEFAULT_MATCH_MAPS))
+    match_maps: list[str] = field(default_factory=list)
     pw_type: str = "fixed"
     fixed_pw: str = ""
     current_match_counter: int = 1
@@ -2138,8 +2138,8 @@ class ScrimRepository:
                 scrim.cap_channel_id = None
             if section == "matches_maps" or reset_all:
                 scrim.max_matches = len(DEFAULT_MATCH_MAPS)
-                scrim.maps = list(DEFAULT_MATCH_MAPS)
-                scrim.match_maps = list(DEFAULT_MATCH_MAPS)
+                scrim.maps = []
+                scrim.match_maps = []
                 scrim.current_match_counter = 1
             if section == "registrations" or reset_all:
                 scrim.registration_channel_id = None
@@ -2697,7 +2697,7 @@ class ScrimRepository:
         slot_start: int = DEFAULT_SLOT_START,
         slot_end: int = DEFAULT_SLOT_END,
         max_matches: int = len(DEFAULT_MATCH_MAPS),
-        maps: list[str] | tuple[str, ...] = DEFAULT_MATCH_MAPS,
+        maps: list[str] | tuple[str, ...] = (),
         match_maps: list[str] | tuple[str, ...] | None = None,
         kill_points_value: int = DEFAULT_KILL_POINTS_VALUE,
         placement_points_string: str = DEFAULT_PLACEMENT_POINTS_STRING,
@@ -2848,7 +2848,7 @@ class ScrimRepository:
         slot_start: int = DEFAULT_SLOT_START,
         slot_end: int = DEFAULT_SLOT_END,
         max_matches: int = len(DEFAULT_MATCH_MAPS),
-        maps: list[str] | tuple[str, ...] = DEFAULT_MATCH_MAPS,
+        maps: list[str] | tuple[str, ...] = (),
         match_maps: list[str] | tuple[str, ...] | None = None,
         kill_points_value: int = DEFAULT_KILL_POINTS_VALUE,
         placement_points_string: str = DEFAULT_PLACEMENT_POINTS_STRING,
@@ -3156,7 +3156,7 @@ class ScrimRepository:
         *,
         cap_channel_id: int | None = None,
         max_matches: int = len(DEFAULT_MATCH_MAPS),
-        maps: list[str] | tuple[str, ...] = DEFAULT_MATCH_MAPS,
+        maps: list[str] | tuple[str, ...] = (),
     ) -> Scrim:
         if self.legacy is None or self.legacy["public_board"] is None:
             raise ValueError("No legacy board can be linked. Existing unlinked data is preserved.")
