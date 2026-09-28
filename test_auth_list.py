@@ -19,7 +19,8 @@ from main import (
     build_auth_tier_embed,
     authorized_guild_name,
 )
-from scrim_state import ScrimRepository
+from license_labels import license_display_name
+from scrim_state import LICENSE_TYPES, ScrimRepository
 from slot_storage import SlotStateStore
 
 
@@ -115,7 +116,7 @@ class AuthPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["view"].owner_id, 1234)
         self.assertEqual(
             [button.label for button in kwargs["view"].children],
-            ["Standard", "Gold", "Diamond", "Close"],
+            ["ARC Go", "ARC Pro", "ARC Pro Max", "Close"],
         )
         self.assertEqual(kwargs["delete_after"], 330)
         self.assertIs(kwargs["view"].message, message)
@@ -130,7 +131,14 @@ class AuthPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("A.R.C. Beta", embed.description)
         self.assertEqual(
             [button.label for button in view.children],
-            ["Standard", "Gold", "Diamond", "Close"],
+            ["ARC Go", "ARC Pro", "ARC Pro Max", "Close"],
+        )
+
+    def test_license_display_names_leave_internal_tier_keys_unchanged(self):
+        self.assertEqual(LICENSE_TYPES, ("Standard", "Gold", "Diamond"))
+        self.assertEqual(
+            [license_display_name(tier) for tier in LICENSE_TYPES],
+            ["ARC Go", "ARC Pro", "ARC Pro Max"],
         )
 
     def test_pre_switch_sqlite_licenses_keep_tiers_durations_and_expiries(self):
@@ -205,7 +213,7 @@ class AuthPanelTests(unittest.IsolatedAsyncioTestCase):
             include_expired=True,
             license_type="Gold",
         )
-        self.assertIn("Gold Guild Authorizations", embed.title)
+        self.assertIn("ARC Pro Guild Authorizations", embed.title)
         self.assertIn("A.R.C. Scrims", embed.fields[0].name)
         self.assertIn("123", embed.fields[0].name)
         self.assertIn("Time left", embed.fields[0].value)
@@ -235,7 +243,7 @@ class AuthPanelTests(unittest.IsolatedAsyncioTestCase):
         view = AuthAdminPanelView(owner_id=1234)
         self.assertEqual(
             [button.label for button in view.children],
-            ["Standard", "Gold", "Diamond", "Close"],
+            ["ARC Go", "ARC Pro", "ARC Pro Max", "Close"],
         )
 
         view.selected_tier = "Diamond"
@@ -264,6 +272,7 @@ class AuthPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(modal, AuthAddGuildModal)
         self.assertEqual(modal.product, ARC_AUTH_PRODUCT)
         self.assertEqual(modal.license_type, "Diamond")
+        self.assertIn("ARC Pro Max", modal.title)
 
     async def test_adding_diamond_license_saves_to_this_bots_sqlite(self):
         with tempfile.TemporaryDirectory() as directory:

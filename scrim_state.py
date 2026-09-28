@@ -936,7 +936,7 @@ class ScrimRepository:
         license_type: str | None = None,
     ) -> list[tuple[int, datetime | None, int]]:
         if license_type is not None and license_type not in LICENSE_TYPES:
-            raise ValueError("Choose a Standard, Gold, or Diamond license.")
+            raise ValueError("Choose an ARC Go, ARC Pro, or ARC Pro Max license.")
         now = datetime.now(timezone.utc)
         authorizations = []
         if self.shared_authorizations is not None:
@@ -992,7 +992,7 @@ class ScrimRepository:
         if license_type is None:
             license_type = self.get_server_license_type(guild_id)
         if license_type not in LICENSE_TYPES:
-            raise ValueError("Choose a Standard, Gold, or Diamond license.")
+            raise ValueError("Choose an ARC Go, ARC Pro, or ARC Pro Max license.")
         duration_days = 0 if days is None else days
         expires_at = (
             datetime.now(timezone.utc) + timedelta(days=duration_days)
@@ -2076,7 +2076,7 @@ class ScrimRepository:
     def _require_gold_emoji_license(self, guild_id: int) -> None:
         if self.get_server_license_type(guild_id) == "Standard":
             raise ValueError(
-                "Custom emoji customization is available to Gold and Diamond licenses only."
+                "Custom emoji customization is available to ARC Pro and ARC Pro Max licenses only."
             )
 
     def save_scrim_emoji(
@@ -2451,7 +2451,7 @@ class ScrimRepository:
             and next_team_count != 20
         ):
             raise ValueError(
-                "Standard licenses are locked to 20 teams."
+                "ARC Go licenses are locked to 20 teams."
             )
         profile_team_count = next_team_count if is_gold else 20
         active_profile_key = leaderboard_profile_key(

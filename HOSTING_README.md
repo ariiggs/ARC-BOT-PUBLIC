@@ -43,7 +43,7 @@ Le rôle du bot doit être placé au-dessus des rôles qu'il doit gérer.
 
 1. Ouvrir un DM avec chaque bot et envoyer `!auth`. Le bot Beta gère uniquement
    ses propres licences, et le bot Public gère uniquement les siennes. Choisir
-   **Standard**, **Gold** ou **Diamond**, puis utiliser **Add** pour saisir l'ID
+   **ARC Go**, **ARC Pro** ou **ARC Pro Max**, puis utiliser **Add** pour saisir l'ID
    du serveur et sa durée. `0` ou `unlimited` signifie que l'accès n'expire
    jamais. Le panneau est privé et n'est accessible qu'au propriétaire du bot
    ou à un utilisateur ajouté avec `!admin add`.
@@ -67,8 +67,8 @@ Chaque bot conserve ses autorisations dans sa propre base SQLite persistante
 `ARC_AUTH_API_TOKEN` ou `ARC_AUTH_PRODUCT` n'est nécessaire pour les licences.
 Conserver le fichier SQLite existant de chaque hébergement lors des mises à
 jour : il contient également les scrims, les équipes et les réglages. Avant de
-retirer un ancien service partagé, vérifier les licences Standard, Gold et
-Diamond, ainsi que leurs expirations, dans le DM de **chaque** bot. Une
+retirer un ancien service partagé, vérifier les licences ARC Go, ARC Pro et
+ARC Pro Max, ainsi que leurs expirations, dans le DM de **chaque** bot. Une
 autorisation créée uniquement dans un service partagé n'est pas copiée
 automatiquement dans les fichiers SQLite des hébergements.
 

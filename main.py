@@ -21,6 +21,7 @@ from discord.ext import commands
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from slot_storage import SlotStateStore, SlotStorageError
+from license_labels import license_display_name
 from scrim_state import (
     STATUS_AVAILABLE,
     STATUS_CONFIRMED,
@@ -6719,8 +6720,8 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         embed = discord.Embed(
             title=f"Edit Leaderboard — {discord.utils.escape_markdown(scrim.name)}",
             description=(
-                "Standard is fixed at 20 teams in either orientation. "
-                "Gold and Diamond can choose the team count. Backgrounds are available "
+                "ARC Go is fixed at 20 teams in either orientation. "
+                "ARC Pro and ARC Pro Max can choose the team count. Backgrounds are available "
                 "for each license-available profile."
                 if not is_gold
                 else
@@ -6784,7 +6785,7 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
             label=(
                 "Teams to Display"
                 if repository.get_server_license_type(self.guild_id) != "Standard"
-                else "Teams to Display · Gold+"
+                else "Teams to Display · ARC Pro+"
             ),
             emoji="🔢",
             style=discord.ButtonStyle.primary,
@@ -6795,8 +6796,8 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
         async def teams_callback(interaction: discord.Interaction) -> None:
             if repository.get_server_license_type(self.guild_id) == "Standard":
                 await interaction.response.send_message(
-                    "Standard licenses are locked to 20 teams. "
-                    "Gold and Diamond licenses can change the team count.",
+                    "ARC Go licenses are locked to 20 teams. "
+                    "ARC Pro and ARC Pro Max licenses can change the team count.",
                     ephemeral=True,
                 )
                 return
@@ -7606,8 +7607,8 @@ class LeaderboardTeamCountView(LeaderboardPanelView):
             description=(
                 f"Current setting: **{current} teams**."
                 if is_gold
-                else "Standard licenses are locked to **20 teams**. "
-                "Gold and Diamond licenses can change this setting."
+                else "ARC Go licenses are locked to **20 teams**. "
+                "ARC Pro and ARC Pro Max licenses can change this setting."
             ),
             color=discord.Color.blurple(),
         )
@@ -7640,8 +7641,8 @@ class LeaderboardTeamCountView(LeaderboardPanelView):
             async def select_callback(interaction: discord.Interaction) -> None:
                 if repository.get_server_license_type(self.guild_id) == "Standard":
                     await interaction.response.send_message(
-                        "Standard licenses are locked to 20 teams. "
-                        "Gold and Diamond licenses can change the team count.",
+                        "ARC Go licenses are locked to 20 teams. "
+                        "ARC Pro and ARC Pro Max licenses can change the team count.",
                         ephemeral=True,
                     )
                     return
@@ -7738,7 +7739,7 @@ class LeaderboardOrientationView(LeaderboardPanelView):
         description = f"Current setting: **{current.title()}**."
         if repository.get_server_license_type(self.guild_id) == "Standard":
             description += (
-                "\nStandard licenses use 20 teams in either orientation."
+                "\nARC Go licenses use 20 teams in either orientation."
             )
         return discord.Embed(
             title="Leaderboard Orientation",
@@ -8684,10 +8685,11 @@ async def build_auth_tier_embed(
     license_type: str,
 ) -> discord.Embed:
     if license_type not in LICENSE_TYPES:
-        raise ValueError("Choose a Standard, Gold, or Diamond version.")
+        raise ValueError("Choose an ARC Go, ARC Pro, or ARC Pro Max version.")
+    display_name = license_display_name(license_type)
     authorizations = authorization_rows(license_type)
     embed = discord.Embed(
-        title=f"💎 {arc_product_label(ARC_AUTH_PRODUCT)} — {license_type} Guild Authorizations",
+        title=f"💎 {arc_product_label(ARC_AUTH_PRODUCT)} — {display_name} Guild Authorizations",
         color=(
             discord.Color.gold()
             if license_type == "Gold"
@@ -8700,7 +8702,7 @@ async def build_auth_tier_embed(
     )
     if not authorizations:
         embed.description = (
-            f"No guilds are assigned to the {license_type} version of "
+            f"No guilds are assigned to the {display_name} version of "
             f"{arc_product_label(ARC_AUTH_PRODUCT)}."
         )
         return embed
@@ -8820,7 +8822,7 @@ class AuthAdminPanelView(DurableView):
                     await self.show_tier(interaction, selected_tier)
 
                 self._add_button(
-                    tier,
+                    license_display_name(tier),
                     discord.ButtonStyle.primary,
                     select_tier,
                 )
@@ -8909,7 +8911,7 @@ class AuthAddGuildModal(discord.ui.Modal):
         license_type: str,
     ):
         super().__init__(
-            title=f"Add {arc_product_label(ARC_AUTH_PRODUCT)} {license_type}",
+            title=f"Add {arc_product_label(ARC_AUTH_PRODUCT)} {license_display_name(license_type)}",
             timeout=300,
         )
         self.panel = panel
@@ -8974,7 +8976,7 @@ class AuthAddGuildModal(discord.ui.Modal):
         await self.panel.refresh_panel()
         await interaction.followup.send(
             f"Guild `{guild_id}` authorization {status} for "
-            f"**{arc_product_label(self.product)} — {self.license_type}** "
+            f"**{arc_product_label(self.product)} — {license_display_name(self.license_type)}** "
             f"{duration_text}.",
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -8988,7 +8990,7 @@ class AuthRemoveGuildModal(discord.ui.Modal):
         license_type: str,
     ):
         super().__init__(
-            title=f"Remove {arc_product_label(ARC_AUTH_PRODUCT)} {license_type}",
+            title=f"Remove {arc_product_label(ARC_AUTH_PRODUCT)} {license_display_name(license_type)}",
             timeout=300,
         )
         self.panel = panel
@@ -8996,7 +8998,7 @@ class AuthRemoveGuildModal(discord.ui.Modal):
         self.license_type = license_type
         self.guild_id_input = discord.ui.TextInput(
             label="Guild ID",
-            placeholder=f"Enter a {license_type} guild ID",
+            placeholder=f"Enter an {license_display_name(license_type)} guild ID",
             required=True,
             max_length=20,
         )
@@ -9022,7 +9024,7 @@ class AuthRemoveGuildModal(discord.ui.Modal):
         if guild_id not in {item[0] for item in tier_authorizations}:
             await interaction.followup.send(
                 f"Guild `{guild_id}` is not assigned to the "
-                f"**{self.license_type}** version of "
+                f"**{license_display_name(self.license_type)}** version of "
                 f"**{arc_product_label(self.product)}**.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
@@ -9055,7 +9057,7 @@ class AuthRemoveGuildModal(discord.ui.Modal):
         await self.panel.refresh_panel()
         await interaction.followup.send(
             f"Guild `{guild_id}` was removed from the "
-            f"**{arc_product_label(self.product)} — {self.license_type}** version.",
+            f"**{arc_product_label(self.product)} — {license_display_name(self.license_type)}** version.",
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )

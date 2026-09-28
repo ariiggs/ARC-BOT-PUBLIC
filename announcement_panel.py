@@ -11,6 +11,8 @@ from typing import Any
 import discord
 from discord.ext import commands
 
+from license_labels import license_display_name
+
 logger = logging.getLogger("pung-scrim-bot.announcements")
 
 ANNOUNCEMENT_AUDIENCES = {
@@ -46,7 +48,21 @@ def eligible_license_types(announcement_tier: str) -> frozenset[str]:
     try:
         return ANNOUNCEMENT_AUDIENCES[announcement_tier]
     except KeyError as error:
-        raise ValueError("Choose Standard, Gold, or Diamond.") from error
+        raise ValueError("Choose ARC Go, ARC Pro, or ARC Pro Max.") from error
+
+
+def announcement_audience_description(announcement_tier: str) -> str:
+    """Describe the included audiences using current display names."""
+    allowed = ANNOUNCEMENT_AUDIENCES[announcement_tier]
+    ordered_tiers = ("Standard", "Gold", "Diamond")
+    names = [
+        license_display_name(tier)
+        for tier in ordered_tiers
+        if tier in allowed
+    ]
+    if len(names) == 1:
+        return f"{names[0]} servers"
+    return f"{', '.join(names[:-1])} and {names[-1]} servers"
 
 
 def parse_server_selection(value: str, eligible_ids: set[int]) -> list[int]:
@@ -222,15 +238,9 @@ class AnnouncementWizard(discord.ui.View):
             max_values=1,
             options=[
                 discord.SelectOption(
-                    label=tier,
+                    label=license_display_name(tier),
                     value=tier,
-                    description=(
-                        "Standard servers"
-                        if tier == "Standard"
-                        else "Standard and Gold servers"
-                        if tier == "Gold"
-                        else "Standard, Gold, and Diamond servers"
-                    ),
+                    description=announcement_audience_description(tier),
                 )
                 for tier in ANNOUNCEMENT_AUDIENCES
             ],
@@ -303,14 +313,14 @@ class AnnouncementWizard(discord.ui.View):
             return
         eligible = await self.eligible_guilds(tier)
         lines = [
-            f"**Eligible {tier} announcement servers**",
+            f"**Eligible {license_display_name(tier)} announcement servers**",
             "Use `all` to choose every listed server, or enter specific IDs in "
             "the next step.",
         ]
         for guild_id, (guild, license_type) in eligible.items():
             lines.append(
                 f"• {discord.utils.escape_markdown(guild.name)} "
-                f"(`{guild_id}`) — {license_type}"
+                f"(`{guild_id}`) — {license_display_name(license_type)}"
             )
         if not eligible:
             lines.append(
@@ -356,7 +366,8 @@ class AnnouncementWizard(discord.ui.View):
         self.add_item(choose_button)
         self.add_cancel_button()
         await self._edit_anchor(
-            f"**{tier} announcement** — {len(eligible)} eligible server(s). "
+            f"**{license_display_name(tier)} announcement** — "
+            f"{len(eligible)} eligible server(s). "
             "Review the server ID list sent above, then choose the exact "
             "destinations. Nothing has been sent.",
             embed=None,
@@ -401,7 +412,7 @@ class AnnouncementWizard(discord.ui.View):
 
         names = [
             f"• {discord.utils.escape_markdown(eligible[guild_id][0].name)} "
-            f"(`{guild_id}`) — {eligible[guild_id][1]}"
+            f"(`{guild_id}`) — {license_display_name(eligible[guild_id][1])}"
             for guild_id in self.guild_ids
         ]
         message_lines = [
@@ -555,7 +566,7 @@ class AnnouncementWizard(discord.ui.View):
                 return
 
         embed = discord.Embed(
-            title=f"{snapshot.tier} announcement preview",
+            title=f"{license_display_name(snapshot.tier)} announcement preview",
             description=snapshot.body,
             color=ANNOUNCEMENT_COLORS[snapshot.tier],
         )
@@ -724,7 +735,8 @@ class AnnouncementWizard(discord.ui.View):
             else:
                 lines.append(
                     f"• {discord.utils.escape_markdown(target.guild_name)} "
-                    f"(`{target.guild_id}`, {target.license_type}) — "
+                    f"(`{target.guild_id}`, "
+                    f"{license_display_name(target.license_type)}) — "
                     f"#{discord.utils.escape_markdown(target.channel_name or '')} "
                     f"(`{target.channel.id}`)"
                 )

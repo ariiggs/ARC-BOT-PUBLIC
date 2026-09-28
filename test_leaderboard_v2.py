@@ -914,7 +914,7 @@ class LeaderboardV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [child.label for child in edit_view.children],
                 [
-                    "Teams to Display · Gold",
+                    "Teams to Display · ARC Pro+",
                     "Background",
                     "Orientation",
                     "Text Color",

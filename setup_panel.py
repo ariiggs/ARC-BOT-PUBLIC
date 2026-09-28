@@ -3300,7 +3300,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                         == "Standard"
                     ):
                         raise ValueError(
-                            "The 2-column layout requires a Gold or Diamond license."
+                            "The 2-column layout requires an ARC Pro or ARC Pro Max license."
                         )
                 else:
                     raise ValueError("Unknown configuration setting.")
@@ -3747,7 +3747,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
         if _gold_emoji_license_enabled(guild_id):
             return True
         await interaction.response.send_message(
-            "Custom emoji customization is available to Gold and Diamond licenses only.",
+            "Custom emoji customization is available to ARC Pro and ARC Pro Max licenses only.",
             ephemeral=True,
         )
         return False
