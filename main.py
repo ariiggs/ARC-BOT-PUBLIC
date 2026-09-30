@@ -137,6 +137,11 @@ FIGURE_SPACE = "\u2007"
 LEADERBOARD_BACKGROUND = (
     Path(__file__).parent / "assets" / "leaderboard-background.png"
 )
+LEADERBOARD_HORIZONTAL_20_BACKGROUND = (
+    Path(__file__).parent
+    / "assets"
+    / "leaderboard-background-horizontal-20.png"
+)
 LEADERBOARD_BLUEPRINT_DIR = (
     Path(__file__).parent / "assets" / "leaderboard-blueprints"
 )
@@ -5813,6 +5818,15 @@ def _leaderboard_scrim_profile(scrim: Scrim) -> tuple[str, int]:
     return orientation, team_count
 
 
+def _default_leaderboard_background_path(
+    orientation: str,
+    team_count: int,
+) -> Path:
+    if orientation == "horizontal" and team_count == 20:
+        return LEADERBOARD_HORIZONTAL_20_BACKGROUND
+    return LEADERBOARD_BACKGROUND
+
+
 def _leaderboard_profile_accent_color(scrim: Scrim) -> str:
     orientation, team_count = _leaderboard_scrim_profile(scrim)
     accent_colors = getattr(scrim, "leaderboard_accent_colors", {})
@@ -5894,7 +5908,11 @@ def _current_leaderboard_background_path(scrim: Scrim) -> Path:
         orientation,
         team_count,
     )
-    return custom_path if custom_path.is_file() else LEADERBOARD_BACKGROUND
+    return (
+        custom_path
+        if custom_path.is_file()
+        else _default_leaderboard_background_path(orientation, team_count)
+    )
 
 
 def _leaderboard_background_lock(scrim_id: str) -> asyncio.Lock:
@@ -7720,7 +7738,9 @@ async def _restore_default_leaderboard_background(
         preview = None
         moved_custom = False
         try:
-            default_buffer, _ = _build_empty_leaderboard_blueprint(scrim)
+            default_buffer, _ = _build_default_leaderboard_background_preview(
+                scrim
+            )
             preview_file = discord.File(
                 default_buffer,
                 filename=f"leaderboard-background-{scrim.id}-{profile_suffix}.png",
@@ -9203,6 +9223,29 @@ def _build_empty_leaderboard_blueprint(scrim: Scrim) -> tuple[io.BytesIO, str]:
     return buffer, filename
 
 
+def _build_default_leaderboard_background_preview(
+    scrim: Scrim,
+) -> tuple[io.BytesIO, str]:
+    """Build a preview of the actual built-in background for this profile."""
+    orientation, team_count = _leaderboard_scrim_profile(scrim)
+    width, height = leaderboard_canvas_dimensions(team_count, orientation)
+    canvas = _load_leaderboard_background_canvas(
+        _default_leaderboard_background_path(orientation, team_count),
+        (width, height),
+    )
+    buffer = io.BytesIO()
+    try:
+        canvas.convert("RGB").save(buffer, format="PNG", optimize=True)
+    finally:
+        canvas.close()
+    buffer.seek(0)
+    filename = (
+        f"leaderboard-background-{team_count}-{orientation}-"
+        f"{width}x{height}.png"
+    )
+    return buffer, filename
+
+
 def _generate_default_leaderboard_background(
     size: tuple[int, int],
 ) -> Image.Image:
@@ -9267,7 +9310,10 @@ def _build_configured_leaderboard_image(
 ) -> io.BytesIO:
     orientation, team_limit = _leaderboard_scrim_profile(scrim)
     # Custom uploads already contain their own title and column labels.
-    render_template_labels = background_path == LEADERBOARD_BACKGROUND
+    render_template_labels = background_path in (
+        LEADERBOARD_BACKGROUND,
+        LEADERBOARD_HORIZONTAL_20_BACKGROUND,
+    )
     header_height = DEFAULT_LEADERBOARD_HEADER_HEIGHT
 
     rows = rows[:team_limit]
