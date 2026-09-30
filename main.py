@@ -4,24 +4,77 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import io
 import json
 import logging
 import os
 import re
 import secrets
+import sys
 import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+def _load_local_feature_module(filename: str, stem: str):
+    """Load stateful features under an identity owned by this entry point."""
+    path = Path(__file__).parent / filename
+    module_name = (
+        f"_arc_local_{stem}_"
+        f"{hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:16]}_"
+        f"{id(sys.modules[__name__]):x}"
+    )
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load local feature module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
 import discord
 from discord.ext import commands
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from slot_storage import SlotStateStore, SlotStorageError
-from license_labels import license_display_name
+from arc_bot.client import create_bot, create_intents
+from arc_bot.commands import bans as ban_commands
+install_events = _load_local_feature_module(
+    "arc_bot/events/startup.py", "events_startup"
+).install_events
+from arc_bot.commands.help import (
+    HELP_CATEGORIES,
+    HELP_COPY_TEXT,
+    HelpView,
+    build_help_text,
+    create_help_command,
+)
+authorization_commands = _load_local_feature_module(
+    "arc_bot/commands/authorization.py", "authorization"
+)
+scrim_lifecycle = _load_local_feature_module(
+    "arc_bot/commands/scrim_lifecycle.py", "scrim_lifecycle"
+)
+from arc_bot.commands.subscription import (
+    SUPPORT_SERVER_URL,
+    SubscriptionStatusView,
+    build_subscription_embed,
+    create_subscription_command,
+    create_support_link_command,
+    subscription_remaining_text,
+)
+from arc_bot.domain.license_labels import license_display_name
+from arc_bot.storage.slot_storage import SlotStateStore, SlotStorageError
+from arc_bot.utils.discord_views import (
+    delete_message_or_clear,
+    disable_view_items,
+)
+from arc_bot.views.base import DurableView, ExpiringView
 from scrim_state import (
     STATUS_AVAILABLE,
     STATUS_CONFIRMED,
@@ -35,7 +88,6 @@ from scrim_state import (
     DEFAULT_LEADERBOARD_ORIENTATION,
     DEFAULT_LEADERBOARD_TEAM_COUNT,
     OPERATIONAL_MESSAGE_KEYS,
-    LEADERBOARD_LAYOUTS,
     LEADERBOARD_ORIENTATIONS,
     LEADERBOARD_TEAM_COUNTS,
     LICENSE_TYPES,
@@ -51,6 +103,29 @@ from scrim_state import (
     timezone_for_name,
 )
 from announcement_panel import install_announcement_command
+add_commands = _load_local_feature_module("arc_bot/commands/add.py", "add")
+idpw_commands = _load_local_feature_module("arc_bot/commands/idpw.py", "idpw")
+staff_messaging = _load_local_feature_module(
+    "arc_bot/commands/staff_messaging.py", "staff_messaging"
+)
+staff_mirror = _load_local_feature_module(
+    "arc_bot/commands/staff_mirror.py", "staff_mirror"
+)
+staff_slots = _load_local_feature_module(
+    "arc_bot/commands/staff_slots.py", "staff_slots"
+)
+registration_commands = _load_local_feature_module(
+    "arc_bot/commands/registration.py", "registration"
+)
+match_results = _load_local_feature_module(
+    "arc_bot/commands/match_results.py", "match_results"
+)
+leaderboard_commands = _load_local_feature_module(
+    "arc_bot/commands/leaderboard.py", "leaderboard"
+)
+slots_commands = _load_local_feature_module(
+    "arc_bot/commands/slots.py", "slots"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,7 +134,6 @@ logging.basicConfig(
 logger = logging.getLogger("pung-scrim-bot")
 
 FIGURE_SPACE = "\u2007"
-SUPPORT_SERVER_URL = "https://discord.gg/S8uaGEJGv8"
 LEADERBOARD_BACKGROUND = (
     Path(__file__).parent / "assets" / "leaderboard-background.png"
 )
@@ -139,63 +213,21 @@ def _leaderboard_accent_label(color_hex: str) -> str:
     return f"Custom HEX (`{normalized}`)"
 
 state_store = SlotStateStore(
-    os.getenv("SLOTS_DB_PATH", str(Path(__file__).parent / "data" / "slots.sqlite3"))
+    os.getenv(
+        "PUBLIC_SLOTS_DB_PATH",
+        str(Path(__file__).parent / "data" / "slots.sqlite3"),
+    )
 )
 repository = ScrimRepository(state_store)
 ARC_AUTH_PRODUCT = "public"
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+intents = create_intents()
+bot = create_bot(command_prefix="!", intents=intents, help_command=None)
 bot.remove_command("help")
 _setup_installed = False
 _global_setup_installed = False
 _loaded = False
-# Each scrim owns its own live announcement and alert tasks.
-active_idpw: dict[str, dict[str, object]] = {}
-active_idpw_locks: dict[str, asyncio.Lock] = {}
 logs_coverage_snapshots_sent: set[str] = set()
-
-
-class UnauthorizedGuild(commands.CheckFailure):
-    """Raised when a command is used from a guild outside the whitelist."""
-
-
-class UnauthorizedAuthAdmin(commands.CheckFailure):
-    """Raised when a user without bot-admin access invokes !auth."""
-
-
-async def whitelist_check(ctx: commands.Context) -> bool:
-    command_name = getattr(ctx.command, "qualified_name", "")
-    if (
-        command_name == "auth"
-        or command_name.startswith("auth ")
-        or command_name == "admin"
-        or command_name.startswith("admin ")
-        or command_name in {"sub", "status"}
-    ):
-        return True
-    if ctx.guild is None:
-        return True
-    if repository.is_guild_authorized(ctx.guild.id):
-        return True
-    raise UnauthorizedGuild()
-
-
-bot.add_check(whitelist_check)
-
-
-async def auth_admin_check(ctx: commands.Context) -> bool:
-    if await bot.is_owner(ctx.author) or repository.is_admin_authorized(
-        ctx.author.id
-    ):
-        return True
-    raise UnauthorizedAuthAdmin()
-
-
-def auth_admin_required():
-    return commands.check(auth_admin_check)
 
 
 def is_active(scrim: Scrim) -> bool:
@@ -247,6 +279,8 @@ def scrim_configuration_errors(scrim: Scrim) -> tuple[str, ...]:
             or (field == "name" and not str(getattr(scrim, field)).strip())
         )
     )
+    # Do not reject older duck-typed test/integration objects that predate the
+    # setup model; actual Scrim instances expose every required field.
     if not any(hasattr(scrim, field) for field, _ in required):
         return ()
     if errors:
@@ -280,6 +314,7 @@ def emoji_is_available_in_guild(emoji: str | None, guild: object | None) -> bool
         return False
     match = re.fullmatch(r"<a?:[A-Za-z0-9_]{2,32}:(\d+)>", emoji.strip())
     if match is None:
+        # Reject malformed/custom-looking tokens rather than displaying raw text.
         return not emoji.strip().startswith("<")
     if guild is None:
         return False
@@ -435,41 +470,6 @@ def release_slot(slot: Slot) -> SlotSnapshot:
     audit = slot.snapshot()
     slot.clear()
     return audit
-
-
-def disable_view_items(view: discord.ui.View) -> None:
-    for item in view.children:
-        if isinstance(item, discord.ui.DynamicItem):
-            item = item.item
-        if hasattr(item, "disabled"):
-            item.disabled = True
-
-
-class ExpiringView(discord.ui.View):
-    """Retire timed controls visibly instead of leaving a dead panel behind."""
-
-    timeout_notice = "⏱️ This panel expired. Run the command again to reopen it."
-
-    async def on_timeout(self) -> None:
-        disable_view_items(self)
-        self.stop()
-        message = getattr(self, "message", None)
-        if message is None:
-            return
-        content = getattr(message, "content", None) or ""
-        notice = self.timeout_notice
-        if notice not in content:
-            content = f"{content}\n\n{notice}" if content else notice
-        try:
-            await message.edit(
-                content=content,
-                view=self,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except (discord.NotFound, discord.Forbidden):
-            return
-        except discord.HTTPException:
-            logger.exception("Could not retire an expired interactive panel.")
 
 
 def slot_display_line(scrim: Scrim, slot: Slot) -> str:
@@ -688,6 +688,29 @@ async def require_staff_scrim(
     return scrim
 
 
+async def require_global_staff_role(
+    ctx: commands.Context,
+    *,
+    silent: bool = True,
+) -> bool:
+    """Authorize server-wide staff commands without requiring a scrim context."""
+    if ctx.guild is None:
+        await send_private_command_feedback(
+            ctx,
+            "This command can only be used in a Discord server.",
+            silent=silent,
+        )
+        return False
+    if not member_has_global_staff_role(ctx.author, ctx.guild.id):
+        await send_private_command_feedback(
+            ctx,
+            "You need the configured server-wide Staff role to use this command.",
+            silent=silent,
+        )
+        return False
+    return True
+
+
 async def delete_command_message(ctx: commands.Context) -> bool:
     message = getattr(ctx, "message", None)
     delete = getattr(message, "delete", None)
@@ -697,38 +720,6 @@ async def delete_command_message(ctx: commands.Context) -> bool:
         await delete()
         return True
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        return False
-
-
-async def delete_message_or_clear(
-    message: discord.Message | None,
-    *,
-    log_context: str,
-    fallback_content: str | None = None,
-) -> bool:
-    """Remove a completed interaction message, clearing it if deletion fails."""
-    if message is None:
-        return False
-    delete = getattr(message, "delete", None)
-    if delete is None:
-        return False
-    try:
-        await delete()
-        return True
-    except discord.NotFound:
-        return True
-    except discord.HTTPException:
-        logger.exception("Could not delete %s.", log_context)
-        if fallback_content is not None:
-            try:
-                await message.edit(
-                    content=fallback_content,
-                    embed=None,
-                    view=None,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except discord.HTTPException:
-                logger.exception("Could not clear %s.", log_context)
         return False
 
 
@@ -857,60 +848,6 @@ async def purge_channel_messages(channel) -> bool:
 async def get_channel(channel_id: int):
     channel = bot.get_channel(channel_id)
     return channel if channel is not None else await bot.fetch_channel(channel_id)
-
-
-async def configured_idpw_channel(guild: discord.Guild, channel_id: int):
-    """Resolve an ID/password channel without crossing the configured guild."""
-    try:
-        channel = guild.get_channel(channel_id)
-        if channel is None:
-            channel = await bot.fetch_channel(channel_id)
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        logger.exception(
-            "Could not resolve the configured ID/password channel (%s).",
-            channel_id,
-        )
-        return None
-    channel_guild = getattr(channel, "guild", None)
-    if (
-        not isinstance(channel, discord.TextChannel)
-        or channel_guild is None
-        or channel_guild.id != guild.id
-    ):
-        logger.error(
-            "Invalid configured ID/password channel for guild %s (channel %s).",
-            guild.id,
-            channel_id,
-        )
-        return None
-    return channel
-
-
-def _format_idpw_reminder(
-    *,
-    title: str,
-    message: str,
-    confirmed_role_id: int | None,
-) -> str:
-    """Build the Discord-formatted reminder shown before a match."""
-    lines = [f"# **{title}**", f"**{message}**"]
-    if confirmed_role_id is not None:
-        lines.append(f"<@&{confirmed_role_id}>")
-    return "\n".join(lines)
-
-
-def _track_active_idpw_message(
-    scrim_id: str,
-    state: dict[str, object],
-    message: object,
-) -> bool:
-    """Track a sent reminder only while its ID/PW run is still current."""
-    if active_idpw.get(scrim_id) is not state:
-        return False
-    messages = state.setdefault("messages", [])
-    if isinstance(messages, list):
-        messages.append(message)
-    return True
 
 
 async def _send_scheduled_idpw_reminder(
@@ -2066,8 +2003,6 @@ class ResultsMessageModal(discord.ui.Modal):
             await interaction.response.send_message(text, ephemeral=True)
 
 
-@bot.command(name="msg")
-@commands.guild_only()
 async def configure_operational_message(ctx: commands.Context) -> None:
     """Open the staff panel for customizing !open and !close messages."""
     if not member_is_staff_in_guild(ctx.author, ctx.guild.id):
@@ -2111,157 +2046,15 @@ async def require_channel_scrim(
     return scrim
 
 
-class DurableView(ExpiringView):
-    async def on_error(self, interaction, error, item):
-        logger.error("Interaction error", exc_info=error)
-        text = (
-            "Your action could not be saved. Please check the board and try again."
-            if isinstance(error, SlotStorageError)
-            else "Something went wrong. Please check the board before trying again."
-        )
-        if interaction.response.is_done():
-            await interaction.followup.send(text, ephemeral=True)
-        else:
-            await interaction.response.send_message(text, ephemeral=True)
-
-
-class SubscriptionStatusView(discord.ui.View):
-    """Link-only view attached to subscription status messages."""
-
-    def __init__(self) -> None:
-        super().__init__(timeout=180)
-        self.add_item(
-            discord.ui.Button(
-                style=discord.ButtonStyle.link,
-                label="🎧 Support Server",
-                url=SUPPORT_SERVER_URL,
-            )
-        )
-
-
-def subscription_remaining_text(expires_at: datetime) -> str:
-    remaining_seconds = max(
-        0, int((expires_at - datetime.now(timezone.utc)).total_seconds())
-    )
-    days, remainder = divmod(remaining_seconds, 24 * 60 * 60)
-    hours = remainder // (60 * 60)
-    return f"{days} day(s), {hours} hour(s) remaining"
-
-
-def build_subscription_embed(
-    *, authorized: bool, expires_at: datetime | None, duration_days: int | None
-) -> discord.Embed:
-    if authorized and duration_days == 0 and expires_at is None:
-        embed = discord.Embed(
-            title="💎 **A.R.C. Subscription Status**",
-            color=discord.Color.gold(),
-        )
-        embed.add_field(name="Status", value="🟢 Active", inline=False)
-        embed.add_field(
-            name="Time Remaining",
-            value="♾️ Lifetime / Unlimited",
-            inline=False,
-        )
-        return embed
-
-    if authorized and expires_at is not None:
-        expires_at = expires_at.astimezone(timezone.utc)
-        if expires_at > datetime.now(timezone.utc):
-            embed = discord.Embed(
-                title="💎 **A.R.C. Subscription Status**",
-                color=discord.Color.green(),
-            )
-            embed.add_field(name="Status", value="🟢 Active", inline=False)
-            embed.add_field(
-                name="Time Remaining",
-                value=subscription_remaining_text(expires_at),
-                inline=False,
-            )
-            return embed
-        expired_text = expires_at.strftime("%Y-%m-%d %H:%M UTC")
-    else:
-        expired_text = "Expired"
-
-    embed = discord.Embed(
-        title="💎 **A.R.C. Subscription Status**",
-        color=discord.Color.red(),
-    )
-    embed.add_field(name="Status", value="🔴 Expired", inline=False)
-    embed.add_field(
-        name="Time Remaining",
-        value=(
-            f"Expired on {expired_text}"
-            if expired_text != "Expired"
-            else "Expired"
-        ),
-        inline=False,
-    )
-    return embed
-
-
-@bot.command(name="sub", aliases=["status"])
-async def subscription_status(ctx: commands.Context) -> None:
-    access_denied = (
-        "❌ **Access Denied.** Only the Server Owner or a designated "
-        "Bot Manager can view the subscription status."
-    )
-    if ctx.guild is None:
-        await send_dm_command_feedback(ctx, access_denied)
-        return
-
-    config = repository.get_server_config(ctx.guild.id)
-    role_ids = {
-        getattr(role, "id", None) for role in getattr(ctx.author, "roles", ())
-    }
-    is_owner = getattr(ctx.guild, "owner_id", None) == getattr(ctx.author, "id", None)
-    manager_role_id = (
-        getattr(config, "manager_role_id", None)
-        if config is not None
-        else None
-    )
-    if manager_role_id is None and config is not None:
-        # !set currently persists the designated Bot Manager role as staff_role_id.
-        manager_role_id = config.staff_role_id
-    is_manager = bool(
-        manager_role_id is not None and manager_role_id in role_ids
-    )
-    if not is_owner and not is_manager:
-        await send_dm_command_feedback(ctx, access_denied)
-        return
-
-    authorized, expires_at, duration_days = repository.get_guild_subscription(
-        ctx.guild.id
-    )
-    try:
-        await ctx.author.send(
-            embed=build_subscription_embed(
-                authorized=authorized,
-                expires_at=expires_at,
-                duration_days=duration_days,
-            ),
-            view=SubscriptionStatusView(),
-            delete_after=60,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-    except discord.HTTPException:
-        await send_private_command_feedback(
-            ctx,
-            "I could not DM the subscription status. Enable DMs from this server "
-            "and run `!sub` again.",
-            delete_after=30,
-        )
-    finally:
-        await delete_command_message(ctx)
-
-
-@bot.command(name="link")
-async def support_link(ctx: commands.Context) -> None:
-    """Post the support server URL as raw text so Discord can unfurl it."""
-    await ctx.send(
-        SUPPORT_SERVER_URL,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-    await delete_command_message(ctx)
+subscription_status = create_subscription_command(
+    repository,
+    send_dm_command_feedback,
+    send_private_command_feedback,
+    delete_command_message,
+)
+support_link = create_support_link_command(delete_command_message)
+bot.add_command(subscription_status)
+bot.add_command(support_link)
 
 
 def interaction_matches_scrim(
@@ -2965,7 +2758,7 @@ async def remove_public_controls(scrim: Scrim) -> bool:
         return False
 
 
-class SlotReviewView(DurableView):
+class _legacy_SlotReviewView(DurableView):
     def __init__(
         self,
         scrim: Scrim,
@@ -3189,6 +2982,7 @@ async def update_registration_reaction(
     request: RegistrationRequest | None,
     *,
     approved: bool = True,
+    banned: bool = False,
 ) -> bool:
     if request is None or request.registration_message_id is None:
         return False
@@ -3202,19 +2996,25 @@ async def update_registration_reaction(
         if channel is None:
             return False
         message = await channel.fetch_message(request.registration_message_id)
-        accepted_emoji = (
-            registration_success_reaction(scrim, accepted=True)
-            if approved
-            else configured_emoji(scrim, "registration_declined_emoji", "❌")
-        )
-        await message.add_reaction(accepted_emoji)
+        try:
+            target_emoji = (
+                ban_system.banned_emoji(scrim.guild_id, channel.guild)
+                if banned
+                else registration_success_reaction(scrim, accepted=True)
+                if approved
+                else configured_emoji(scrim, "registration_declined_emoji", "❌")
+            )
+        except ban_commands.BanStorageError:
+            logger.exception("Could not resolve the configured banned reaction.")
+            return False
+        await message.add_reaction(target_emoji)
         bot_user = getattr(bot, "user", None)
         if bot_user is not None:
             for old_emoji in {
                 configured_emoji(scrim, "registration_ok_emoji", "🆗"),
                 "🆗",
             }:
-                if old_emoji != accepted_emoji:
+                if old_emoji != target_emoji:
                     try:
                         await message.remove_reaction(old_emoji, bot_user)
                     except discord.NotFound:
@@ -3298,37 +3098,7 @@ async def notify_staff_for_registration(
         return False
 
 
-def registration_queue_content(scrim: Scrim) -> str:
-    requests = sorted(
-        getattr(scrim, "pending_registrations", {}).values(),
-        key=lambda request: (request.slot_number, request.request_id),
-    )
-    lines = [f"**Registration review · {len(requests)} pending**"]
-    if not requests:
-        lines.append("No teams waiting for staff review.")
-    visible = 0
-    for request in requests:
-        name = discord.utils.escape_markdown(
-            discord.utils.escape_mentions(request.team_name)
-        )
-        tag = discord.utils.escape_markdown(
-            discord.utils.escape_mentions(request.tag)
-        )
-        line = (
-            f"{configured_emoji(scrim, 'registration_ok_emoji', '🆗')} "
-            f"`{request.slot_number:02d}` **{name}** · {tag} · <@{request.manager_id}>"
-        )
-        if len("\n".join(lines)) + len(line) > 1750:
-            break
-        lines.append(line)
-        visible += 1
-    if len(requests) > visible:
-        lines.append(f"…and {len(requests) - visible} more. Use the selection pages below.")
-    lines.append("\nAccept or Decline opens a private selection and confirmation.")
-    return "\n".join(lines)
-
-
-async def refresh_registration_queue(scrim: Scrim) -> bool:
+async def _legacy_refresh_registration_queue(scrim: Scrim) -> bool:
     """Keep one durable staff message in sync with pending requests."""
     async with getattr(scrim, "board_lock", asyncio.Lock()):
         if not is_active(scrim):
@@ -3438,7 +3208,7 @@ async def registration_queue_allowed(
     return allowed
 
 
-class RegistrationQueueView(discord.ui.View):
+class _legacy_RegistrationQueueView(discord.ui.View):
     def __init__(self, scrim_id: str):
         super().__init__(timeout=None)
         self.scrim_id = scrim_id
@@ -3477,7 +3247,7 @@ class RegistrationQueueView(discord.ui.View):
         )
 
 
-class RegistrationQueueSelectView(discord.ui.View):
+class _legacy_RegistrationQueueSelectView(discord.ui.View):
     def __init__(self, scrim_id, owner_id, action, requests, page=0):
         super().__init__(timeout=180)
         self.scrim_id, self.owner_id, self.action = scrim_id, owner_id, action
@@ -3554,7 +3324,7 @@ class RegistrationQueueSelectView(discord.ui.View):
         )
 
 
-class RegistrationQueueConfirmView(discord.ui.View):
+class _legacy_RegistrationQueueConfirmView(discord.ui.View):
     def __init__(self, scrim_id, owner_id, action, requests):
         super().__init__(timeout=180)
         self.scrim_id, self.owner_id, self.action, self.requests = (
@@ -4228,8 +3998,6 @@ class ResetConfirmationView(DurableView):
         )
 
 
-@bot.command(name="reset")
-@commands.guild_only()
 async def reset_slots(ctx: commands.Context) -> None:
     scrim = await require_staff_scrim(ctx, allow_public=True)
     if scrim is None:
@@ -4252,8 +4020,6 @@ async def reset_slots(ctx: commands.Context) -> None:
     confirmation.message = confirmation_message
 
 
-@bot.command(name="open", aliases=["o"])
-@commands.guild_only()
 async def open_scrim(ctx: commands.Context) -> None:
     """Open managers or registrations based on the configured command channel."""
     registration_scrim = resolve_registration_scrim(ctx)
@@ -4332,8 +4098,6 @@ async def open_scrim(ctx: commands.Context) -> None:
     )
 
 
-@bot.command(name="close", aliases=["c"])
-@commands.guild_only()
 async def close_scrim(ctx: commands.Context) -> None:
     """Close managers or registrations based on the configured command channel."""
     registration_scrim = resolve_registration_scrim(ctx)
@@ -4390,25 +4154,6 @@ async def close_scrim(ctx: commands.Context) -> None:
         )
         return
     await send_operational_message(ctx, scrim, "close_slots")
-
-
-@bot.command(name="idpw")
-@commands.guild_only()
-async def distribute_idpw(
-    ctx: commands.Context, *, input_string: str
-) -> None:
-    parsed = await _parse_idpw_input(ctx, input_string, "!idpw")
-    if parsed is None:
-        return
-    scrim, config, room_id, minutes, password = parsed
-    await _publish_idpw(
-        ctx,
-        room_id,
-        minutes,
-        password=password,
-        scrim=scrim,
-        config=config,
-    )
 
 
 async def _parse_idpw_input(
@@ -4699,24 +4444,6 @@ async def _publish_idpw_locked(
     await delete_command_message(ctx)
 
 
-def _match_map_for_scrim(scrim: Scrim, game_number: int) -> str | None:
-    match_maps = getattr(scrim, "match_maps", None)
-    maps = getattr(scrim, "maps", ()) if match_maps is None else match_maps
-    if isinstance(maps, str):
-        maps = [
-            item.strip()
-            for item in maps.strip("[]").split(",")
-            if item.strip()
-        ]
-    if not isinstance(maps, (list, tuple)):
-        return None
-    index = game_number - 1
-    if not 0 <= index < len(maps):
-        return None
-    map_name = maps[index]
-    return map_name.strip() if isinstance(map_name, str) and map_name.strip() else None
-
-
 async def _publish_idpwg(
     ctx: commands.Context,
     game_number: int,
@@ -4738,26 +4465,6 @@ async def _publish_idpwg(
         config=config,
         specific_match=True,
     )
-
-
-def _register_specific_idpw_commands() -> None:
-    for match_number in range(1, MAX_MATCHES + 1):
-        def make_specific_idpw_handler(game_number: int):
-            async def specific_idpw(
-                ctx: commands.Context,
-                *,
-                input_string: str,
-            ) -> None:
-                await _publish_idpwg(ctx, game_number, input_string)
-
-            return specific_idpw
-
-        specific_idpw = make_specific_idpw_handler(match_number)
-        specific_idpw.__name__ = f"distribute_idpwg{match_number}"
-        bot.command(name=f"idpwg{match_number}")(specific_idpw)
-
-
-_register_specific_idpw_commands()
 
 
 async def _record_match_scores(
@@ -4906,7 +4613,7 @@ def _match_scores_snapshot(scrim: Scrim, match_number: int) -> tuple:
     )
 
 
-class MatchScoreSubmissionReviewView(ExpiringView):
+class _LegacyMatchScoreSubmissionReviewView(ExpiringView):
     """Confirm or edit a complete match result set before it is saved."""
 
     def __init__(
@@ -5194,7 +4901,7 @@ class MatchScoreSubmissionReviewView(ExpiringView):
         )
 
 
-class MatchScoreSubmissionEditModal(discord.ui.Modal):
+class _LegacyMatchScoreSubmissionEditModal(discord.ui.Modal):
     """Let staff edit the pasted !resgN command before confirming it."""
 
     def __init__(self, source_review: MatchScoreSubmissionReviewView) -> None:
@@ -5292,7 +4999,7 @@ class MatchScoreSubmissionEditModal(discord.ui.Modal):
         )
 
 
-class MatchScoreCorrectionView(ExpiringView):
+class _LegacyMatchScoreCorrectionView(ExpiringView):
     """Let the command owner choose one assigned team to correct."""
 
     def __init__(
@@ -5458,7 +5165,7 @@ class MatchScoreCorrectionView(ExpiringView):
             logger.exception("Could not expire the score correction selector.")
 
 
-class MatchScoreCorrectionModal(discord.ui.Modal):
+class _LegacyMatchScoreCorrectionModal(discord.ui.Modal):
     """Collect a proposed correction, then require a review confirmation."""
 
     def __init__(
@@ -5587,7 +5294,7 @@ class MatchScoreCorrectionModal(discord.ui.Modal):
             )
 
 
-class MatchScoreCorrectionReviewView(ExpiringView):
+class _LegacyMatchScoreCorrectionReviewView(ExpiringView):
     """Review a score correction before saving its single-team upsert."""
 
     def __init__(
@@ -5937,12 +5644,12 @@ async def _start_match_score_correction(
         await delete_command_message(ctx)
 
 
-@bot.command(name="editres")
+"""
 async def edit_match_score_command(
     ctx: commands.Context,
     match_number: str = "",
 ) -> None:
-    """Correct one team's rank and kills without re-entering the match."""
+    # Legacy implementation retained only as migration reference.
     match_number = match_number.strip()
     if re.fullmatch(r"[0-9]+", match_number) is None:
         await send_private_command_feedback(
@@ -5952,6 +5659,7 @@ async def edit_match_score_command(
         )
         return
     await _start_match_score_correction(ctx, int(match_number))
+"""
 
 
 def _register_specific_score_commands() -> None:
@@ -5972,6 +5680,22 @@ def _register_specific_score_commands() -> None:
 
 
 _register_specific_score_commands()
+
+_match_results_bindings = match_results.install_match_results_commands(
+    bot, sys.modules[__name__]
+)
+MatchScoreSubmissionReviewView = _match_results_bindings[
+    "MatchScoreSubmissionReviewView"
+]
+MatchScoreSubmissionEditModal = _match_results_bindings[
+    "MatchScoreSubmissionEditModal"
+]
+MatchScoreCorrectionView = _match_results_bindings["MatchScoreCorrectionView"]
+MatchScoreCorrectionModal = _match_results_bindings["MatchScoreCorrectionModal"]
+MatchScoreCorrectionReviewView = _match_results_bindings[
+    "MatchScoreCorrectionReviewView"
+]
+edit_match_score_command = _match_results_bindings["edit_match_score_command"]
 
 
 _leaderboard_background_locks: dict[str, asyncio.Lock] = {}
@@ -6340,7 +6064,7 @@ class LeaderboardPanelView(ExpiringView):
 
 
 class LeaderboardBlueprintOfferView(LeaderboardPanelView):
-    """Offer the exact upload canvas after a dimension mismatch."""
+    """Offer empty and placeholder canvases after a dimension mismatch."""
 
     def __init__(
         self,
@@ -6359,7 +6083,7 @@ class LeaderboardBlueprintOfferView(LeaderboardPanelView):
     def rebuild(self) -> None:
         self.clear_items()
         yes_button = discord.ui.Button(
-            label="Yes, send both blueprints",
+            label="Yes, send both canvases",
             style=discord.ButtonStyle.success,
             row=0,
         )
@@ -6374,7 +6098,7 @@ class LeaderboardBlueprintOfferView(LeaderboardPanelView):
                 return
             try:
                 blueprint, filename = _build_empty_leaderboard_blueprint(scrim)
-                dimensioned_blueprint, dimensioned_filename = (
+                placeholder_blueprint, placeholder_filename = (
                     _load_dimensioned_leaderboard_blueprint(scrim)
                 )
             except (OSError, ValueError, RuntimeError) as error:
@@ -6386,15 +6110,14 @@ class LeaderboardBlueprintOfferView(LeaderboardPanelView):
             self.stop()
             await interaction.response.send_message(
                 (
-                    "Attached are the exact-size blank canvas for this profile "
-                    f"and the {leaderboard_blueprint_reference_label(scrim)}. "
-                    "The reference is not an upload background."
+                    "Attached are the exact-size empty canvas and a "
+                    "placeholder canvas with sample team names and zero scores."
                 ),
                 files=[
                     discord.File(blueprint, filename=filename),
                     discord.File(
-                        dimensioned_blueprint,
-                        filename=dimensioned_filename,
+                        placeholder_blueprint,
+                        filename=placeholder_filename,
                     ),
                 ],
                 ephemeral=True,
@@ -7170,7 +6893,7 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
                 return
             try:
                 blueprint, filename = _build_empty_leaderboard_blueprint(scrim)
-                dimensioned_blueprint, dimensioned_filename = (
+                placeholder_blueprint, placeholder_filename = (
                     _load_dimensioned_leaderboard_blueprint(scrim)
                 )
             except (OSError, ValueError, RuntimeError) as error:
@@ -7181,15 +6904,14 @@ class LeaderboardScrimEditView(LeaderboardPanelView):
                 return
             await interaction.response.send_message(
                 (
-                    "Attached are the exact-size blank canvas for this profile "
-                    f"and the {leaderboard_blueprint_reference_label(scrim)}. "
-                    "The reference is not an upload background."
+                    "Attached are the exact-size empty canvas and a "
+                    "placeholder canvas with sample team names and zero scores."
                 ),
                 files=[
                     discord.File(blueprint, filename=filename),
                     discord.File(
-                        dimensioned_blueprint,
-                        filename=dimensioned_filename,
+                        placeholder_blueprint,
+                        filename=placeholder_filename,
                     ),
                 ],
                 ephemeral=True,
@@ -8064,9 +7786,7 @@ async def _restore_default_leaderboard_background(
         return preview.attachments[0].url
 
 
-@bot.command(name="setres")
-@commands.guild_only()
-async def leaderboard_settings_command(ctx: commands.Context) -> None:
+async def _legacy_leaderboard_settings_command(ctx: commands.Context) -> None:
     """Open the standalone leaderboard settings panel."""
     all_scrims = repository.list(ctx.guild.id)
     scrims = _available_leaderboard_scrims(ctx.guild.id, ctx.author)
@@ -8282,9 +8002,7 @@ class IncompleteResultsReviewView(ExpiringView):
         )
 
 
-@bot.command(name="res", aliases=["leaderboard", "lb"])
-@commands.guild_only()
-async def leaderboard_command(ctx: commands.Context) -> None:
+async def _legacy_leaderboard_command(ctx: commands.Context) -> None:
     """Render the final current leaderboard image."""
     scrim = await require_staff_scrim(ctx, allow_public=True)
     if scrim is None:
@@ -8391,209 +8109,11 @@ async def leaderboard_command(ctx: commands.Context) -> None:
         await delete_command_message(ctx)
 
 
-HELP_CATEGORIES = {
-    "Getting started": {
-        "description": "Setup, server access, and help",
-        "text": (
-            "`!help` — command categories.\n"
-            "`!setup` — configure scrims.\n"
-            "`!set @Staff` — server Staff role.\n"
-            "`!setres` — leaderboard settings.\n"
-            "`!sub` — private status (Owner/Manager)."
-        ),
-    },
-    "Scrims and slots": {
-        "description": "Boards, teams, and staff operations",
-        "text": (
-            "`!slots [Scrim]` — view a slot summary.\n"
-            "`!update [Scrim]` — publish or refresh a slot board.\n"
-            "`!open` / `!close` — open or close slot interactions/registrations.\n"
-            "`!add Team / TAG / @Captain` — add a team to the selected scrim.\n"
-            "`!confirm 03 [04 ...]` — confirm Reserved/Pending slots.\n"
-            "`!remove 03 [04 ...]` — remove occupied slots.\n"
-            "`!move 03 06` — move to empty slot (`!move 03` lists choices).\n"
-            "`!switch 03 06` — swap occupied teams and their statuses.\n"
-            "`!reset` — clear a scrim after confirming the warning.\n"
-            "`!remind` — remind reserved teams to confirm.\n"
-            "`!say <message>` — publish a staff announcement.\n"
-            "`!msg <key> <text>` — edit an operational message."
-        ),
-    },
-    "Registration and captains": {
-        "description": "Team registration and captain tools",
-        "text": (
-            "`!register Team / TAG [/ @Captain]` — request a registration.\n"
-            "`!cap add @User` — grant captain access.\n"
-            "`!cap transfer @User` — transfer captain access.\n"
-            "`!cap remove @User` — remove captain access.\n"
-            "Configured roles and channels apply."
-        ),
-    },
-    "Match results": {
-        "description": "Score entry, review, and leaderboard",
-        "text": (
-            "`!res` / `!lb` — generate the leaderboard image.\n"
-            f"`!resg1-{MAX_MATCHES} slot kills` — enter results in rank order, "
-            "best team first. Omit teams that did not play; review before saving.\n"
-            "`!editres <match>` — choose one team and correct its rank/kills.\n"
-            "Confirming a full match replaces that match's previous result set."
-        ),
-    },
-    "Room ID and password": {
-        "description": "Fixed or per-match room access details",
-        "text": (
-            "`!idpw <room> / <minutes>` — saved password.\n"
-            "`!idpw <room> / <password> / <minutes>` — dynamic password.\n"
-            f"`!idpwg1-{MAX_MATCHES}` accepts the same formats for a specific "
-            "match; reminder settings come from scrim setup."
-        ),
-    },
-}
-
-HELP_COPY_TEXT = "A.R.C. HELP\n\n" + "\n\n".join(
-    f"{category.upper()}\n{details['text']}"
-    for category, details in HELP_CATEGORIES.items()
-) + "\n\nUse `!` for every command. Configured roles and channels apply."
+help_command = create_help_command(send_private_command_feedback)
+bot.add_command(help_command)
 
 
-def build_help_text(category: str | None = None) -> str:
-    """Return the selected help category or the interactive panel prompt."""
-    if category not in HELP_CATEGORIES:
-        return (
-            ">>> **A.R.C. HELP**\n"
-            "Choose a category below to see commands and their formats. "
-            "Select one to enable **Copy text** for that category."
-        )
-    details = HELP_CATEGORIES[category]
-    return (
-        f">>> **A.R.C. HELP · {category.upper()}**\n"
-        f"{details['text']}\n\n"
-        "_Use `!` for every command. Configured roles and channels apply._"
-    )
-
-
-class HelpView(ExpiringView):
-    """Owner-only controls for the categorized help panel."""
-
-    def __init__(self, owner_id: int) -> None:
-        super().__init__(timeout=300)
-        self.owner_id = owner_id
-        self.selected_category: str | None = None
-        self.copy_text_button = next(
-            item
-            for item in self.children
-            if isinstance(item, discord.ui.Button)
-            and item.label == "Copy text"
-        )
-        self.copy_text_button.disabled = True
-        self.timeout_notice = "⏱️ This help panel expired. Run `!help` again."
-        self.message: discord.Message | None = None
-        category_select = discord.ui.Select(
-            placeholder="Choose a help category...",
-            min_values=1,
-            max_values=1,
-            options=[
-                discord.SelectOption(
-                    label=category,
-                    value=category,
-                    description=details["description"],
-                )
-                for category, details in HELP_CATEGORIES.items()
-            ],
-        )
-
-        async def select_category(interaction: discord.Interaction) -> None:
-            category = category_select.values[0]
-            previous_category = self.selected_category
-            self.selected_category = category
-            self.copy_text_button.disabled = False
-            try:
-                await interaction.response.edit_message(
-                    content=build_help_text(category),
-                    view=self,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except discord.HTTPException:
-                self.selected_category = previous_category
-                self.copy_text_button.disabled = previous_category is None
-                raise
-
-        category_select.callback = select_category
-        self.add_item(category_select)
-
-    async def on_timeout(self) -> None:
-        disable_view_items(self)
-        await delete_message_or_clear(
-            self.message,
-            log_context="expired help panel",
-            fallback_content="This help panel expired.",
-        )
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.owner_id:
-            return True
-        await interaction.response.send_message(
-            "This help panel belongs to another user.",
-            ephemeral=True,
-        )
-        return False
-
-    @discord.ui.button(
-        label="Copy text",
-        emoji="📋",
-        style=discord.ButtonStyle.secondary,
-    )
-    async def copy_text(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        if self.selected_category not in HELP_CATEGORIES:
-            await interaction.response.send_message(
-                "Select a help category before copying its text.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-        await interaction.response.send_message(
-            build_help_text(self.selected_category),
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-
-    @discord.ui.button(
-        label="Close",
-        emoji="✖️",
-        style=discord.ButtonStyle.danger,
-    )
-    async def close(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        self.stop()
-        await interaction.response.send_message(
-            "Help closed.",
-            ephemeral=True,
-        )
-        await delete_message_or_clear(
-            getattr(interaction, "message", None),
-            log_context="closed help panel",
-            fallback_content="This help panel has ended.",
-        )
-
-
-@bot.command(name="help", aliases=["h"])
-async def help_command(ctx: commands.Context) -> None:
-    view = HelpView(ctx.author.id)
-    view.message = await send_private_command_feedback(
-        ctx,
-        build_help_text(),
-        delete_after=None,
-        view=view,
-    )
-
-
+'''Legacy admin/auth UI moved to arc_bot.commands.authorization.
 @bot.group(name="admin", invoke_without_command=True, hidden=True)
 @commands.is_owner()
 async def admin_command(ctx: commands.Context) -> None:
@@ -9094,79 +8614,64 @@ async def authorized_guild_name(guild_id: int) -> str | None:
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
         return None
     return guild.name
+'''
 
 
-@bot.event
-async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
-    original = getattr(error, "original", error)
-    command_name = getattr(ctx.command, "qualified_name", "")
-    if isinstance(original, SlotStorageError):
-        logger.error("Save error", exc_info=original)
-        await send_private_command_feedback(
-            ctx,
-            "I could not save that change. Please try again.",
-            silent=False,
-        )
-    elif isinstance(original, UnauthorizedGuild):
-        await send_private_command_feedback(
-            ctx,
-            "This server is not authorized to use this bot.",
-            silent=False,
-        )
-    elif isinstance(error, UnauthorizedAuthAdmin):
-        await send_private_command_feedback(
-            ctx,
-            "❌ **Access Denied.** You do not have permission to manage the "
-            "server whitelist.",
-            silent=False,
-        )
-    elif isinstance(error, commands.NotOwner):
-        await send_private_command_feedback(
-            ctx,
-            "This developer command is restricted to the bot owner.",
-            silent=False,
-        )
-    elif isinstance(error, commands.MissingRequiredArgument):
-        command_usage = {
-            "confirm": "Use `!confirm <slot> [<slot> ...]`.",
-            "remove": "Use `!remove <slot> [<slot> ...]`.",
-            "say": "Use `!say <message>`.",
-        }
-        await send_private_command_feedback(
-            ctx,
-            command_usage.get(
-                command_name,
-                "A required argument is missing. Use `!help` to check the command format.",
-            ),
-            silent=False,
-        )
-    elif isinstance(error, commands.BadArgument):
-        await send_private_command_feedback(
-            ctx,
-            "One of the arguments is invalid. Use `!help` to check the command format.",
-            silent=False,
-        )
-    elif isinstance(error, commands.MissingPermissions):
-        await send_private_command_feedback(
-            ctx,
-            "You do not have permission to use this command.",
-            silent=False,
-        )
-    elif isinstance(error, commands.NoPrivateMessage):
-        await send_private_command_feedback(
-            ctx,
-            "This command can only be used inside a Discord server.",
-            silent=False,
-        )
-    elif isinstance(error, commands.CommandNotFound):
-        await delete_command_message(ctx)
-    else:
-        logger.exception("Command execution error", exc_info=error)
-        await send_private_command_feedback(
-            ctx,
-            "The command could not be completed. Please try again.",
-            silent=False,
-        )
+# The implementation lives in the shared command module.  Keep these names in
+# this module as compatibility exports for integrations and older test seams.
+(
+    _installed_auth_command,
+    _installed_admin_command,
+    _installed_admin_add,
+    _installed_admin_remove,
+    _installed_admin_list,
+) = authorization_commands.install_authorization_commands(
+    bot,
+    lambda: repository,
+    ARC_AUTH_PRODUCT,
+    send_private_command_feedback,
+    delete_command_message,
+    logger,
+    lambda guild_id: authorized_guild_name(guild_id),
+)
+(
+    UnauthorizedGuild,
+    UnauthorizedAuthAdmin,
+    whitelist_check,
+    auth_admin_check,
+    auth_admin_required,
+    arc_product_label,
+    build_auth_panel_embed,
+    authorization_time_left_text,
+    authorization_rows,
+    build_auth_tier_embed,
+    parse_auth_duration,
+    AuthAdminPanelView,
+    AuthAddGuildModal,
+    AuthRemoveGuildModal,
+    authorized_guild_name,
+) = (
+    authorization_commands.UnauthorizedGuild,
+    authorization_commands.UnauthorizedAuthAdmin,
+    authorization_commands.whitelist_check,
+    authorization_commands.auth_admin_check,
+    authorization_commands.auth_admin_required,
+    authorization_commands.arc_product_label,
+    authorization_commands.build_auth_panel_embed,
+    authorization_commands.authorization_time_left_text,
+    authorization_commands.authorization_rows,
+    authorization_commands.build_auth_tier_embed,
+    authorization_commands.parse_auth_duration,
+    authorization_commands.AuthAdminPanelView,
+    authorization_commands.AuthAddGuildModal,
+    authorization_commands.AuthRemoveGuildModal,
+    authorization_commands.authorized_guild_name,
+)
+auth_command = bot.get_command("auth")
+admin_command = bot.get_command("admin")
+admin_add = _installed_admin_add
+admin_remove = _installed_admin_remove
+admin_list = _installed_admin_list
 
 
 def install_setup_panel() -> None:
@@ -9180,144 +8685,12 @@ def install_setup_panel() -> None:
             repository,
             publish_scrim,
             log_action=send_scrim_log,
+            ban_service=ban_system,
         )
         _setup_installed = True
     if not _global_setup_installed:
         global_setup.install_global_setup(bot, repository)
         _global_setup_installed = True
-
-
-@bot.event
-async def setup_hook() -> None:
-    global _loaded
-    if not _loaded:
-        repository.load()
-        _loaded = True
-    install_setup_panel()
-    for scrim in repository.scrims.values():
-        if (
-            not scrim.deleted
-            and scrim.registration_review_message_id is not None
-            and scrim.staff_channel_id is not None
-        ):
-            bot.add_view(
-                RegistrationQueueView(scrim.id),
-                message_id=scrim.registration_review_message_id,
-            )
-    bot.add_dynamic_items(
-        ManagerActionButton,
-        StaffActionButton,
-    )
-
-
-async def migrate_legacy() -> None:
-    if repository.legacy is None:
-        return
-    board = repository.legacy.get("public_board")
-    if not isinstance(board, dict) or not board.get("channel_id"):
-        logger.warning("Unclaimed v1 state: no resolvable public channel.")
-        return
-    try:
-        channel = await get_channel(int(board["channel_id"]))
-    except (discord.HTTPException, ValueError, TypeError):
-        logger.exception("Retaining v1 state: public channel not found.")
-        return
-    guild = getattr(channel, "guild", None)
-    if guild is None:
-        logger.warning("Retaining v1 state: unable to determine the server.")
-        return
-    staff = None
-    configured_id = os.getenv("STAFF_CHANNEL_ID", "").strip()
-    if configured_id.isdigit():
-        staff = guild.get_channel(int(configured_id))
-    if staff is None:
-        name = os.getenv("STAFF_CHANNEL_NAME", "staff").strip().lstrip("#")
-        staff = discord.utils.get(guild.text_channels, name=name)
-    if staff is None:
-        logger.warning("Retaining v1 state: unable to resolve the staff channel.")
-        return
-    try:
-        scrim = repository.claim_legacy(guild.id, staff.id)
-        logger.info("Imported v1 state into scrim %s.", scrim.id)
-    except Exception:
-        logger.exception("v1 migration failed; state was retained.")
-
-
-async def restore_authorized_runtime_state() -> None:
-    await restore_active_idpw()
-    authorized_scrims = [
-        scrim
-        for scrim in list(repository.scrims.values())
-        if repository.is_guild_authorized(scrim.guild_id)
-    ]
-    results = await asyncio.gather(
-        *(publish_scrim(scrim) for scrim in authorized_scrims),
-        return_exceptions=True,
-    )
-    for result in results:
-        if isinstance(result, Exception):
-            logger.error("Board recovery failed.", exc_info=result)
-    for scrim in authorized_scrims:
-        await send_scrim_log_coverage_snapshot(scrim)
-
-
-@bot.event
-async def on_ready() -> None:
-    if bot.user is not None:
-        logger.info("Bot connected as %s (ID: %s)", bot.user, bot.user.id)
-    await migrate_legacy()
-    await restore_authorized_runtime_state()
-
-
-@bot.event
-async def on_guild_join(guild: discord.Guild) -> None:
-    """Leave immediately after notifying a guild outside the whitelist."""
-    if repository.is_guild_authorized(guild.id):
-        return
-
-    me = guild.me
-    candidates: list[discord.TextChannel] = []
-    if isinstance(guild.system_channel, discord.TextChannel):
-        candidates.append(guild.system_channel)
-    candidates.extend(
-        channel
-        for channel in guild.text_channels
-        if channel not in candidates
-    )
-    channel = next(
-        (
-            candidate
-            for candidate in candidates
-            if me is None
-            or candidate.permissions_for(me).send_messages
-        ),
-        None,
-    )
-    embed = discord.Embed(
-        description=(
-            "❌ **Unauthorized Server.** A.R.C. is a private bot. "
-            "To purchase or request access, please contact the developer."
-        ),
-        color=discord.Color.red(),
-    )
-    try:
-        if channel is not None:
-            await channel.send(embed=embed)
-        else:
-            logger.warning(
-                "No sendable text channel found in unauthorized guild %s.",
-                guild.id,
-            )
-    except (discord.Forbidden, discord.HTTPException):
-        logger.exception(
-            "Could not notify unauthorized guild %s before leaving.",
-            guild.id,
-        )
-    finally:
-        try:
-            await guild.leave()
-        except (discord.Forbidden, discord.HTTPException):
-            logger.exception("Could not leave unauthorized guild %s.", guild.id)
 
 
 def member_has_manager_role(member: object, guild_id: int) -> bool:
@@ -9337,29 +8710,6 @@ def member_has_manager_role(member: object, guild_id: int) -> bool:
             getattr(role, "id", None) for role in getattr(member, "roles", ())
         }
     )
-
-
-async def scrim_category_ids(scrim: Scrim) -> set[int]:
-    """Resolve the Discord categories containing a scrim's public/staff channels."""
-    category_ids: set[int] = set()
-    for channel_id in {scrim.public_channel_id, scrim.staff_channel_id}:
-        channel = bot.get_channel(channel_id)
-        if channel is None:
-            try:
-                channel = await bot.fetch_channel(channel_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                logger.warning(
-                    "Could not resolve channel %s while routing !slots.",
-                    channel_id,
-                )
-                continue
-        category_id = getattr(channel, "category_id", None)
-        if category_id is None:
-            category = getattr(channel, "category", None)
-            category_id = getattr(category, "id", None)
-        if type(category_id) is int:
-            category_ids.add(category_id)
-    return category_ids
 
 
 def build_slot_status_embed(scrim: Scrim) -> discord.Embed:
@@ -9849,7 +9199,7 @@ def _generate_default_leaderboard_background(
     size: tuple[int, int],
 ) -> Image.Image:
     """Create a solid, high-contrast canvas when no bundled image exists."""
-    return Image.new("RGBA", size, (13, 18, 26, 255))
+    return Image.new("RGBA", size, (8, 27, 58, 255))
 
 
 def _load_leaderboard_background_canvas(
@@ -9874,25 +9224,22 @@ def _load_leaderboard_background_canvas(
 def leaderboard_blueprint_reference_label(scrim: Scrim) -> str:
     orientation, team_count = _leaderboard_scrim_profile(scrim)
     width, height = leaderboard_canvas_dimensions(team_count, orientation)
-    return (
-        f"dimensioned {team_count}-team {orientation.title()} reference "
-        f"({width} × {height} px)"
-    )
+    return f"placeholder {team_count}-team {orientation.title()} canvas ({width} × {height} px)"
 
 
 def _load_dimensioned_leaderboard_blueprint(
     scrim: Scrim,
 ) -> tuple[io.BytesIO, str]:
-    """Load the dimensioned reference matching the active leaderboard profile."""
+    """Load the placeholder canvas matching the active leaderboard profile."""
     orientation, team_count = _leaderboard_scrim_profile(scrim)
     expected_size = leaderboard_canvas_dimensions(team_count, orientation)
     path = LEADERBOARD_BLUEPRINT_DIR / (
-        f"{orientation}-{team_count}-complete-dimensions.png"
+        f"{orientation}-{team_count}-placeholder.png"
     )
     with Image.open(path) as blueprint:
         if blueprint.size != expected_size:
             raise ValueError(
-                f"The dimensioned {team_count}-team {orientation} reference "
+                f"The placeholder {team_count}-team {orientation} canvas "
                 f"must be {expected_size[0]} × {expected_size[1]} px."
             )
         blueprint.load()
@@ -9900,7 +9247,7 @@ def _load_dimensioned_leaderboard_blueprint(
     buffer.seek(0)
     return (
         buffer,
-        f"leaderboard-blueprint-{orientation}-{team_count}-dimensions.png",
+        f"leaderboard-blueprint-{orientation}-{team_count}-placeholder.png",
     )
 
 
@@ -10118,7 +9465,7 @@ def build_leaderboard_image(
     )
 
 
-class SlotsScrimSelectView(ExpiringView):
+class _LegacySlotsScrimSelectView(ExpiringView):
     """Let a Manager choose an active scrim for the !slots summary."""
 
     def __init__(
@@ -10204,9 +9551,7 @@ class SlotsScrimSelectView(ExpiringView):
         self.add_item(select)
 
 
-@bot.command(name="slots", aliases=["s"])
-@commands.guild_only()
-async def show_slots(ctx: commands.Context, *, name: str | None = None) -> None:
+async def _legacy_show_slots(ctx: commands.Context, *, name: str | None = None) -> None:
     """Show compact slot statistics for an active scrim."""
     if not member_has_manager_role(ctx.author, ctx.guild.id):
         await send_private_command_feedback(
@@ -10245,7 +9590,7 @@ async def show_slots(ctx: commands.Context, *, name: str | None = None) -> None:
         await send_slot_status_embed(ctx, channel_scrim)
         return
 
-    view = SlotsScrimSelectView(
+    view = _LegacySlotsScrimSelectView(
         owner_id=ctx.author.id,
         guild_id=ctx.guild.id,
         scrims=active_scrims,
@@ -10262,7 +9607,7 @@ async def show_slots(ctx: commands.Context, *, name: str | None = None) -> None:
         await delete_command_message(ctx)
 
 
-class UpdateScrimSelectView(ExpiringView):
+class _LegacyUpdateScrimSelectView(ExpiringView):
     """Let staff choose which active scrim should be published or refreshed."""
 
     def __init__(
@@ -10387,9 +9732,7 @@ class UpdateScrimSelectView(ExpiringView):
         self.add_item(select)
 
 
-@bot.command(name="update", aliases=["u", "publier_slots"])
-@commands.guild_only()
-async def update_slots_command(
+async def _legacy_update_slots_command(
     ctx: commands.Context, *, name: str | None = None
 ) -> None:
     """Publish or refresh the full slot board for an active scrim."""
@@ -10457,7 +9800,7 @@ async def update_slots_command(
             )
         return
 
-    view = UpdateScrimSelectView(
+    view = _LegacyUpdateScrimSelectView(
         owner_id=ctx.author.id,
         guild_id=ctx.guild.id,
         scrims=active_scrims,
@@ -10474,8 +9817,6 @@ async def update_slots_command(
         await delete_command_message(ctx)
 
 
-@bot.command(name="say", aliases=["announce"])
-@commands.guild_only()
 async def say_message(ctx: commands.Context, *, message: str) -> None:
     """Publish an anonymous bot message for authorized staff."""
     if not member_has_global_staff_role(ctx.author, ctx.guild.id):
@@ -10511,222 +9852,7 @@ async def say_message(ctx: commands.Context, *, message: str) -> None:
         )
 
 
-@dataclass
-class AddDraftEntry:
-    original_line: str
-    team_name: str
-    slot_number: int
-    member: discord.Member
-    tag: str = ""
-
-
-def add_preview_embed(
-    scrim: Scrim,
-    valid_entries: list[AddDraftEntry],
-    error_entries: list[str],
-    *,
-    title: str = "🔍 Registration Preview",
-    color: discord.Color = discord.Color.blurple(),
-) -> discord.Embed:
-    lines = []
-    if valid_entries:
-        lines.append("**Valid registrations**")
-        lines.extend(
-            f"✅ Slot {entry.slot_number:02d}: "
-            f"{discord.utils.escape_mentions(entry.team_name)} "
-            f"(Cap: <@{entry.member.id}>)"
-            for entry in valid_entries
-        )
-    if error_entries:
-        if lines:
-            lines.append("")
-        lines.append("**Entries requiring attention**")
-        lines.extend(
-            f"⚠️ Failed: {discord.utils.escape_mentions(error)}"
-            for error in error_entries
-        )
-    if not lines:
-        lines.append("No registrations were provided.")
-    embed = discord.Embed(
-        title=title,
-        description="\n".join(lines)[:4096],
-        color=color,
-    )
-    embed.set_footer(text=f"Scrim: {scrim.name}")
-    return embed
-
-
-async def resolve_add_member(
-    ctx: commands.Context,
-    member_text: str,
-) -> discord.Member:
-    """Resolve a mention or member reference without accepting arbitrary IDs."""
-    mention_match = re.fullmatch(r"<@!?(\d+)>", member_text.strip())
-    if mention_match is not None and ctx.guild is not None:
-        member_id = int(mention_match.group(1))
-        member = ctx.guild.get_member(member_id)
-        if member is None:
-            member = await ctx.guild.fetch_member(member_id)
-        return member
-    return await commands.MemberConverter().convert(ctx, member_text)
-
-
-async def build_add_draft(
-    ctx: commands.Context,
-    scrim: Scrim,
-    arguments: str,
-) -> tuple[list[AddDraftEntry], list[str]]:
-    """Parse the historical Team / TAG / @Captain form for one or many teams."""
-    raw = arguments.strip()
-    lines = raw.splitlines() if raw else []
-    lines = [line.strip() for line in lines if line.strip()]
-    valid_entries: list[AddDraftEntry] = []
-    error_entries: list[str] = []
-    requested_slots: set[int] = set()
-
-    if not lines:
-        return [], ["empty input - provide Team / TAG / @Captain"]
-
-    for line in lines:
-        parts = [part.strip() for part in line.split("/")]
-        if len(parts) != 3:
-            if len(lines) == 1:
-                try:
-                    team_name, tag, member_text = parse_add_arguments(line)
-                except ValueError:
-                    error_entries.append(f"{line} - invalid format")
-                    continue
-                slot_number = None
-            else:
-                error_entries.append(f"{line} - invalid format; use Team / TAG / @Captain")
-                continue
-        else:
-            team_name, tag, member_text = parts
-            if not team_name or not tag or not member_text:
-                error_entries.append(f"{line} - invalid format")
-                continue
-            slot_number = None
-
-        if not team_name or not member_text:
-            error_entries.append(f"{line} - team name and captain are required")
-            continue
-
-        try:
-            member = await resolve_add_member(ctx, member_text)
-        except (commands.MemberNotFound, discord.NotFound, discord.Forbidden, discord.HTTPException):
-            error_entries.append(f"{line} - captain not found")
-            continue
-
-        if slot_number is None:
-            async with scrim.state_lock:
-                slot_number = next(
-                    (
-                        slot.number
-                        for slot in scrim.slots.values()
-                        if slot_is_assignable(slot)
-                        and slot.number not in requested_slots
-                    ),
-                    None,
-                )
-            if slot_number is None:
-                error_entries.append(f"{line} - no available slot")
-                continue
-
-        requested_slots.add(slot_number)
-        valid_entries.append(
-            AddDraftEntry(
-                original_line=line,
-                team_name=team_name,
-                slot_number=slot_number,
-                member=member,
-                tag=tag,
-            )
-        )
-    return valid_entries, error_entries
-
-
-async def apply_add_entries(
-    scrim: Scrim,
-    entries: list[AddDraftEntry],
-) -> tuple[list[SlotSnapshot], list[str], list[str], bool]:
-    """Persist validated entries atomically, then apply Discord side effects."""
-    unavailable: list[str] = []
-    snapshots: list[SlotSnapshot] = []
-    async with scrim.state_lock:
-        if not is_active(scrim):
-            unavailable.append("The scrim is no longer active.")
-        elif pause_scrim_if_unconfigured(scrim):
-            unavailable.append(
-                "The scrim is paused because required settings are missing."
-            )
-        else:
-            for entry in entries:
-                slot = scrim.slots.get(entry.slot_number)
-                if slot is None or not slot_is_assignable(slot):
-                    unavailable.append(
-                        f"Slot {entry.slot_number:02d} became occupied before confirmation."
-                    )
-            if not unavailable:
-                with repository.transaction():
-                    for entry in entries:
-                        slot = scrim.slots[entry.slot_number]
-                        slot.assignment_id += 1
-                        slot.status = STATUS_RESERVED
-                        slot.team_name = entry.team_name
-                        slot.tag = entry.tag
-                        slot.manager_id = entry.member.id
-                        slot.captain_1_id = entry.member.id
-                        slot.captain_2_id = None
-                        snapshots.append(slot.snapshot())
-
-    if unavailable:
-        return snapshots, unavailable, [], False
-
-    access_failures = []
-    for entry in entries:
-        if not await grant_manager_access(scrim, entry.member):
-            access_failures.append(f"Slot {entry.slot_number:02d}")
-        await send_scrim_log(
-            scrim,
-            "TEAM ADDED",
-            f"Slot {entry.slot_number:02d} · team **{entry.team_name}** · "
-            f"captain <@{entry.member.id}>",
-        )
-    board_refreshed = await refresh_public_slots(scrim)
-    return snapshots, unavailable, access_failures, board_refreshed
-
-
-def parse_registration_arguments(arguments: str) -> tuple[str, str, str | None]:
-    """Parse ``!register Team Name / Tag [/ @Manager]``."""
-    raw = arguments.strip()
-    if "\n" in raw or "\r" in raw:
-        raise ValueError(
-            "`!register` accepts one team per command. Use `!add` for bulk "
-            "staff registrations."
-        )
-    parts = [part.strip() for part in raw.split("/")]
-    if len(parts) not in {2, 3} or not all(parts):
-        raise ValueError(
-            "Wrong format. Use `!register Team Name / Tag` or "
-            "`!register Team Name / Tag / @Manager`. "
-            "The manager mention is optional; without it, you become captain."
-        )
-    team_name, tag = parts[:2]
-    manager_text = parts[2] if len(parts) == 3 else None
-    if len(team_name) > 100 or len(tag) > 32:
-        raise ValueError("The team name or tag is too long.")
-    if any(character in team_name or character in tag for character in ("\r", "\n")):
-        raise ValueError("The team name and tag must stay on one line.")
-    if manager_text is not None and not re.fullmatch(
-        r"<@!?\d+>", manager_text
-    ):
-        raise ValueError(
-            "The manager must be a member mention, such as `@Manager`."
-        )
-    return team_name, tag, manager_text
-
-
-async def apply_registration_entry(
+async def _legacy_apply_registration_entry(
     scrim: Scrim,
     entry: AddDraftEntry,
     *,
@@ -10820,199 +9946,7 @@ async def apply_registration_entry(
     return snapshot, None, True, notified
 
 
-class AddRegistrationView(DurableView):
-    def __init__(
-        self,
-        ctx: commands.Context,
-        scrim: Scrim,
-        valid_entries: list[AddDraftEntry],
-        error_entries: list[str],
-    ) -> None:
-        super().__init__(timeout=120)
-        self.ctx = ctx
-        self.scrim = scrim
-        self.owner_id = ctx.author.id
-        self.valid_entries = valid_entries
-        self.error_entries = error_entries
-        self.message: discord.Message | None = None
-        self.completed = False
-        self.processing = False
-        if not valid_entries:
-            self.confirm_button.disabled = True
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "This registration preview belongs to another staff member.",
-                ephemeral=True,
-            )
-            return False
-        return True
-
-    def final_embed(
-        self,
-        title: str,
-        *,
-        color: discord.Color,
-        extra_lines: list[str] | None = None,
-    ) -> discord.Embed:
-        lines = list(extra_lines or [])
-        if not lines:
-            lines = [
-                f"✅ Slot {entry.slot_number:02d}: "
-                f"{discord.utils.escape_mentions(entry.team_name)} "
-                f"(Cap: <@{entry.member.id}>)"
-                for entry in self.valid_entries
-            ]
-        embed = discord.Embed(
-            title=title,
-            description="\n".join(lines)[:4096],
-            color=color,
-        )
-        embed.set_footer(text=f"Scrim: {self.scrim.name}")
-        return embed
-
-    async def on_timeout(self) -> None:
-        if self.completed or self.processing:
-            return
-        self.completed = True
-        disable_view_items(self)
-        self.stop()
-        await delete_message_or_clear(
-            self.message,
-            log_context="expired registration preview",
-            fallback_content="This registration preview expired. No changes were made.",
-        )
-
-    async def _finish_cancel(self, interaction: discord.Interaction) -> None:
-        if self.completed or self.processing:
-            await interaction.response.send_message(
-                "This registration preview is already being processed.",
-                ephemeral=True,
-            )
-            return
-        self.completed = True
-        disable_view_items(self)
-        self.stop()
-        await interaction.response.send_message(
-            "Registration cancelled. No changes were made.",
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        await delete_message_or_clear(
-            self.message or getattr(interaction, "message", None),
-            log_context="cancelled registration preview",
-            fallback_content="This registration preview was cancelled.",
-        )
-
-    async def _finish_confirm(self, interaction: discord.Interaction) -> None:
-        if self.completed or self.processing:
-            await interaction.response.send_message(
-                "This registration preview has already been processed.",
-                ephemeral=True,
-            )
-            return
-
-        self.processing = True
-        try:
-            snapshots, unavailable, access_failures, board_refreshed = (
-                await apply_add_entries(self.scrim, self.valid_entries)
-            )
-        except Exception:
-            self.processing = False
-            logger.exception(
-                "Could not finish the registration preview for scrim %s.",
-                self.scrim.id,
-            )
-            await interaction.response.send_message(
-                "Registration could not be completed. Check the current slot board "
-                "and try again.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-        if unavailable:
-            self.completed = True
-            disable_view_items(self)
-            self.stop()
-            await interaction.response.send_message(
-                embed=self.final_embed(
-                    "⚠️ Registration Not Completed",
-                    color=discord.Color.orange(),
-                    extra_lines=["No changes were made.", *unavailable],
-                ),
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            await delete_message_or_clear(
-                self.message or getattr(interaction, "message", None),
-                log_context="unavailable registration preview",
-                fallback_content="This registration preview is no longer available.",
-            )
-            return
-
-        self.completed = True
-        disable_view_items(self)
-        self.stop()
-        result_lines = [
-            f"✅ Slot {snapshot.number:02d}: "
-            f"{discord.utils.escape_mentions(snapshot.team_name)} "
-            f"(Cap: <@{snapshot.captain_1_id}>)"
-            for snapshot in snapshots
-        ]
-        if access_failures:
-            result_lines.append(
-                f"⚠️ Pending Captain access could not be completed for: "
-            f"{', '.join(access_failures)}."
-            )
-        if not board_refreshed:
-            result_lines.append("⚠️ The slot board could not be refreshed.")
-        result_lines.extend(
-            f"⚠️ Skipped: {error}" for error in self.error_entries
-        )
-        await interaction.response.send_message(
-            embed=self.final_embed(
-                "✅ Registration Completed Successfully",
-                color=discord.Color.green(),
-                extra_lines=result_lines,
-            ),
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        await delete_message_or_clear(
-            self.message or getattr(interaction, "message", None),
-            log_context="completed registration preview",
-            fallback_content="This registration preview has been completed.",
-        )
-
-    @discord.ui.button(
-        label="Confirm",
-        style=discord.ButtonStyle.success,
-        emoji="✅",
-    )
-    async def confirm_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await self._finish_confirm(interaction)
-
-    @discord.ui.button(
-        label="Cancel",
-        style=discord.ButtonStyle.danger,
-        emoji="❌",
-    )
-    async def cancel_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await self._finish_cancel(interaction)
-
-
-@bot.command(name="register", aliases=["reg"])
-@commands.guild_only()
-async def register_team(ctx: commands.Context, *, arguments: str) -> None:
+async def _legacy_register_team(ctx: commands.Context, *, arguments: str) -> None:
     """Register the invoking member's team through the configured public channel."""
     scrim = resolve_registration_scrim(ctx)
     if scrim is None:
@@ -11165,65 +10099,8 @@ async def register_team(ctx: commands.Context, *, arguments: str) -> None:
             logger.exception("Could not acknowledge successful registration.")
 
 
-@bot.command(name="add", aliases=["a"])
-@commands.guild_only()
-async def add_team(ctx: commands.Context, *, arguments: str) -> None:
-    scrim = await require_staff_scrim(ctx, allow_public=True)
-    if scrim is None:
-        return
-    valid_entries, error_entries = await build_add_draft(ctx, scrim, arguments)
-    if len(valid_entries) < 2:
-        if not valid_entries:
-            details = "\n".join(f"⚠️ {error}" for error in error_entries)
-            await send_private_command_feedback(
-                ctx,
-                details or "No valid registration was provided.",
-                silent=False,
-            )
-            return
-        snapshots, unavailable, access_failures, board_refreshed = (
-            await apply_add_entries(scrim, valid_entries)
-        )
-        if unavailable:
-            await send_private_command_feedback(
-                ctx,
-                "No changes were made.\n" + "\n".join(f"⚠️ {error}" for error in unavailable),
-                silent=False,
-            )
-            return
-        messages = [
-            f"✅ Slot {snapshot.number:02d}: {snapshot.team_name} was added."
-            for snapshot in snapshots
-        ]
-        messages.extend(f"⚠️ Skipped: {error}" for error in error_entries)
-        if access_failures:
-            messages.append(
-                "⚠️ Pending Captain access could not be completed for: "
-                + ", ".join(access_failures)
-                + "."
-            )
-        if not board_refreshed:
-            messages.append("⚠️ The slot board could not be refreshed.")
-        await send_private_command_feedback(
-            ctx,
-            "\n".join(messages),
-            silent=False,
-            delete_after=30,
-        )
-        return
-
-    view = AddRegistrationView(ctx, scrim, valid_entries, error_entries)
-    embed = add_preview_embed(scrim, valid_entries, error_entries)
-    try:
-        view.message = await ctx.send(
-            embed=embed,
-            view=view,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-    except discord.HTTPException:
-        logger.exception("Could not send the registration preview.")
-        return
-    await delete_command_message(ctx)
+_legacy_group = bot.group
+_legacy_command = bot.command
 
 
 def cap_feedback_mentions() -> discord.AllowedMentions:
@@ -11238,7 +10115,7 @@ async def refresh_cap_board(scrim: Scrim) -> bool:
         return False
 
 
-class CaptainSlotSelectView(discord.ui.View):
+class _legacy_CaptainSlotSelectView(discord.ui.View):
     def __init__(
         self,
         ctx: commands.Context,
@@ -11666,9 +10543,9 @@ async def send_cap_action_feedback(
     await send_private_command_feedback(ctx, message, **kwargs)
 
 
-@bot.group(name="cap", invoke_without_command=True, hidden=True)
+@_legacy_group(name="cap", invoke_without_command=True, hidden=True)
 @commands.guild_only()
-async def cap_command(ctx: commands.Context) -> None:
+async def _legacy_cap_command(ctx: commands.Context) -> None:
     if not await require_cap_channel(ctx):
         return
     await send_private_command_feedback(
@@ -11679,9 +10556,9 @@ async def cap_command(ctx: commands.Context) -> None:
     )
 
 
-@cap_command.command(name="add")
+@_legacy_cap_command.command(name="add")
 @commands.guild_only()
-async def cap_add(ctx: commands.Context, member: discord.Member) -> None:
+async def _legacy_cap_add(ctx: commands.Context, member: discord.Member) -> None:
     if not await require_cap_channel(ctx):
         return
     assignment = await captain_assignment_or_selection(ctx, "add", member)
@@ -11693,9 +10570,9 @@ async def cap_add(ctx: commands.Context, member: discord.Member) -> None:
     await send_cap_action_feedback(ctx, success, message)
 
 
-@cap_command.command(name="transfer")
+@_legacy_cap_command.command(name="transfer")
 @commands.guild_only()
-async def cap_transfer(ctx: commands.Context, member: discord.Member) -> None:
+async def _legacy_cap_transfer(ctx: commands.Context, member: discord.Member) -> None:
     if not await require_cap_channel(ctx):
         return
     assignment = await captain_assignment_or_selection(ctx, "transfer", member)
@@ -11707,9 +10584,9 @@ async def cap_transfer(ctx: commands.Context, member: discord.Member) -> None:
     await send_cap_action_feedback(ctx, success, message)
 
 
-@cap_command.command(name="remove")
+@_legacy_cap_command.command(name="remove")
 @commands.guild_only()
-async def cap_remove(ctx: commands.Context, member: discord.Member) -> None:
+async def _legacy_cap_remove(ctx: commands.Context, member: discord.Member) -> None:
     if not await require_cap_channel(ctx):
         return
     assignment = await captain_assignment_or_selection(ctx, "remove", member)
@@ -11758,9 +10635,9 @@ def parse_add_arguments(arguments: str) -> tuple[str, str, str]:
     return team_name, tag, manager_text
 
 
-@bot.command(name="remind", aliases=["rem"])
+@_legacy_command(name="remind", aliases=["rem"])
 @commands.guild_only()
-async def remind_managers(ctx: commands.Context) -> None:
+async def _legacy_remind_managers(ctx: commands.Context) -> None:
     """Mention managers whose assigned slots still need their confirmation."""
     scrim = await require_staff_scrim(ctx, allow_public=True)
     if scrim is None:
@@ -11819,9 +10696,9 @@ async def remind_managers(ctx: commands.Context) -> None:
     await delete_command_message(ctx)
 
 
-@bot.command(name="confirm", aliases=["cf"])
+@_legacy_command(name="confirm", aliases=["cf"])
 @commands.guild_only()
-async def confirm_slot(ctx: commands.Context, *, slot_numbers: str) -> None:
+async def _legacy_confirm_slot(ctx: commands.Context, *, slot_numbers: str) -> None:
     scrim = await require_staff_scrim(
         ctx,
         allow_public=True,
@@ -11903,9 +10780,9 @@ async def confirm_slot(ctx: commands.Context, *, slot_numbers: str) -> None:
     )
 
 
-@bot.command(name="remove", aliases=["rm"])
+@_legacy_command(name="remove", aliases=["rm"])
 @commands.guild_only()
-async def remove_team(ctx: commands.Context, *, slot_numbers: str) -> None:
+async def _legacy_remove_team(ctx: commands.Context, *, slot_numbers: str) -> None:
     scrim = await require_staff_scrim(ctx, silent=False)
     if scrim is None:
         return
@@ -12102,18 +10979,6 @@ async def transfer_slots_command(
         silent=False,
         delete_after=30,
     )
-
-
-@bot.command(name="move")
-@commands.guild_only()
-async def move_team(ctx: commands.Context, *, slot_numbers: str = "") -> None:
-    await transfer_slots_command(ctx, action="move", slot_numbers=slot_numbers)
-
-
-@bot.command(name="switch")
-@commands.guild_only()
-async def switch_teams(ctx: commands.Context, *, slot_numbers: str = "") -> None:
-    await transfer_slots_command(ctx, action="switch", slot_numbers=slot_numbers)
 
 
 class StaffActionButton(
@@ -12887,13 +11752,107 @@ install_announcement_command(
     repository,
     configured_text_channel,
 )
+_idpw_bindings = idpw_commands.install_idpw_commands(bot, sys.modules[__name__])
+active_idpw = idpw_commands.active_idpw
+active_idpw_locks = idpw_commands.active_idpw_locks
+_format_idpw_reminder = _idpw_bindings._format_idpw_reminder
+_format_idpw_announcement = _idpw_bindings._format_idpw_announcement
+_parse_idpw_input = _idpw_bindings._parse_idpw_input
+_publish_idpw = _idpw_bindings._publish_idpw
+_publish_idpwg = _idpw_bindings._publish_idpwg
+_send_scheduled_idpw_reminder = _idpw_bindings._send_scheduled_idpw_reminder
+restore_active_idpw = _idpw_bindings.restore_active_idpw
+clear_active_idpw = _idpw_bindings.clear_active_idpw
+bot.remove_command("add")
+AddDraftEntry = add_commands.AddDraftEntry
+add_preview_embed = add_commands.add_preview_embed
+resolve_add_member = add_commands.resolve_add_member
+build_add_draft = add_commands.build_add_draft
+apply_add_entries = add_commands.apply_add_entries
+AddRegistrationView = add_commands.AddRegistrationView
+add_team = add_commands.add_team
+add_commands.bind_owner(sys.modules[__name__])
+add_commands.install_add_command(bot, sys.modules[__name__])
+_slots_bindings = slots_commands.install_slots_commands(bot, sys.modules[__name__])
+SlotsScrimSelectView = _slots_bindings["SlotsScrimSelectView"]
+UpdateScrimSelectView = _slots_bindings["UpdateScrimSelectView"]
+show_slots = _slots_bindings["show_slots"]
+update_slots_command = _slots_bindings["update_slots_command"]
+build_slot_status_embed = _slots_bindings["build_slot_status_embed"]
+# Keep the implementation objects available to the feature module while the
+# entry point is migrated away from its historical ``_legacy_*`` names.
+_registration_bindings = registration_commands.install_registration_commands(
+    bot, sys.modules[__name__]
+)
+for _name, _value in _registration_bindings.items():
+    globals()[_name] = _value
+leaderboard_settings_command = _legacy_leaderboard_settings_command
+build_and_send_leaderboard = _legacy_leaderboard_command
+_leaderboard_bindings = leaderboard_commands.install_leaderboard_commands(
+    bot, sys.modules[__name__]
+)
+for _name, _value in _leaderboard_bindings.items():
+    globals()[_name] = _value
+bot.remove_command("reset")
+bot.remove_command("open")
+bot.remove_command("close")
+(
+    perform_scrim_reset,
+    ResetConfirmationView,
+    reset_slots,
+    open_scrim,
+    close_scrim,
+) = scrim_lifecycle.install_lifecycle_commands(bot, sys.modules[__name__])
+staff_messaging.install(
+    bot,
+    owner=sys.modules[__name__],
+    repository=repository,
+    logger=logger,
+    constants={
+        "DEFAULT_OPERATIONAL_MESSAGES": DEFAULT_OPERATIONAL_MESSAGES,
+        "OPERATIONAL_MESSAGE_KEYS": OPERATIONAL_MESSAGE_KEYS,
+        "OPERATIONAL_MESSAGE_LABELS": OPERATIONAL_MESSAGE_LABELS,
+    },
+    views={"ExpiringView": ExpiringView},
+    callbacks={
+        "member_is_staff_in_guild": member_is_staff_in_guild,
+        "member_has_global_staff_role": member_has_global_staff_role,
+        "resolve_operational_scrim": resolve_operational_scrim,
+        "send_private_command_feedback": send_private_command_feedback,
+        "delete_command_message": delete_command_message,
+    },
+)
+OperationalMessageView = staff_messaging.OperationalMessageView
+OperationalMessageModal = staff_messaging.OperationalMessageModal
+ResultsMessageModal = staff_messaging.ResultsMessageModal
+configure_operational_message = staff_messaging.configure_operational_message
+say_message = staff_messaging.say_message
+_staff_mirror_bindings = staff_mirror.install_staff_mirror_commands(
+    bot, sys.modules[__name__]
+)
+for _name, _value in _staff_mirror_bindings.items():
+    globals()[_name] = _value
+_staff_slot_bindings = staff_slots.install_staff_slot_commands(
+    bot, sys.modules[__name__]
+)
+for _name, _value in _staff_slot_bindings.items():
+    globals()[_name] = _value
+ban_system = ban_commands.BanService(
+    bot,
+    sys.modules[__name__],
+    Path(__file__).parent / "data" / "public_advanced_bans.json",
+)
 install_setup_panel()
+ban_commands.install_ban_commands(bot, ban_system)
+install_events(sys.modules[__name__])
 
 
 def main() -> None:
-    token = os.getenv("DISCORD_TOKEN")
+    token = os.getenv("ARC_PUBLIC_DISCORD_TOKEN")
     if not token:
-        raise RuntimeError("The DISCORD_TOKEN environment variable is missing.")
+        raise RuntimeError(
+            "The ARC_PUBLIC_DISCORD_TOKEN environment variable is missing."
+        )
     bot.run(token)
 
 

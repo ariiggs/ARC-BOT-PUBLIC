@@ -6,8 +6,8 @@ avec une plage de slots PUBG Mobile configurable pour chaque scrim.
 ## Copie indépendante
 
 Cette copie utilise sa propre base SQLite dans `data/slots.sqlite3` et doit
-utiliser un **nouveau bot Discord**. Ajoute le nouveau token dans le secret
-`DISCORD_TOKEN` de ce projet, sans l'écrire dans un fichier, puis lance :
+utiliser un **nouveau bot Discord**. Ajoute son token dans le secret
+`ARC_PUBLIC_DISCORD_TOKEN`, sans l'écrire dans un fichier, puis lance :
 
 ```bash
 python main.py
@@ -166,7 +166,7 @@ n'est nécessaire.
   archive une seule fois l'état final du scrim, avec le résumé complet du board,
   avant d'effacer les slots.
 
-Le chemin peut être configuré avec `SLOTS_DB_PATH` (chemin absolu recommandé).
+Le chemin peut être configuré avec `PUBLIC_SLOTS_DB_PATH` (chemin absolu recommandé).
 Par défaut, il est résolu à côté de `main.py`, indépendamment du dossier de
 lancement. Garder ce fichier sur un disque persistant et lancer **une seule
 instance du bot** par base. Cette sauvegarde couvre les redémarrages du processus

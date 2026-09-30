@@ -10,7 +10,10 @@ from typing import Any
 import discord
 from discord.ext import commands
 
-from slot_storage import SlotStorageError
+from arc_bot.utils.discord_messages import (
+    delete_command_message as _delete_command_message,
+)
+from arc_bot.storage.slot_storage import SlotStorageError
 
 
 logger = logging.getLogger(__name__)
@@ -33,17 +36,6 @@ def extract_raw_emoji(content: str) -> str | None:
         return custom.group(0)
     unicode_emoji = UNICODE_EMOJI_RE.search(content)
     return unicode_emoji.group(0) if unicode_emoji is not None else None
-
-
-async def _delete_command_message(ctx: commands.Context) -> None:
-    message = getattr(ctx, "message", None)
-    delete = getattr(message, "delete", None)
-    if delete is None:
-        return
-    try:
-        await delete()
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        pass
 
 
 GUIDE = (

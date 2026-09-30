@@ -1,12 +1,8 @@
-"""Display names for persisted ARC license tiers."""
+"""Compatibility exports for integrations using the original flat module path."""
 
-LICENSE_DISPLAY_NAMES = {
-    "Standard": "ARC Go",
-    "Gold": "ARC Pro",
-    "Diamond": "ARC Pro Max",
-}
+from arc_bot.domain.license_labels import (
+    LICENSE_DISPLAY_NAMES,
+    license_display_name,
+)
 
-
-def license_display_name(license_type: str) -> str:
-    """Return the public-facing name without changing the stored tier key."""
-    return LICENSE_DISPLAY_NAMES.get(license_type, license_type)
+__all__ = ["LICENSE_DISPLAY_NAMES", "license_display_name"]

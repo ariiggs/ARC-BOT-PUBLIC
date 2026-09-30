@@ -10,8 +10,12 @@ from typing import Any
 import discord
 from discord.ext import commands
 
+from arc_bot.utils.discord_messages import (
+    delete_command_message as _delete_command_message,
+)
 from global_setup import CUSTOM_EMOJI_RE, UNICODE_EMOJI_RE, extract_raw_emoji
-from slot_storage import SlotStorageError
+from arc_bot.storage.ban_storage import BanStorageError
+from arc_bot.storage.slot_storage import SlotStorageError
 from scrim_state import (
     DEFAULT_KILL_POINTS_VALUE,
     DEFAULT_IDPW_TIMEZONE,
@@ -38,17 +42,6 @@ from scrim_state import (
 
 
 logger = logging.getLogger(__name__)
-
-
-async def _delete_command_message(ctx: commands.Context) -> None:
-    message = getattr(ctx, "message", None)
-    delete = getattr(message, "delete", None)
-    if delete is None:
-        return
-    try:
-        await delete()
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        pass
 
 
 def _safe_name(value: str | None) -> str:
@@ -96,6 +89,7 @@ def _role_ref(role_id: int | None) -> str:
 
 
 ADDITIONAL_SETTINGS_SECTIONS = (
+    ("ban_system", "Ban System", "🔨"),
     ("matches_maps", "Matches & Maps", "🎮"),
     ("registration", "Registrations", "📝"),
     ("idpw", "ID&PW", "🔐"),
@@ -272,7 +266,9 @@ def _channel_permissions_error(
     return None
 
 
-def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
+def install_setup(
+    bot, repository, publish_scrim, log_action=None, ban_service=None
+) -> None:
     """Install the guild-only ``!setup`` command on *bot*."""
 
     def setup_authorized(
@@ -1183,7 +1179,9 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
         def rebuild(self) -> None:
             self.clear_items()
-            for section, label, emoji in ADDITIONAL_SETTINGS_SECTIONS:
+            for index, (section, label, emoji) in enumerate(
+                ADDITIONAL_SETTINGS_SECTIONS
+            ):
                 button = discord.ui.Button(
                     label=label,
                     emoji=emoji,
@@ -1192,7 +1190,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                         section == "emojis"
                         and not _gold_emoji_license_enabled(self.guild_id)
                     ),
-                    row=0,
+                    row=index // 5,
                 )
 
                 async def callback(
@@ -1222,6 +1220,26 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                             allowed_mentions=discord.AllowedMentions.none(),
                         )
                         return
+                    if section == "ban_system":
+                        if ban_service is None:
+                            await interaction.response.send_message(
+                                "Ban System settings are unavailable right now.",
+                                ephemeral=True,
+                            )
+                            return
+                        ban_view = BanSettingsView(
+                            self.panel,
+                            self.owner_id,
+                            self.guild_id,
+                            self.scrim_id,
+                        )
+                        await interaction.response.edit_message(
+                            content=ban_view.content(),
+                            embed=ban_view.embed(),
+                            view=ban_view,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                        return
                     edit_view = ScrimEditView(
                         self.panel,
                         self.owner_id,
@@ -1243,7 +1261,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 label="Back to Management",
                 emoji="↩️",
                 style=discord.ButtonStyle.secondary,
-                row=1,
+                row=2,
             )
 
             async def back_callback(interaction: discord.Interaction) -> None:
@@ -1265,7 +1283,7 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
                 label="Restore All Defaults",
                 emoji="🔄",
                 style=discord.ButtonStyle.danger,
-                row=1,
+                row=2,
             )
 
             async def restore_callback(interaction: discord.Interaction) -> None:
@@ -1316,19 +1334,743 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
             embed = discord.Embed(
                 title=f"Additional Settings — {_safe_name(selected.name)}",
                 description=(
-                    "Cap Transfer (`!cap`), Matches & Maps, Registrations, "
-                    "ID&PW, and Custom Emojis are optional. "
-                    "This panel shows configuration only; live registration and "
-                    "slot states are handled elsewhere."
+                    "Current saved values for every optional category. Password "
+                    "contents are never displayed here."
                 ),
                 color=discord.Color.blurple(),
             )
+
+            try:
+                if ban_service is None:
+                    raise BanStorageError("Ban settings are unavailable.")
+                ban_store = ban_service._require_store()
+                ban_config = ban_store.config(self.guild_id)
+                ban_scope = ban_store.scope_for_scrim(self.guild_id, self.scrim_id)
+                scope_label = (
+                    "Server-wide"
+                    if ban_scope == "guild"
+                    else "This scrim only"
+                )
+                ban_channel = (
+                    f"<#{ban_config['bans_channel_id']}>"
+                    if ban_config["bans_channel_id"]
+                    else "Not configured"
+                )
+                punitive_role = (
+                    f"<@&{ban_config['punitive_role_id']}>"
+                    if ban_config["punitive_role_id"]
+                    else "Not configured"
+                )
+                ban_value = (
+                    f"New ban scope: **{scope_label}**\n"
+                    f"Server-wide board: {ban_channel}\n"
+                    f"Punitive role: {punitive_role}\n"
+                    f"Blocked-registration reaction: "
+                    f"{ban_config.get('banned_emoji', '🔨')}"
+                )
+            except (BanStorageError, KeyError, ValueError):
+                ban_value = "Ban System settings are unavailable."
+
+            matches = getattr(selected, "max_matches", 0)
+            maps = list(getattr(selected, "maps", []) or [])
+            match_maps = list(getattr(selected, "match_maps", maps) or [])
+            rotation = ", ".join(match_maps[:MAX_MATCHES]) or "Not configured"
+            map_pool = ", ".join(maps) or "Not configured (optional)"
+            matches_value = (
+                f"Matches: **{matches or 'Not configured'}**\n"
+                f"Custom map pool: {map_pool}\n"
+                f"Match rotation: {rotation}"
+            )
+
+            registration_channel = getattr(
+                selected, "registration_channel_id", None
+            )
+            registration_role = getattr(selected, "registration_role_id", None)
+            registration_role_text = (
+                "@everyone"
+                if registration_role == self.guild_id
+                else f"<@&{registration_role}>"
+                if registration_role
+                else "Not configured"
+            )
+            registration_mode = (
+                "Auto-accept"
+                if getattr(selected, "registration_auto_accept", False)
+                else "Staff validation"
+            )
+            registration_state = (
+                "Configured"
+                if registration_channel and registration_role
+                else "Partially configured"
+                if registration_channel or registration_role
+                else "Not configured"
+            )
+            registration_value = (
+                f"Status: **{registration_state}**\n"
+                f"Channel: "
+                f"{f'<#{registration_channel}>' if registration_channel else 'Not configured'}\n"
+                f"Role: {registration_role_text}\n"
+                f"Handling: **{registration_mode}**"
+            )
+
+            idpw_config = repository.get_idpw_config(selected.id)
+            idpw_channel = idpw_config.target_channel_id if idpw_config else None
+            password_type = getattr(selected, "pw_type", None) or (
+                idpw_config.password_type if idpw_config else None
+            )
+            timezone_name = getattr(selected, "timezone", None) or (
+                idpw_config.timezone_name if idpw_config else None
+            )
+            fixed_password = (
+                idpw_config.fixed_password
+                if idpw_config
+                else getattr(selected, "fixed_pw", "")
+            )
+            idpw_state = (
+                "Configured"
+                if idpw_channel and password_type and timezone_name
+                else "Partially configured"
+                if idpw_channel or password_type or timezone_name
+                else "Not configured"
+            )
+            idpw_value = (
+                f"Status: **{idpw_state}**\n"
+                f"Target channel: "
+                f"{f'<#{idpw_channel}>' if idpw_channel else 'Not configured'}\n"
+                f"Password mode: **{str(password_type).upper() if password_type else 'Not configured'}**\n"
+                f"Saved fixed password: "
+                f"{'Configured' if fixed_password else 'Not configured'}\n"
+                f"Timezone: **{timezone_name or 'Not configured'}**"
+            )
+
+            emoji_values = (
+                ("Available", getattr(selected, "emoji_available", DEFAULT_EMOJI_AVAILABLE), DEFAULT_EMOJI_AVAILABLE),
+                ("Reserved", getattr(selected, "emoji_reserved", DEFAULT_EMOJI_RESERVED), DEFAULT_EMOJI_RESERVED),
+                ("Pending", getattr(selected, "emoji_pending", DEFAULT_EMOJI_PENDING), DEFAULT_EMOJI_PENDING),
+                ("Confirmed", getattr(selected, "emoji_confirmed", DEFAULT_EMOJI_CONFIRMED), DEFAULT_EMOJI_CONFIRMED),
+                ("Review OK", getattr(selected, "emoji_registration_ok", DEFAULT_EMOJI_REGISTRATION_OK), DEFAULT_EMOJI_REGISTRATION_OK),
+                ("Accepted", getattr(selected, "emoji_registration_accepted", DEFAULT_EMOJI_REGISTRATION_ACCEPTED), DEFAULT_EMOJI_REGISTRATION_ACCEPTED),
+                ("Declined", getattr(selected, "emoji_registration_declined", DEFAULT_EMOJI_REGISTRATION_DECLINED), DEFAULT_EMOJI_REGISTRATION_DECLINED),
+            )
+            slot_number_emojis = getattr(selected, "slot_number_emojis", {}) or {}
+            customized_emojis = (
+                any(value != default for _label, value, default in emoji_values)
+                or bool(slot_number_emojis)
+            )
+            emoji_value = (
+                f"Status: **{'Customized' if customized_emojis else 'Using defaults'}**\n"
+                "Slot statuses: "
+                + " · ".join(f"{label} {value}" for label, value, _ in emoji_values[:4])
+                + "\nRegistration: "
+                + " · ".join(f"{label} {value}" for label, value, _ in emoji_values[4:])
+                + f"\nSlot-number overrides: **{len(slot_number_emojis)}**"
+            )
+            if slot_number_emojis:
+                preview = ", ".join(
+                    f"{int(number):02d} {emoji}"
+                    for number, emoji in sorted(
+                        slot_number_emojis.items(),
+                        key=lambda item: int(item[0]),
+                    )[:8]
+                )
+                emoji_value += f"\nExamples: {preview}"
+
             embed.add_field(
-                name="Current Cap Transfer channel",
+                name="Ban System",
+                value=ban_value,
+                inline=False,
+            )
+            embed.add_field(
+                name="Cap Transfer",
                 value=_cap_transfer_summary(selected),
                 inline=False,
             )
+            embed.add_field(
+                name="Matches & Maps",
+                value=matches_value,
+                inline=False,
+            )
+            embed.add_field(
+                name="Registrations",
+                value=registration_value,
+                inline=False,
+            )
+            embed.add_field(
+                name="ID&PW",
+                value=idpw_value,
+                inline=False,
+            )
+            embed.add_field(
+                name="Custom Emojis",
+                value=emoji_value,
+                inline=False,
+            )
             return embed
+
+    class BanSettingsView(BoundView):
+        """Scope-aware ban configuration for one selected scrim."""
+
+        def __init__(
+            self,
+            panel: SetupPanel,
+            owner_id: int,
+            guild_id: int,
+            scrim_id: str,
+        ):
+            super().__init__(owner_id, guild_id)
+            self.panel = panel
+            self.scrim_id = scrim_id
+            self.service = ban_service
+            try:
+                current_scope = self.service.scope_for_scrim(guild_id, scrim_id)
+            except BanStorageError:
+                current_scope = "guild"
+
+            self.scope_picker = discord.ui.Select(
+                placeholder="Choose the ban scope for this scrim",
+                min_values=1,
+                max_values=1,
+                options=[
+                    discord.SelectOption(
+                        label="Server-wide",
+                        value="guild",
+                        description="Applies across all scrims in this server.",
+                        default=current_scope == "guild",
+                    ),
+                    discord.SelectOption(
+                        label="This scrim only",
+                        value="scrim",
+                        description="Applies only to this selected scrim.",
+                        default=current_scope == "scrim",
+                    ),
+                ],
+                row=0,
+            )
+            self.scope_picker.callback = self.scope_callback
+            self.add_item(self.scope_picker)
+
+            self.channel_picker = discord.ui.ChannelSelect(
+                channel_types=[discord.ChannelType.text],
+                placeholder="Choose the server-wide ban board channel",
+                min_values=1,
+                max_values=1,
+                row=1,
+            )
+            self.channel_picker.callback = self.channel_callback
+            self.add_item(self.channel_picker)
+
+            self.role_picker = discord.ui.RoleSelect(
+                placeholder="Choose the punitive role for active bans",
+                min_values=1,
+                max_values=1,
+                row=2,
+            )
+            self.role_picker.callback = self.role_callback
+            self.add_item(self.role_picker)
+
+            confirm_button = discord.ui.Button(
+                label="Confirm",
+                style=discord.ButtonStyle.success,
+                row=3,
+            )
+            confirm_button.callback = self.confirm_callback
+            self.add_item(confirm_button)
+
+            reset_button = discord.ui.Button(
+                label="Reset Default",
+                style=discord.ButtonStyle.danger,
+                row=3,
+            )
+            reset_button.callback = self.reset_callback
+            self.add_item(reset_button)
+
+            back_button = discord.ui.Button(
+                label="Back to Additional Settings",
+                emoji="↩️",
+                style=discord.ButtonStyle.secondary,
+                row=3,
+            )
+            back_button.callback = self.back_callback
+            self.add_item(back_button)
+
+        def scrim(self) -> Any | None:
+            selected = repository.get(self.scrim_id)
+            if selected is None or selected.guild_id != self.guild_id:
+                return None
+            return selected
+
+        def content(self, notice: str | None = None) -> str:
+            selected = self.scrim()
+            if selected is None:
+                return "That scrim no longer exists."
+            body = (
+                f"**Ban System — {_safe_name(selected.name)}**\n"
+                "Set the scope for new bans in this scrim. The board channel and "
+                "punitive role apply across this server."
+            )
+            return f"{body}\n\n{notice}" if notice else body
+
+        def embed(self) -> discord.Embed:
+            selected = self.scrim()
+            if selected is None:
+                return discord.Embed(
+                    title="Scrim no longer exists",
+                    color=discord.Color.red(),
+                )
+            embed = discord.Embed(
+                title="Ban System Settings",
+                color=discord.Color.dark_red(),
+                description=(
+                    "Changing scope affects new bans only. Existing bans keep the "
+                    "scope saved on each record. A captain keeps the configured role "
+                    "while any of their team bans is active; only roles added by the "
+                    "bot are removed automatically."
+                ),
+            )
+            try:
+                store = self.service._require_store()
+                config = store.config(self.guild_id)
+                scope = store.scope_for_scrim(self.guild_id, self.scrim_id)
+            except BanStorageError:
+                embed.add_field(
+                    name="Ban storage",
+                    value="Unavailable; settings cannot be changed safely.",
+                    inline=False,
+                )
+                return embed
+            scope_label = (
+                "Server-wide (all scrims)"
+                if scope == "guild"
+                else "This scrim only"
+            )
+            embed.add_field(name="New ban scope", value=scope_label, inline=False)
+            embed.add_field(
+                name="Ban board channel",
+                value=(
+                    f"<#{config['bans_channel_id']}>"
+                    if config["bans_channel_id"]
+                    else "Not configured"
+                ),
+                inline=False,
+            )
+            embed.add_field(
+                name="Punitive role",
+                value=(
+                    f"<@&{config['punitive_role_id']}>"
+                    if config["punitive_role_id"]
+                    else "Not configured"
+                ),
+                inline=False,
+            )
+            return embed
+
+        async def show(
+            self, interaction: discord.Interaction, notice: str | None = None
+        ) -> None:
+            await interaction.edit_original_response(
+                content=self.content(notice),
+                embed=self.embed(),
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        async def _defer(self, interaction: discord.Interaction) -> bool:
+            if not await self.interaction_check(interaction):
+                return False
+            if self.scrim() is None:
+                await interaction.response.edit_message(
+                    content="That scrim no longer exists.",
+                    embed=None,
+                    view=None,
+                )
+                return False
+            await interaction.response.defer()
+            return True
+
+        async def scope_callback(self, interaction: discord.Interaction) -> None:
+            if not await self._defer(interaction):
+                return
+            scope = self.scope_picker.values[0]
+            try:
+                await self.service.configure_scope_for_scrim(
+                    self.guild_id, self.scrim_id, scope
+                )
+                notice = (
+                    "Saved. New bans will apply server-wide."
+                    if scope == "guild"
+                    else "Saved. New bans will apply only to this scrim."
+                )
+            except (BanStorageError, ValueError):
+                logger.exception("Could not save a scrim's ban scope.")
+                notice = "The scope could not be saved. Please try again."
+            await self.show(interaction, notice)
+
+        async def channel_callback(
+            self, interaction: discord.Interaction
+        ) -> None:
+            if not await self._defer(interaction):
+                return
+            channel = self.channel_picker.values[0]
+            if (
+                not isinstance(channel, discord.app_commands.AppCommandChannel)
+                or channel.type != discord.ChannelType.text
+                or channel.guild_id != self.guild_id
+            ):
+                await self.show(
+                    interaction,
+                    "Choose a text channel in this server.",
+                )
+                return
+            try:
+                refreshed, old_board_retired = (
+                    await self.service.configure_board_channel(
+                        self.guild_id, channel.id
+                    )
+                )
+                notice = (
+                    f"Saved {channel.mention} as the server-wide ban board channel."
+                    if refreshed
+                    else (
+                        f"Saved {channel.mention} as the server-wide ban board "
+                        "channel, but I could not publish the board there. Check "
+                        "that I have View Channel, Send Messages, Embed Links, "
+                        "and Read Message History."
+                    )
+                )
+                if not old_board_retired:
+                    notice += " I could not retire the previous board message."
+            except (BanStorageError, ValueError, discord.HTTPException):
+                logger.exception("Could not configure the ban board channel.")
+                notice = "The ban board channel could not be configured safely."
+            await self.show(interaction, notice)
+
+        async def role_callback(self, interaction: discord.Interaction) -> None:
+            if not await self._defer(interaction):
+                return
+            role = self.role_picker.values[0]
+            if role.is_default() or role.managed:
+                await self.show(
+                    interaction,
+                    "Choose a regular server role, not @everyone or a managed role.",
+                )
+                return
+            bot_member = getattr(interaction.guild, "me", None)
+            permissions = getattr(bot_member, "guild_permissions", None)
+            top_role = getattr(bot_member, "top_role", None)
+            if (
+                permissions is None
+                or not getattr(permissions, "manage_roles", False)
+                or (
+                    top_role is not None
+                    and role.position >= top_role.position
+                )
+            ):
+                await self.show(
+                    interaction,
+                    "I need Manage Roles, and my highest role must be above the selected role.",
+                )
+                return
+            try:
+                failed = await self.service.configure_punitive_role(
+                    self.guild_id, role.id
+                )
+                notice = f"Saved {role.mention} as the punitive role."
+                if failed:
+                    notice += (
+                        " I could not update the role for "
+                        + ", ".join(f"<@{captain_id}>" for captain_id in failed[:5])
+                        + "."
+                    )
+            except (BanStorageError, ValueError):
+                logger.exception("Could not configure the punitive role.")
+                notice = "The punitive role could not be configured safely."
+            await self.show(interaction, notice)
+
+        async def confirm_callback(self, interaction: discord.Interaction) -> None:
+            if not await self.interaction_check(interaction):
+                return
+            selected = self.scrim()
+            if selected is None:
+                await interaction.response.edit_message(
+                    content="That scrim no longer exists.",
+                    embed=None,
+                    view=None,
+                )
+                return
+            try:
+                config = self.service._require_store().config(self.guild_id)
+            except BanStorageError:
+                await interaction.response.send_message(
+                    "Ban settings are unavailable right now. Please try again later.",
+                    ephemeral=True,
+                )
+                return
+
+            channel_id = config.get("bans_channel_id")
+            role_id = config.get("punitive_role_id")
+            missing = []
+            if not channel_id:
+                missing.append("a text channel for the public ban board")
+            if not role_id:
+                missing.append("a punitive role")
+            if missing:
+                await interaction.response.send_message(
+                    "Please configure "
+                    + " and ".join(missing)
+                    + " before confirming Ban System settings.",
+                    ephemeral=True,
+                )
+                return
+
+            guild = interaction.guild
+            channel = guild.get_channel(channel_id) if guild else None
+            role = guild.get_role(role_id) if guild else None
+            if (
+                channel is None
+                or not isinstance(channel, discord.TextChannel)
+                or channel.guild.id != self.guild_id
+            ):
+                await interaction.response.send_message(
+                    "The saved ban-board channel is no longer a valid text channel "
+                    "in this server. Select a new channel first.",
+                    ephemeral=True,
+                )
+                return
+            if (
+                role is None
+                or role.is_default()
+                or role.managed
+            ):
+                await interaction.response.send_message(
+                    "The saved punitive role is no longer a valid regular server "
+                    "role. Select a new role first.",
+                    ephemeral=True,
+                )
+                return
+            bot_member = getattr(guild, "me", None)
+            permissions = getattr(bot_member, "guild_permissions", None)
+            top_role = getattr(bot_member, "top_role", None)
+            if (
+                permissions is None
+                or not getattr(permissions, "manage_roles", False)
+                or top_role is None
+                or role.position >= top_role.position
+            ):
+                await interaction.response.send_message(
+                    "I need Manage Roles, and my highest role must be above the "
+                    "saved punitive role.",
+                    ephemeral=True,
+                )
+                return
+            channel_permissions = channel.permissions_for(bot_member)
+            missing_permissions = [
+                name.replace("_", " ")
+                for name in (
+                    "view_channel",
+                    "send_messages",
+                    "embed_links",
+                    "read_message_history",
+                )
+                if not getattr(channel_permissions, name, False)
+            ]
+            if missing_permissions:
+                await interaction.response.send_message(
+                    "I need "
+                    + ", ".join(missing_permissions)
+                    + " in the selected ban-board channel before these settings "
+                    "can be confirmed.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer()
+            try:
+                refreshed = await self.service.refresh_board(self.guild_id)
+            except (BanStorageError, discord.HTTPException):
+                logger.exception("Could not confirm the ban-board settings.")
+                refreshed = False
+            notice = (
+                f"✅ Ban System confirmed. The public board is active in "
+                f"<#{channel_id}> and {role.mention} is configured for active bans."
+                if refreshed
+                else (
+                    "The settings are saved, but I could not refresh the public "
+                    "ban board. Check the channel permissions and try again; the "
+                    "system is not confirmed yet."
+                )
+            )
+            await self.show(interaction, notice)
+
+        async def reset_callback(self, interaction: discord.Interaction) -> None:
+            if not await self.interaction_check(interaction):
+                return
+            if self.scrim() is None:
+                await interaction.response.edit_message(
+                    content="That scrim no longer exists.",
+                    embed=None,
+                    view=None,
+                )
+                return
+            await interaction.response.edit_message(
+                content=(
+                    "Reset Ban System settings to defaults?\n\n"
+                    "This clears the shared public ban-board channel and punitive "
+                    "role for the entire server, restores the default 🔨 reaction, "
+                    "and resets this scrim’s scope to server-wide. Active ban "
+                    "records are kept and remain enforced."
+                ),
+                embed=None,
+                view=BanSettingsResetConfirmationView(
+                    self.panel,
+                    self.owner_id,
+                    self.guild_id,
+                    self.scrim_id,
+                ),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        async def back_callback(self, interaction: discord.Interaction) -> None:
+            if not await self.interaction_check(interaction):
+                return
+            menu = AdditionalSettingsMenuView(
+                self.panel, self.owner_id, self.guild_id, self.scrim_id
+            )
+            await interaction.response.edit_message(
+                content=menu.content(),
+                embed=menu.embed(),
+                view=menu,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    class BanSettingsResetConfirmationView(BoundView):
+        """Confirm the server-wide effects of restoring Ban System defaults."""
+
+        def __init__(
+            self,
+            panel: SetupPanel,
+            owner_id: int,
+            guild_id: int,
+            scrim_id: str,
+        ):
+            super().__init__(owner_id, guild_id)
+            self.panel = panel
+            self.scrim_id = scrim_id
+
+            confirm = discord.ui.Button(
+                label="Confirm Reset",
+                emoji="⚠️",
+                style=discord.ButtonStyle.danger,
+                row=0,
+            )
+
+            async def confirm_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                selected = repository.get(self.scrim_id)
+                if selected is None or selected.guild_id != self.guild_id:
+                    await interaction.response.edit_message(
+                        content="That scrim no longer exists.",
+                        embed=None,
+                        view=None,
+                    )
+                    return
+                await interaction.response.defer()
+                try:
+                    board_retired, failed_captains = (
+                        await ban_service.reset_settings_for_scrim(
+                            self.guild_id, self.scrim_id
+                        )
+                    )
+                except (BanStorageError, ValueError):
+                    logger.exception("Could not reset Ban System settings.")
+                    await interaction.edit_original_response(
+                        content=(
+                            "Ban System settings could not be reset safely. "
+                            "Review the current settings before trying again."
+                        ),
+                        embed=None,
+                        view=BanSettingsView(
+                            self.panel,
+                            self.owner_id,
+                            self.guild_id,
+                            self.scrim_id,
+                        ),
+                    )
+                    return
+                if not board_retired:
+                    await interaction.edit_original_response(
+                        content=(
+                            "I could not remove the existing public ban board, so "
+                            "no Ban System settings were reset. Check my permissions "
+                            "in that channel and try again."
+                        ),
+                        embed=None,
+                        view=BanSettingsView(
+                            self.panel,
+                            self.owner_id,
+                            self.guild_id,
+                            self.scrim_id,
+                        ),
+                    )
+                    return
+
+                try:
+                    await self.panel.refresh_message()
+                except Exception:
+                    logger.exception("Could not refresh setup after Ban System reset.")
+
+                notice = (
+                    "✅ Ban System settings restored to defaults. Active ban records "
+                    "remain stored and enforced."
+                )
+                if failed_captains:
+                    notice += (
+                        " I could not remove bot-managed punitive roles from "
+                        + ", ".join(
+                            f"<@{captain_id}>" for captain_id in failed_captains[:5]
+                        )
+                        + "."
+                    )
+                next_view = BanSettingsView(
+                    self.panel,
+                    self.owner_id,
+                    self.guild_id,
+                    self.scrim_id,
+                )
+                await interaction.edit_original_response(
+                    content=notice,
+                    embed=next_view.embed(),
+                    view=next_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+            confirm.callback = confirm_callback
+            self.add_item(confirm)
+
+            cancel = discord.ui.Button(
+                label="Cancel",
+                style=discord.ButtonStyle.secondary,
+                row=0,
+            )
+
+            async def cancel_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                next_view = BanSettingsView(
+                    self.panel,
+                    self.owner_id,
+                    self.guild_id,
+                    self.scrim_id,
+                )
+                await interaction.response.edit_message(
+                    content=next_view.content(),
+                    embed=next_view.embed(),
+                    view=next_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+            cancel.callback = cancel_callback
+            self.add_item(cancel)
 
     class GridSettingModal(discord.ui.Modal):
         """One-input modal used by every setting in the configuration grid."""
@@ -4705,6 +5447,43 @@ def install_setup(bot, repository, publish_scrim, log_action=None) -> None:
 
             cancel_button.callback = cancel_callback
             self.add_item(cancel_button)
+
+            reset_button = discord.ui.Button(
+                label="Restore ID/PW Defaults",
+                emoji="🔄",
+                style=discord.ButtonStyle.danger,
+                row=4,
+            )
+
+            async def reset_callback(interaction: discord.Interaction) -> None:
+                if not await self.interaction_check(interaction):
+                    return
+                return_view = AdditionalSettingsMenuView(
+                    self.panel,
+                    self.owner_id,
+                    self.guild_id,
+                    self.scrim.id,
+                )
+                await interaction.response.edit_message(
+                    content=(
+                        f"Restore ID/PW settings for **{_safe_name(self.scrim.name)}** "
+                        "to defaults? This clears the saved channel, timezone, and "
+                        "fixed password."
+                    ),
+                    embed=None,
+                    view=ScrimResetConfirmationView(
+                        self.panel,
+                        self.owner_id,
+                        self.guild_id,
+                        self.scrim.id,
+                        "idpw",
+                        return_view,
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+            reset_button.callback = reset_callback
+            self.add_item(reset_button)
 
         def content(self) -> str:
             channel = f"<#{self.channel_id}>" if self.channel_id else "not selected"

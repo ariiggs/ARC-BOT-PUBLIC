@@ -1,0 +1,1 @@
+"""Small Discord helpers shared by bot features."""

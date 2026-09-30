@@ -13,7 +13,7 @@ Elle ne contient aucun token Discord.
 python -m pip install -r requirements.txt
 ```
 
-3. Ajouter une variable secrète nommée exactement `DISCORD_TOKEN`.
+3. Ajouter une variable secrète nommée exactement `ARC_PUBLIC_DISCORD_TOKEN`.
 4. Définir la commande de démarrage :
 
 ```bash
@@ -99,34 +99,6 @@ Le board public affiche les slots numérotés, par défaut de `03` à `25`,
 la légende des états et les boutons **Confirm** / **Cancel**. Le staff mirror
 affiche la même liste sans les contrôles publics.
 
-## Connexion à Interactive
-
-Le bridge Interactive s'exécute dans le même processus que le bot. Il est
-désactivé par défaut et ne démarre que lorsque ces variables sont configurées
-sur l'hébergement :
-
-```text
-ARC_BETA_WEB_BRIDGE_PORT=<port TCP public exposé par l'hébergement>
-ARC_BETA_WEB_BRIDGE_SECRET=<secret partagé avec l'API Replit>
-INTERACTIVE_URL=<URL publique de la page Interactive>
-```
-
-`ARC_BETA_WEB_BRIDGE_SECRET` doit rester une variable secrète et ne doit
-jamais être commitée dans GitHub ou ajoutée à `main.py`. Le bot doit être
-redémarré après l'ajout ou le changement de ces variables.
-
-Dans l'API Replit, configurer les mêmes valeurs de connexion :
-
-```text
-BETA_WEB_BRIDGE_URL=https://<domaine-bot-hosting>:<port>
-BETA_WEB_BRIDGE_SECRET=<la même valeur secrète>
-```
-
-Après le redémarrage du bot et de l'API, un membre Staff peut utiliser
-`!interactive` dans Discord. Le bouton ouvre la page et les changements
-effectués dans celle-ci sont validés et enregistrés par le processus ARC Beta
-avant que les boards Discord soient rafraîchis.
-
 ## Commandes principales
 
 ```text
@@ -181,7 +153,7 @@ est repris automatiquement du scrim sélectionné.
 
 La base est stockée dans `data/slots.sqlite3`. Conserver le dossier `data`
 sur un disque persistant et ne lancer qu'une seule instance du bot avec cette
-base. Le chemin peut être changé avec `SLOTS_DB_PATH`.
+base. Le chemin peut être changé avec `PUBLIC_SLOTS_DB_PATH`.
 
 Ne pas versionner ni publier la base SQLite : elle contient des identifiants
 Discord et l'état des équipes.

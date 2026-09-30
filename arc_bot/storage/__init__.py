@@ -1,0 +1,1 @@
+"""Durable storage adapters used by the bot."""

@@ -11,7 +11,7 @@ from typing import Any
 import discord
 from discord.ext import commands
 
-from license_labels import license_display_name
+from arc_bot.domain.license_labels import license_display_name
 
 logger = logging.getLogger("pung-scrim-bot.announcements")
 
@@ -27,8 +27,6 @@ ANNOUNCEMENT_COLORS = {
 }
 MAX_ANNOUNCEMENT_LENGTH = 4000
 V19_UPDATE_LOG_TEXT = """# ARC BOT V1.9 Update Log
-
-• Screenshot scanning: Added staff-only OCR testing with checks for mismatched screenshots and conflicting results. Scanned scores stay in review and are never saved automatically.
 
 • Team registration: Duplicate team names are declined. If different teams share a tag, the new request goes to staff review—even when auto-accept is on.
 

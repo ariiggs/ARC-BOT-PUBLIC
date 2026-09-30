@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from slot_storage import SlotStateStore, SlotStorageError
+from arc_bot.storage.slot_storage import SlotStateStore, SlotStorageError
 
 DEFAULT_SLOT_START = 3
 DEFAULT_SLOT_END = 25
@@ -316,6 +316,7 @@ class RegistrationRequest:
     manager_id: int
     assignment_id: int
     registration_message_id: int | None = None
+    ban_match_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -705,7 +706,7 @@ def _read_registration_requests(
     result: dict[str, RegistrationRequest] = {}
     requested_slots: set[int] = set()
     for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != {
+        legacy_fields = {
             "request_id",
             "slot_number",
             "team_name",
@@ -713,9 +714,18 @@ def _read_registration_requests(
             "manager_id",
             "assignment_id",
             "registration_message_id",
-        }:
+        }
+        if (
+            not isinstance(entry, dict)
+            or set(entry) not in (
+                legacy_fields,
+                legacy_fields | {"ban_match_reason"},
+            )
+        ):
             raise ValueError("Invalid registration request fields.")
-        request = RegistrationRequest(**entry)
+        request = RegistrationRequest(
+            **{**entry, "ban_match_reason": entry.get("ban_match_reason")}
+        )
         if (
             not isinstance(request.request_id, str)
             or not re.fullmatch(r"[a-f0-9]{16}", request.request_id)
@@ -737,6 +747,14 @@ def _read_registration_requests(
             or (
                 request.registration_message_id is not None
                 and not _positive_id(request.registration_message_id)
+            )
+            or (
+                request.ban_match_reason is not None
+                and (
+                    not isinstance(request.ban_match_reason, str)
+                    or not request.ban_match_reason.strip()
+                    or len(request.ban_match_reason) > 5000
+                )
             )
         ):
             raise ValueError("Invalid registration request.")
