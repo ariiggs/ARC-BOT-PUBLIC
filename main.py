@@ -160,19 +160,34 @@ LEADERBOARD_SECTION_GAP = 10
 LEADERBOARD_TABLE_HEADER_HEIGHT = 64
 LEADERBOARD_VERTICAL_ROW_HEIGHT = 60
 LEADERBOARD_HORIZONTAL_ROW_HEIGHT = 80
-LEADERBOARD_VERTICAL_ROW_FONT_SIZE = 21
+LEADERBOARD_VERTICAL_ROW_FONT_SIZE = 22
 LEADERBOARD_HORIZONTAL_ROW_FONT_SIZE = 32
 LEADERBOARD_ROW_FONT_WEIGHT = 700
-LEADERBOARD_DATE_FONT_SIZE = 36
-LEADERBOARD_TITLE_MAX_FONT_SIZE = 96
+LEADERBOARD_DATE_FONT_SIZE = 22
+LEADERBOARD_TITLE_MAX_FONT_SIZE = 84
+LEADERBOARD_TITLE_MIN_FONT_SIZE = 18
+LEADERBOARD_TITLE_FONT_WEIGHT = 800
+LEADERBOARD_SUBTITLE_TITLE_GAP = 16
+LEADERBOARD_SUBTITLE_FONT_SIZE = 32
+LEADERBOARD_METRIC_HEADER_FONT_SIZE = 24
+LEADERBOARD_RANK_LEFT_PADDING = 8
+LEADERBOARD_HORIZONTAL_RANK_LEFT_PADDING = 32
+LEADERBOARD_TITLE_LEFT_PADDING = 2
+LEADERBOARD_OVERLINE_LEFT_PADDING = 8
+LEADERBOARD_OVERLINE_TOP_OFFSET = 12
+LEADERBOARD_METRIC_RIGHT_PADDING = 8
+LEADERBOARD_LEFT_HEADERS = ("#", "TEAM NAME")
+LEADERBOARD_METRIC_HEADERS = ("WIN", "PLACE", "KILLS", "TOTAL")
+LEADERBOARD_TABLE_HEADER_TEXT_OFFSET = 12
 LEADERBOARD_TEAM_NAME_LEFT_PADDING = 12
-LEADERBOARD_HORIZONTAL_FIELD_BASE_WIDTHS = (80, 368, 116, 117, 112, 118)
+LEADERBOARD_HORIZONTAL_FIELD_BASE_WIDTHS = (90, 330, 125, 125, 125, 125)
 LEADERBOARD_HORIZONTAL_FIELD_REFERENCE_WIDTH = 920
-LEADERBOARD_HORIZONTAL_TEAM_NAME_LEFT_PADDING = 24
+LEADERBOARD_HORIZONTAL_RANK_LEFT_PADDING = 32
+LEADERBOARD_HORIZONTAL_TEAM_NAME_LEFT_PADDING = 12
 LEADERBOARD_ROW_TEXT_VERTICAL_OFFSET = 10
 LEADERBOARD_HORIZONTAL_RANK_CELL_CENTER_OFFSETS = (1, 3)
 STANDARD_LEADERBOARD_TEAM_COUNT = 20
-LEADERBOARD_FIELD_BASE_WIDTHS = (48, 500, 120, 120, 120, 116)
+LEADERBOARD_FIELD_BASE_WIDTHS = (48, 500, 119, 119, 119, 119)
 
 
 class LeaderboardBackgroundDimensionsError(ValueError):
@@ -9251,6 +9266,8 @@ def _build_configured_leaderboard_image(
     background_path: Path = LEADERBOARD_BACKGROUND,
 ) -> io.BytesIO:
     orientation, team_limit = _leaderboard_scrim_profile(scrim)
+    # Custom uploads already contain their own title and column labels.
+    render_template_labels = background_path == LEADERBOARD_BACKGROUND
     header_height = DEFAULT_LEADERBOARD_HEADER_HEIGHT
 
     rows = rows[:team_limit]
@@ -9273,31 +9290,74 @@ def _build_configured_leaderboard_image(
         timezone_for_name(getattr(scrim, "timezone", "UTC"))
     ).strftime("%d/%m/%Y")
     date_font = _load_font(LEADERBOARD_DATE_FONT_SIZE, weight=700)
+    date_position = (width - margin, margin)
     draw.text(
-        (width - margin, margin),
+        date_position,
         date_label,
         font=date_font,
         fill=generated_text,
         anchor="rt",
     )
-    if background_path == LEADERBOARD_BACKGROUND:
-        scrim_title = str(getattr(scrim, "name", "") or "").strip()
-        if scrim_title:
-            title_font = _fit_font(
-                scrim_title,
-                max_width=width - 2 * margin,
-                max_height=header_height - 24,
-                max_size=LEADERBOARD_TITLE_MAX_FONT_SIZE,
-                min_size=18,
-                weight=LEADERBOARD_BODY_FONT_WEIGHT,
-            )
-            draw.text(
-                (margin, margin + header_height // 2),
-                scrim_title,
-                font=title_font,
-                fill=generated_text,
-                anchor="lm",
-            )
+    date_bbox = draw.textbbox(
+        date_position,
+        date_label,
+        font=date_font,
+        anchor="rt",
+    )
+    overline_position = (
+        margin + LEADERBOARD_OVERLINE_LEFT_PADDING,
+        margin + LEADERBOARD_OVERLINE_TOP_OFFSET,
+    )
+    overline_text, overline_font = _fit_leaderboard_cell_text(
+        "OVERALL STANDINGS",
+        max_width=max(1, date_bbox[0] - overline_position[0] - 24),
+        max_height=LEADERBOARD_SUBTITLE_FONT_SIZE,
+        max_size=LEADERBOARD_SUBTITLE_FONT_SIZE,
+        min_size=24,
+        weight=700,
+    )
+    if render_template_labels:
+        draw.text(
+            overline_position,
+            overline_text,
+            font=overline_font,
+            fill=generated_text,
+            anchor="lt",
+        )
+    overline_bbox = draw.textbbox(
+        overline_position,
+        overline_text,
+        font=overline_font,
+        anchor="lt",
+    )
+    scrim_title = str(getattr(scrim, "name", "") or "").strip()
+    if not scrim_title:
+        scrim_title = "Leaderboard"
+    title_position = (
+        margin + LEADERBOARD_TITLE_LEFT_PADDING,
+        overline_bbox[3] + LEADERBOARD_SUBTITLE_TITLE_GAP,
+    )
+    title_max_width = max(1, date_bbox[0] - title_position[0] - 24)
+    title_max_height = max(
+        1,
+        margin + header_height - title_position[1] - 12,
+    )
+    title_text, title_font = _fit_leaderboard_cell_text(
+        scrim_title,
+        max_width=title_max_width,
+        max_height=title_max_height,
+        max_size=LEADERBOARD_TITLE_MAX_FONT_SIZE,
+        min_size=LEADERBOARD_TITLE_MIN_FONT_SIZE,
+        weight=LEADERBOARD_TITLE_FONT_WEIGHT,
+    )
+    if render_template_labels:
+        draw.text(
+            title_position,
+            title_text,
+            font=title_font,
+            fill=generated_text,
+            anchor="lt",
+        )
 
     columns = 2 if orientation == "horizontal" else 1
     column_gap = 24 if columns == 2 else 0
@@ -9336,10 +9396,88 @@ def _build_configured_leaderboard_image(
             column_width,
             horizontal=columns == 2,
         )
-        field_centers = tuple(
-            (field_left + field_right) / 2
-            for field_left, field_right in field_ranges
+        rank_left_padding = (
+            LEADERBOARD_HORIZONTAL_RANK_LEFT_PADDING
+            if columns == 2
+            else LEADERBOARD_RANK_LEFT_PADDING
         )
+        team_name_padding = (
+            LEADERBOARD_HORIZONTAL_TEAM_NAME_LEFT_PADDING
+            if columns == 2
+            else LEADERBOARD_TEAM_NAME_LEFT_PADDING
+        )
+        header_y = (
+            table_top
+            + LEADERBOARD_TABLE_HEADER_HEIGHT // 2
+            + LEADERBOARD_TABLE_HEADER_TEXT_OFFSET
+        )
+        left_headers = (
+            (
+                0,
+                LEADERBOARD_LEFT_HEADERS[0],
+                rank_left_padding,
+            ),
+            (
+                1,
+                LEADERBOARD_LEFT_HEADERS[1],
+                team_name_padding,
+            ),
+        ) if render_template_labels else ()
+        for field_index, header, left_padding in left_headers:
+            header_text, header_font = _fit_leaderboard_cell_text(
+                header,
+                max_width=(
+                    field_ranges[field_index][1]
+                    - field_ranges[field_index][0]
+                    - left_padding
+                    - 4
+                ),
+                max_height=LEADERBOARD_TABLE_HEADER_HEIGHT - 12,
+                max_size=LEADERBOARD_METRIC_HEADER_FONT_SIZE,
+                min_size=11,
+                weight=700,
+            )
+            draw.text(
+                (
+                    field_ranges[field_index][0] + left_padding,
+                    header_y,
+                ),
+                header_text,
+                font=header_font,
+                fill=generated_text,
+                anchor="lm",
+            )
+        metric_headers = (
+            LEADERBOARD_METRIC_HEADERS if render_template_labels else ()
+        )
+        for field_index, header in enumerate(
+            metric_headers,
+            start=2,
+        ):
+            header_text, header_font = _fit_leaderboard_cell_text(
+                header,
+                max_width=(
+                    field_ranges[field_index][1]
+                    - field_ranges[field_index][0]
+                    - LEADERBOARD_METRIC_RIGHT_PADDING
+                    - 4
+                ),
+                max_height=LEADERBOARD_TABLE_HEADER_HEIGHT - 12,
+                max_size=LEADERBOARD_METRIC_HEADER_FONT_SIZE,
+                min_size=16,
+                weight=700,
+            )
+            draw.text(
+                (
+                    field_ranges[field_index][1]
+                    - LEADERBOARD_METRIC_RIGHT_PADDING,
+                    header_y,
+                ),
+                header_text,
+                font=header_font,
+                fill=generated_text,
+                anchor="rm",
+            )
         for row_index in range(per_column_capacity):
             y = row_top + row_index * row_height
             text_y = y + row_height // 2
@@ -9347,39 +9485,29 @@ def _build_configured_leaderboard_image(
             rank = column_index * per_column_capacity + row_index + 1
             rank_text, rank_font = _fit_leaderboard_cell_text(
                 str(rank),
-                max_width=field_ranges[0][1] - field_ranges[0][0] - 4,
+                max_width=(
+                    field_ranges[0][1]
+                    - field_ranges[0][0]
+                    - rank_left_padding
+                    - 4
+                ),
                 max_height=row_height - 8,
                 max_size=row_font,
                 weight=LEADERBOARD_ROW_FONT_WEIGHT,
             )
-            rank_cell_center = field_centers[0]
-            if columns == 2:
-                rank_cell_center += (
-                    LEADERBOARD_HORIZONTAL_RANK_CELL_CENTER_OFFSETS[column_index]
-                )
-            rank_bbox = draw.textbbox(
-                (0, 0),
-                rank_text,
-                font=rank_font,
-                anchor="mm",
-            )
-            rank_ink_center_offset = (rank_bbox[0] + rank_bbox[2]) / 2
-            rank_x = rank_cell_center - rank_ink_center_offset
             draw.text(
-                (rank_x, text_y),
+                (
+                    field_ranges[0][0] + rank_left_padding,
+                    text_y,
+                ),
                 rank_text,
                 font=rank_font,
                 fill=generated_text,
-                anchor="mm",
+                anchor="lm",
             )
             if row_index >= len(column_rows):
                 continue
             row = column_rows[row_index]
-            team_name_padding = (
-                LEADERBOARD_HORIZONTAL_TEAM_NAME_LEFT_PADDING
-                if columns == 2
-                else LEADERBOARD_TEAM_NAME_LEFT_PADDING
-            )
             team_text, team_font = _fit_leaderboard_cell_text(
                 row.team_name,
                 max_width=max(
@@ -9418,18 +9546,23 @@ def _build_configured_leaderboard_image(
                     max_width=(
                         field_ranges[field_index][1]
                         - field_ranges[field_index][0]
-                        - 10
+                    - LEADERBOARD_METRIC_RIGHT_PADDING
+                    - 4
                     ),
                     max_height=row_height - 8,
                     max_size=row_font,
                     weight=LEADERBOARD_ROW_FONT_WEIGHT,
                 )
                 draw.text(
-                    (field_centers[field_index], text_y),
+                    (
+                        field_ranges[field_index][1]
+                        - LEADERBOARD_METRIC_RIGHT_PADDING,
+                        text_y,
+                    ),
                     value_text,
                     font=value_font,
                     fill=generated_text,
-                    anchor="mm",
+                    anchor="rm",
                 )
     buffer = io.BytesIO()
     output.convert("RGB").save(buffer, format="PNG", optimize=True)
