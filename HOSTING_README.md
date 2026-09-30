@@ -45,8 +45,8 @@ Le rôle du bot doit être placé au-dessus des rôles qu'il doit gérer.
    ses propres licences, et le bot Public gère uniquement les siennes. Choisir
    **ARC Go**, **ARC Pro** ou **ARC Pro Max**, puis utiliser **Add** pour saisir l'ID
    du serveur et sa durée. `0` ou `unlimited` signifie que l'accès n'expire
-   jamais. Le panneau est privé et n'est accessible qu'au propriétaire du bot
-   ou à un utilisateur ajouté avec `!admin add`.
+   jamais. Le panneau privé est réservé au propriétaire du bot ; le propriétaire
+   d'un serveur Discord n'obtient pas cet accès.
 2. Le propriétaire du serveur lance `!set @Staff`.
 3. Les membres ayant le rôle Staff global lancent `!setup`.
 4. Créer un scrim et sélectionner son rôle Manager et ses salons.
@@ -80,10 +80,12 @@ Les commandes `!admin` sont masquées et réservées au propriétaire du bot :
 !admin list
 ```
 
-Elles gèrent les utilisateurs autorisés à administrer la whitelist. `!auth`
-ouvre en DM le panneau privé des autorisations locales de ce bot. Le
-propriétaire du bot peut ajouter ou modifier une autorisation ; le propriétaire
-et les utilisateurs ajoutés avec `!admin add` peuvent en retirer une.
+Elles maintiennent la liste historique des identifiants d'administrateurs délégués,
+mais cette liste ne donne plus accès à `!auth`. `!auth` ouvre en DM le panneau
+privé des autorisations locales et est réservé au propriétaire du bot uniquement.
+Le propriétaire du serveur Discord et les administrateurs délégués ne peuvent pas
+l'utiliser. Seul le propriétaire du bot peut ajouter, modifier ou retirer une
+autorisation de serveur.
 
 Un utilisateur non autorisé reçoit un message d'accès refusé, puis son
 invocation est supprimée. Les commandes préfixées Discord ne supportent pas

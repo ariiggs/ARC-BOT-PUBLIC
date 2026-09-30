@@ -8287,15 +8287,10 @@ class AuthAdminPanelView(DurableView):
     async def user_is_authorized(
         self,
         user: discord.abc.User,
-        *,
-        owner_only: bool = False,
     ) -> bool:
         if getattr(user, "id", None) != self.owner_id:
             return False
-        is_owner = await bot.is_owner(user)
-        if owner_only:
-            return is_owner
-        return is_owner or repository.is_admin_authorized(user.id)
+        return await bot.is_owner(user)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -8355,7 +8350,6 @@ class AuthAdminPanelView(DurableView):
         async def add_guild(interaction: discord.Interaction) -> None:
             if not await self.user_is_authorized(
                 interaction.user,
-                owner_only=True,
             ):
                 await interaction.response.send_message(
                     "Only the bot owner can add or change a guild authorization.",
@@ -8456,7 +8450,6 @@ class AuthAddGuildModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not await self.panel.user_is_authorized(
             interaction.user,
-            owner_only=True,
         ):
             await interaction.response.send_message(
                 "Only the bot owner can add or change a guild authorization.",

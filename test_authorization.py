@@ -2,7 +2,9 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
+from arc_bot.commands import authorization as authorization_commands
 from scrim_state import ScrimRepository
 from slot_storage import SlotStateStore
 
@@ -212,6 +214,76 @@ class GuildAuthorizationTests(unittest.TestCase):
             migrated.load()
             self.assertEqual(migrated.list_authorized_admin_ids(), [])
             self.assertEqual(migrated.payload()["version"], 34)
+
+
+class AuthOwnerOnlyTests(unittest.IsolatedAsyncioTestCase):
+    class FakeBot:
+        async def is_owner(self, user):
+            return getattr(user, "id", None) == 100
+
+    class FakeRepository:
+        def is_admin_authorized(self, user_id):
+            return user_id == 200
+
+    def setUp(self):
+        self.previous_bot = authorization_commands._bot
+        self.previous_repository = authorization_commands._repository
+        authorization_commands._bot = self.FakeBot()
+        authorization_commands._repository = self.FakeRepository()
+
+    def tearDown(self):
+        authorization_commands._bot = self.previous_bot
+        authorization_commands._repository = self.previous_repository
+
+    async def test_only_bot_owner_can_run_auth(self):
+        owner_ctx = SimpleNamespace(author=SimpleNamespace(id=100))
+        self.assertTrue(await authorization_commands.auth_admin_check(owner_ctx))
+
+        delegated_admin_ctx = SimpleNamespace(author=SimpleNamespace(id=200))
+        with self.assertRaises(authorization_commands.UnauthorizedAuthAdmin):
+            await authorization_commands.auth_admin_check(delegated_admin_ctx)
+
+    async def test_guild_owner_is_not_treated_as_bot_owner(self):
+        guild_owner = SimpleNamespace(id=300, is_guild_owner=True)
+        ctx = SimpleNamespace(author=guild_owner)
+        with self.assertRaises(authorization_commands.UnauthorizedAuthAdmin):
+            await authorization_commands.auth_admin_check(ctx)
+
+    async def test_existing_panel_and_pending_removal_are_bot_owner_only(self):
+        delegated_admin = SimpleNamespace(id=200)
+        delegated_panel = authorization_commands.AuthAdminPanelView(owner_id=200)
+        self.assertFalse(await delegated_panel.user_is_authorized(delegated_admin))
+
+        class FakeResponse:
+            def __init__(self):
+                self.message = None
+
+            async def send_message(self, message, **kwargs):
+                self.message = message
+
+        response = FakeResponse()
+        interaction = SimpleNamespace(user=delegated_admin, response=response)
+        self.assertFalse(await delegated_panel.interaction_check(interaction))
+        self.assertEqual(
+            response.message,
+            "You are no longer authorized to use this panel.",
+        )
+
+        remove_modal = authorization_commands.AuthRemoveGuildModal(
+            delegated_panel,
+            authorization_commands.LICENSE_TYPES[0],
+        )
+        response.message = None
+        await remove_modal.on_submit(interaction)
+        self.assertEqual(
+            response.message,
+            "You are no longer authorized to use this panel.",
+        )
+
+        owner = SimpleNamespace(id=100)
+        owner_panel = authorization_commands.AuthAdminPanelView(owner_id=100)
+        self.assertTrue(await owner_panel.user_is_authorized(owner))
+        self.assertFalse(await owner_panel.user_is_authorized(delegated_admin))
 
 
 if __name__ == "__main__":

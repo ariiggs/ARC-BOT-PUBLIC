@@ -61,7 +61,9 @@ async def whitelist_check(ctx: commands.Context) -> bool:
 
 
 async def auth_admin_check(ctx: commands.Context) -> bool:
-    if await _bot.is_owner(ctx.author) or _repo().is_admin_authorized(ctx.author.id):
+    # Only the Discord bot owner may manage guild authorizations. Guild ownership
+    # and previously delegated bot-admin IDs do not grant access to !auth.
+    if await _bot.is_owner(ctx.author):
         return True
     raise UnauthorizedAuthAdmin()
 
@@ -152,11 +154,10 @@ class AuthAdminPanelView(DurableView):
         self.timeout_notice = "⏱️ This private authorization panel expired. Run `!auth` again to reopen it in your DMs."
         self.rebuild()
 
-    async def user_is_authorized(self, user, *, owner_only=False):
+    async def user_is_authorized(self, user):
         if getattr(user, "id", None) != self.owner_id:
             return False
-        owner = await _bot.is_owner(user)
-        return owner if owner_only else owner or _repo().is_admin_authorized(user.id)
+        return await _bot.is_owner(user)
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.owner_id:
@@ -189,7 +190,7 @@ class AuthAdminPanelView(DurableView):
             return
         tier = self.selected_tier
         async def add(interaction):
-            if not await self.user_is_authorized(interaction.user, owner_only=True):
+            if not await self.user_is_authorized(interaction.user):
                 await interaction.response.send_message("Only the bot owner can add or change a guild authorization.", ephemeral=True)
                 return
             await interaction.response.send_modal(AuthAddGuildModal(self, tier))
@@ -235,7 +236,7 @@ class AuthAddGuildModal(discord.ui.Modal):
         self.add_item(self.guild_id_input); self.add_item(self.duration_input)
 
     async def on_submit(self, interaction):
-        if not await self.panel.user_is_authorized(interaction.user, owner_only=True):
+        if not await self.panel.user_is_authorized(interaction.user):
             await interaction.response.send_message("Only the bot owner can add or change a guild authorization.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True)
         try:
