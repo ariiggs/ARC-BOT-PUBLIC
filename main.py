@@ -157,6 +157,31 @@ LEADERBOARD_HORIZONTAL_22_BACKGROUND = (
     / "assets"
     / "leaderboard-background-horizontal-22.png"
 )
+LEADERBOARD_VERTICAL_16_BACKGROUND = (
+    Path(__file__).parent
+    / "assets"
+    / "leaderboard-background-vertical-16.png"
+)
+LEADERBOARD_VERTICAL_18_BACKGROUND = (
+    Path(__file__).parent
+    / "assets"
+    / "leaderboard-background-vertical-18.png"
+)
+LEADERBOARD_VERTICAL_20_BACKGROUND = (
+    Path(__file__).parent
+    / "assets"
+    / "leaderboard-background-vertical-20.png"
+)
+LEADERBOARD_VERTICAL_22_BACKGROUND = (
+    Path(__file__).parent
+    / "assets"
+    / "leaderboard-background-vertical-22.png"
+)
+LEADERBOARD_VERTICAL_24_BACKGROUND = (
+    Path(__file__).parent
+    / "assets"
+    / "leaderboard-background-vertical-24.png"
+)
 LEADERBOARD_BLUEPRINT_DIR = (
     Path(__file__).parent / "assets" / "leaderboard-blueprints"
 )
@@ -5843,6 +5868,14 @@ def _default_leaderboard_background_path(
             18: LEADERBOARD_HORIZONTAL_18_BACKGROUND,
             20: LEADERBOARD_HORIZONTAL_20_BACKGROUND,
             22: LEADERBOARD_HORIZONTAL_22_BACKGROUND,
+        }.get(team_count, LEADERBOARD_BACKGROUND)
+    if orientation == "vertical":
+        return {
+            16: LEADERBOARD_VERTICAL_16_BACKGROUND,
+            18: LEADERBOARD_VERTICAL_18_BACKGROUND,
+            20: LEADERBOARD_VERTICAL_20_BACKGROUND,
+            22: LEADERBOARD_VERTICAL_22_BACKGROUND,
+            24: LEADERBOARD_VERTICAL_24_BACKGROUND,
         }.get(team_count, LEADERBOARD_BACKGROUND)
     return LEADERBOARD_BACKGROUND
 
