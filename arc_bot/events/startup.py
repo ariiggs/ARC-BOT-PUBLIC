@@ -161,6 +161,16 @@ def install_events(
             if isinstance(result, Exception):
                 logger.error("Board recovery failed.", exc_info=result)
         for scrim in authorized:
+            reconcile_roles = getattr(
+                deps, "reconcile_scrim_captain_roles", None
+            )
+            if reconcile_roles is not None:
+                try:
+                    await reconcile_roles(scrim)
+                except Exception:
+                    logger.exception(
+                        "Captain role recovery failed for scrim %s.", scrim.id
+                    )
             await deps.send_scrim_log_coverage_snapshot(scrim)
 
     async def on_ready() -> None:

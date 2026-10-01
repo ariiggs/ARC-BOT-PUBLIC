@@ -79,7 +79,6 @@ from scrim_state import (
     STATUS_AVAILABLE,
     STATUS_CONFIRMED,
     STATUS_PENDING,
-    STATUS_RESERVED,
     DEFAULT_LEADERBOARD_ACCENT_COLOR,
     DEFAULT_PLACEMENT_POINTS_STRING,
     DEFAULT_OPERATIONAL_MESSAGES,
@@ -437,13 +436,11 @@ def assignment_fingerprint(scrim: Scrim) -> str:
 def slot_status_emoji(scrim: Scrim, slot: Slot | SlotSnapshot) -> str:
     field_name = {
         STATUS_AVAILABLE: "emoji_available",
-        STATUS_RESERVED: "emoji_reserved",
         STATUS_PENDING: "emoji_pending",
         STATUS_CONFIRMED: "emoji_confirmed",
     }.get(slot.status, "emoji_available")
     fallback = {
         "emoji_available": "⚪",
-        "emoji_reserved": "🔵",
         "emoji_pending": "🟠",
         "emoji_confirmed": "🟢",
     }[field_name]
@@ -453,7 +450,6 @@ def slot_status_emoji(scrim: Scrim, slot: Slot | SlotSnapshot) -> str:
 def slot_status_label(slot: Slot | SlotSnapshot) -> str:
     return {
         STATUS_AVAILABLE: "Available",
-        STATUS_RESERVED: "Reserved",
         STATUS_PENDING: "Pending",
         STATUS_CONFIRMED: "Confirmed",
     }.get(slot.status, "Unknown")
@@ -582,13 +578,12 @@ def slot_display_line(scrim: Scrim, slot: Slot) -> str:
 def build_slots_message(scrim: Scrim) -> str:
     emojis = {
         "available": configured_emoji(scrim, "emoji_available", "⚪"),
-        "reserved": configured_emoji(scrim, "emoji_reserved", "🔵"),
         "pending": configured_emoji(scrim, "emoji_pending", "🟠"),
         "confirmed": configured_emoji(scrim, "emoji_confirmed", "🟢"),
     }
     legend = (
-        f"{emojis['available']} Available · {emojis['reserved']} Reserved · "
-        f"{emojis['pending']} Pending · {emojis['confirmed']} Confirmed"
+        f"{emojis['available']} Available · {emojis['pending']} Pending · "
+        f"{emojis['confirmed']} Confirmed"
     )
     heading = f"**{discord.utils.escape_markdown(scrim.name or 'Scrim setup incomplete')}**"
     missing = scrim_configuration_errors(scrim)
@@ -2423,8 +2418,8 @@ def scrim_log_coverage_details(scrim: Scrim) -> str:
         f"{f'<@&{confirmed_role_id}>' if confirmed_role_id else 'not configured'}",
         f"State: {'open' if scrim.is_open else 'closed'} · "
         f"slots {scrim.slot_start:02d}–{scrim.slot_end:02d}",
-        f"Legend: {scrim.emoji_available} available · {scrim.emoji_reserved} reserved · "
-        f"{scrim.emoji_pending} pending · {scrim.emoji_confirmed} confirmed",
+        f"Legend: {scrim.emoji_available} Available · {scrim.emoji_pending} Pending · "
+        f"{scrim.emoji_confirmed} Confirmed",
     ]
     occupied = [
         slot
@@ -2742,7 +2737,7 @@ async def sync_captain_roles_locked(
     """Reconcile both captain roles from the latest assignments; caller holds state_lock."""
     has_pending = any(
         manager_id in {slot.captain_1_id, slot.captain_2_id}
-        and slot.status in {STATUS_RESERVED, STATUS_PENDING}
+        and slot.status == STATUS_PENDING
         for slot in scrim.slots.values()
     )
     has_confirmed = any(
@@ -2784,6 +2779,34 @@ async def sync_captain_roles_locked(
         except discord.HTTPException:
             logger.exception("Could not reconcile captain role (%s).", scrim.id)
             synced = False
+    return synced
+
+
+async def reconcile_scrim_captain_roles(scrim: Scrim) -> bool:
+    """Repair Pending/Confirmed captain roles from persisted slot assignments."""
+    guild = bot.get_guild(scrim.guild_id)
+    if guild is None:
+        return False
+    captain_ids = {
+        captain_id
+        for slot in scrim.slots.values()
+        for captain_id in (slot.captain_1_id, slot.captain_2_id)
+        if captain_id is not None
+    }
+    synced = True
+    for captain_id in captain_ids:
+        member = guild.get_member(captain_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(captain_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                synced = False
+                continue
+        async with scrim.state_lock:
+            if not await sync_captain_roles_locked(
+                scrim, captain_id, member
+            ):
+                synced = False
     return synced
 
 
@@ -2915,7 +2938,7 @@ class _legacy_SlotReviewView(DurableView):
                             if confirm:
                                 approved_registration = request
                                 current.assignment_id += 1
-                                current.status = STATUS_RESERVED
+                                current.status = STATUS_PENDING
                                 current.team_name = request.team_name
                                 current.tag = request.tag
                                 current.manager_id = request.manager_id
@@ -2976,7 +2999,7 @@ class _legacy_SlotReviewView(DurableView):
                 )
             text = (
                 (
-                    f"✅ Team **{result.team_name}** has been reserved."
+                    f"✅ Team **{result.team_name}** was assigned and is Pending."
                     if self.registration_request
                     else f"🟢 Team **{result.team_name}** has been confirmed."
                 )
@@ -3443,7 +3466,7 @@ class _legacy_RegistrationQueueConfirmView(discord.ui.View):
                         if approved:
                             slot = scrim.slots[request.slot_number]
                             slot.assignment_id += 1
-                            slot.status = STATUS_RESERVED
+                            slot.status = STATUS_PENDING
                             slot.team_name = request.team_name
                             slot.tag = request.tag
                             slot.manager_id = request.manager_id
@@ -3473,7 +3496,7 @@ class _legacy_RegistrationQueueConfirmView(discord.ui.View):
                 scrim,
                 "STAFF REGISTRATION APPROVAL" if approved else "STAFF REGISTRATION REJECTION",
                 f"Slot {request.slot_number:02d} · team **{request.team_name}** · "
-                f"{'Reserved' if approved else 'Declined'}",
+                f"{'Pending' if approved else 'Declined'}",
             )
         if approved and not await refresh_public_slots(scrim):
             issues.append("Public slots board")
@@ -3496,7 +3519,7 @@ async def notify_staff_of_manager_action(
     channel = await staff_channel(scrim)
     if channel is None or not is_active(scrim):
         return False
-    status = "confirmed" if slot.status == STATUS_PENDING else "released"
+    status = "confirmed" if slot.status == STATUS_CONFIRMED else "released"
     try:
         await channel.send(
             f"**{slot.team_name}**\n{status}",
@@ -3623,12 +3646,12 @@ class ManagerSlotView(DurableView):
                     and current.assignment_id == assignment.assignment_id
                     and current.manager_id == interaction.user.id
                 )
-                if valid and current.status in {STATUS_PENDING, STATUS_CONFIRMED}:
+                if valid and current.status == STATUS_CONFIRMED:
                     already_confirmed = True
-                elif valid and current.status == STATUS_RESERVED:
+                elif valid and current.status == STATUS_PENDING:
                     with repository.transaction():
                         current.assignment_id += 1
-                        current.status = STATUS_PENDING
+                        current.status = STATUS_CONFIRMED
                         result = current.snapshot()
             if already_confirmed:
                 await interaction.response.send_message(
@@ -3705,7 +3728,7 @@ class ManagerSlotView(DurableView):
             return
         if confirm:
             emoji, label = "✅", "Confirmation"
-            text = f"🟠 Slot **{result.number:02d}**: Pending — awaiting staff approval."
+            text = f"🟢 Slot **{result.number:02d}**: Confirmed."
         else:
             emoji, label = "❌", "Release / Decline"
             text = f"Slot **{result.number:02d}** has been released and is available."
@@ -8805,7 +8828,6 @@ def build_slot_status_embed(scrim: Scrim) -> discord.Embed:
     """Build the compact status summary used by the !slots command."""
     counts = {
         STATUS_AVAILABLE: 0,
-        STATUS_RESERVED: 0,
         STATUS_PENDING: 0,
         STATUS_CONFIRMED: 0,
     }
@@ -8817,10 +8839,8 @@ def build_slot_status_embed(scrim: Scrim) -> discord.Embed:
         title=f"📊 Slot Status - {discord.utils.escape_markdown(scrim.name)}",
         description=(
             f"**Total Slots:** {len(scrim.slots)}\n\n"
-            f"{scrim.emoji_available} **Free:** "
+            f"{scrim.emoji_available} **Available:** "
             f"{counts[STATUS_AVAILABLE]}\n"
-            f"{scrim.emoji_reserved} **Reserved:** "
-            f"{counts[STATUS_RESERVED]}\n"
             f"{scrim.emoji_pending} **Pending:** "
             f"{counts[STATUS_PENDING]}\n"
             f"{scrim.emoji_confirmed} **Confirmed:** "
@@ -8840,7 +8860,6 @@ def build_slot_status_embed(scrim: Scrim) -> discord.Embed:
     )
 
     status_labels = (
-        (STATUS_RESERVED, "Reserved Teams", scrim.emoji_reserved),
         (STATUS_PENDING, "Pending Teams", scrim.emoji_pending),
         (STATUS_CONFIRMED, "Confirmed Teams", scrim.emoji_confirmed),
     )
@@ -10092,7 +10111,7 @@ async def _legacy_apply_registration_entry(
     *,
     registration_message_id: int | None = None,
 ) -> tuple[SlotSnapshot | None, str | None, bool, bool]:
-    """Create a Reserved slot or a durable unassigned registration request."""
+    """Create a Pending slot or a durable unassigned registration request."""
     snapshot: SlotSnapshot | None = None
     auto_accept = getattr(scrim, "registration_auto_accept", False) is True
     tag_match: tuple[str, int, str] | None = None
@@ -10122,7 +10141,7 @@ async def _legacy_apply_registration_entry(
         if auto_accept:
             with repository.transaction():
                 slot.assignment_id += 1
-                slot.status = STATUS_RESERVED
+                slot.status = STATUS_PENDING
                 slot.team_name = entry.team_name
                 slot.tag = entry.tag
                 slot.manager_id = entry.member.id
@@ -10295,6 +10314,7 @@ async def _legacy_register_team(ctx: commands.Context, *, arguments: str) -> Non
             access_ok,
             board_refreshed,
         )
+    tag_match = None
     if snapshot.status == STATUS_PENDING:
         async with scrim.state_lock:
             tag_match = registration_tag_conflict(scrim, team_name, tag)
@@ -10326,7 +10346,11 @@ async def _legacy_register_team(ctx: commands.Context, *, arguments: str) -> Non
             await add_reaction(
                 registration_success_reaction(
                     scrim,
-                    accepted=snapshot.status == STATUS_RESERVED,
+                    accepted=(
+                        snapshot.status == STATUS_PENDING
+                        and getattr(scrim, "registration_auto_accept", False)
+                        and not tag_match
+                    ),
                 )
             )
         except discord.HTTPException:
@@ -10878,16 +10902,16 @@ async def _legacy_remind_managers(ctx: commands.Context) -> None:
         return
 
     async with scrim.state_lock:
-        reserved = [
+        pending = [
             slot.snapshot()
             for slot in scrim.slots.values()
-            if slot.status == STATUS_RESERVED and slot.manager_id is not None
+            if slot.status == STATUS_PENDING and slot.manager_id is not None
         ]
 
-    if not reserved:
+    if not pending:
         embed = discord.Embed(
             title="✅ No reminder needed",
-            description="There are no Reserved slots waiting for captain confirmation.",
+            description="There are no Pending slots waiting for captain confirmation.",
             color=discord.Color.blue(),
         )
         embed.set_footer(text=f"Scrim: {scrim.name}")
@@ -10913,13 +10937,13 @@ async def _legacy_remind_managers(ctx: commands.Context) -> None:
         )
         embed.add_field(
             name="Slots waiting",
-            value=", ".join(f"`{slot.number:02d}`" for slot in reserved),
+            value=", ".join(f"`{slot.number:02d}`" for slot in pending),
             inline=False,
         )
         embed.set_footer(text=f"Scrim: {scrim.name}")
         await ctx.send(
             content=(
-                "***Reserved teams: please Confirm or Cancel your Slot.***\n"
+                "***Pending teams: please Confirm or Cancel your Slot.***\n"
                 f"<@&{scrim.pending_role_id}>"
             ),
             embed=embed,
@@ -10959,12 +10983,12 @@ async def _legacy_confirm_slot(ctx: commands.Context, *, slot_numbers: str) -> N
         slots = [scrim.slots.get(number) for number in requested_numbers]
         if any(
             slot is None
-            or slot.status not in {STATUS_RESERVED, STATUS_PENDING}
+            or slot.status != STATUS_PENDING
             for slot in slots
         ):
             await send_private_command_feedback(
                 ctx,
-                "Only Reserved or Pending slots can be confirmed.",
+                "Only Pending slots can be force-confirmed.",
             )
             return
         with repository.transaction():
@@ -11859,8 +11883,8 @@ async def perform_staff_mirror_action(
         ):
             failure = "That slot has changed. Select it again from the staff mirror."
         elif action == "confirm":
-            if source.status not in {STATUS_RESERVED, STATUS_PENDING}:
-                failure = "Only Reserved or Pending teams can be confirmed."
+            if source.status != STATUS_PENDING:
+                failure = "Only Pending teams can be force-confirmed."
             else:
                 with repository.transaction():
                     source.assignment_id += 1

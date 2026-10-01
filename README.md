@@ -96,8 +96,8 @@ scrim reprend son nom. Les autres scrims restent inchangés.
 - Dans **Edit**, utiliser **⚙️ Set !cap Channel** pour configurer ou remplacer
   le salon public dédié aux commandes `!cap`. Les scrims existants migrés sans
   ce réglage refusent `!cap` jusqu'à sa configuration.
-- Dans `!setup`, utiliser **🎨 Custom Emojis** pour modifier les quatre emojis
-  de la légende (Available, Reserved, Pending et Confirmed).
+- Dans `!setup`, utiliser **🎨 Custom Emojis** pour modifier les trois emojis
+  de la légende (Available, Pending et Confirmed).
 - Dans **✏️ Edit**, modifier aussi le premier slot et le nombre de slots
   (jusqu'à 25 slots au total). La réduction d'une plage qui contient une équipe
   active est refusée pour protéger les données.
@@ -111,13 +111,13 @@ salon où la commande est utilisée.
 
 ## Confirmations des managers
 
-Après `!add`, le slot est bleu **Reserved**, sans mention supplémentaire.
+Après `!add`, le slot est orange **Pending**, sans mention supplémentaire.
 Tous les textes du bot visibles par les managers sont en anglais.
 Le tableau public comporte uniquement deux boutons communs :
 
-- `✅ Confirm` : le slot du manager passe en orange **Pending**.
-  Le staff reçoit la demande avec `🟢 Confirmer` et `⚪ Libérer`.
-  Seule sa validation passe le slot en vert **Confirmed**.
+- `✅ Confirm` : le slot du manager passe immédiatement en vert **Confirmed**.
+  Le staff reçoit le résultat ; aucune validation supplémentaire par le staff
+  n'est nécessaire.
 - `❌ Cancel` : ouvre une confirmation privée, en anglais, visible uniquement
   au manager : `Yes, cancel my slot` ou `Keep my slot`. Sans confirmation,
   aucune annulation n'est effectuée (expiration après 60 secondes).
@@ -129,7 +129,7 @@ plusieurs slots, une sélection privée permet de choisir le slot concerné.
 
 Chaque décision du manager est transmise au salon staff avec le statut obtenu.
 La légende du mode automatique est :
-`⚪ Available · 🔵 Reserved · 🟠 Pending · 🟢 Confirmed`.
+`⚪ Available · 🟠 Pending · 🟢 Confirmed`.
 Les boutons de libération rendent immédiatement le slot disponible. Les
 confirmations privées expirent au redémarrage ;
 le manager peut recliquer sur `Cancel` sans perdre son slot.

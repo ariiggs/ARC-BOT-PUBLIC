@@ -135,7 +135,7 @@ async def apply_add_entries(scrim, entries):
                     for entry in entries:
                         slot = scrim.slots[entry.slot_number]
                         slot.assignment_id += 1
-                        slot.status = _get("STATUS_RESERVED")
+                        slot.status = _get("STATUS_PENDING")
                         slot.team_name, slot.tag = entry.team_name, entry.tag
                         slot.manager_id, slot.captain_1_id, slot.captain_2_id = entry.member.id, entry.member.id, None
                         snapshots.append(slot.snapshot())

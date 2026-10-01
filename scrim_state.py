@@ -22,12 +22,10 @@ MAX_SLOT_NUMBER = 99
 MAX_SLOT_COUNT = 25
 SLOT_NUMBERS = range(DEFAULT_SLOT_START, DEFAULT_SLOT_END + 1)
 STATUS_AVAILABLE = "Disponible"
-STATUS_RESERVED = "En attente du manager"
 STATUS_PENDING = "En attente"
 STATUS_CONFIRMED = "Confirmé"
 SLOT_STATUSES = (
     STATUS_AVAILABLE,
-    STATUS_RESERVED,
     STATUS_PENDING,
     STATUS_CONFIRMED,
 )
@@ -38,7 +36,6 @@ MAX_MATCHES = 25
 MAX_MAP_POOL = 25
 PASSWORD_TYPES = ("fixed", "dynamic")
 DEFAULT_EMOJI_AVAILABLE = "⚪"
-DEFAULT_EMOJI_RESERVED = "🔵"
 DEFAULT_EMOJI_PENDING = "🟠"
 DEFAULT_EMOJI_CONFIRMED = "🟢"
 DEFAULT_EMOJI_REGISTRATION_OK = "🆗"
@@ -95,13 +92,11 @@ def normalize_leaderboard_accent_colors(value: object) -> dict[str, str]:
 
 EMOJI_FIELDS = (
     "emoji_available",
-    "emoji_reserved",
     "emoji_pending",
     "emoji_confirmed",
 )
 DEFAULT_SCRIM_EMOJIS = {
     "emoji_available": DEFAULT_EMOJI_AVAILABLE,
-    "emoji_reserved": DEFAULT_EMOJI_RESERVED,
     "emoji_pending": DEFAULT_EMOJI_PENDING,
     "emoji_confirmed": DEFAULT_EMOJI_CONFIRMED,
 }
@@ -398,7 +393,6 @@ class Scrim:
     registration_role_id: int | None = None
     registration_auto_accept: bool = False
     emoji_available: str = DEFAULT_EMOJI_AVAILABLE
-    emoji_reserved: str = DEFAULT_EMOJI_RESERVED
     emoji_pending: str = DEFAULT_EMOJI_PENDING
     emoji_confirmed: str = DEFAULT_EMOJI_CONFIRMED
     slot_number_emojis: dict[int, str] = field(default_factory=dict)
@@ -488,7 +482,6 @@ class Scrim:
             "registration_role_id": self.registration_role_id,
             "registration_auto_accept": self.registration_auto_accept,
             "emoji_available": self.emoji_available,
-            "emoji_reserved": self.emoji_reserved,
             "emoji_pending": self.emoji_pending,
             "emoji_confirmed": self.emoji_confirmed,
             "slot_number_emojis": {
@@ -1084,7 +1077,7 @@ class ScrimRepository:
 
     def payload(self) -> dict:
         return {
-            "version": 34,
+            "version": 36,
             "scrims": [s.payload() for s in self.scrims.values()],
             "server_configs": [
                 config.payload() for config in self.server_configs.values()
@@ -1133,7 +1126,7 @@ class ScrimRepository:
             version = payload.get("version")
             if type(version) is not int or version not in (
                 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-                20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34
+                20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36
             ):
                 raise ValueError("Unsupported snapshot version.")
             if not isinstance(payload["scrims"], list):
@@ -1422,6 +1415,26 @@ class ScrimRepository:
                     values.setdefault(field_name, default)
                 slot_start = values.get("slot_start")
                 slot_end = values.get("slot_end")
+                if payload["version"] < 35:
+                    # Translate pre-version-35 assignment states while
+                    # preserving team identity and invalidating old controls.
+                    raw_slots = values.get("slots")
+                    if not isinstance(raw_slots, list):
+                        raise ValueError("Invalid slot list.")
+                    for entry in raw_slots:
+                        if not isinstance(entry, dict):
+                            continue
+                        old_status = entry.get("status")
+                        if old_status == "En attente du manager":
+                            entry["status"] = STATUS_PENDING
+                        elif old_status == STATUS_PENDING:
+                            entry["status"] = STATUS_CONFIRMED
+                        else:
+                            continue
+                        assignment_id = entry.get("assignment_id")
+                        if type(assignment_id) is not int or assignment_id < 0:
+                            raise ValueError("Invalid slot assignment.")
+                        entry["assignment_id"] = assignment_id + 1
                 # An intentionally cleared range is retained as no configured
                 # range while saved slot assignments remain available for repair.
                 if slot_start is None and slot_end is None:
@@ -1470,6 +1483,8 @@ class ScrimRepository:
                 values["operational_message_refs"] = normalize_operational_message_refs(
                     values.get("operational_message_refs")
                 )
+                # Discard the retired status emoji when loading older snapshots.
+                values.pop("emoji_reserved", None)
                 # Runtime-only fields must never be read from disk.
                 if set(values) != {
                     "id", "guild_id", "name", "public_channel_id",
@@ -1480,7 +1495,7 @@ class ScrimRepository:
                     "registration_role_id", "registration_auto_accept",
                     "public_message_id", "staff_message_id",
                     "registration_review_message_id",
-                    "emoji_available", "emoji_reserved", "emoji_pending",
+                    "emoji_available", "emoji_pending",
                     "slot_number_emojis", "emoji_registration_ok",
                     "emoji_registration_accepted", "emoji_registration_declined",
                      "emoji_confirmed", "is_open", "registration_open",
@@ -1694,6 +1709,7 @@ class ScrimRepository:
                 if not isinstance(entry, dict):
                     raise ValueError("Invalid server configuration fields.")
                 config_entry = dict(entry)
+                config_entry.pop("emoji_reserved", None)
                 if payload["version"] < 9:
                     for field_name in EMOJI_FIELDS:
                         config_entry.pop(field_name, None)
@@ -1896,7 +1912,7 @@ class ScrimRepository:
             except (KeyError, TypeError, ValueError) as error:
                 raise SlotStorageError("Invalid legacy snapshot; migration was stopped.") from error
             new_payload = {
-                "version": 34,
+                "version": 35,
                 "scrims": [],
                 "server_configs": [],
                 "idpw_configs": [],
@@ -1942,7 +1958,7 @@ class ScrimRepository:
         self.authorized_guild_duration_days = authorized_guild_duration_days
         self.authorized_guild_license_types = authorized_guild_license_types
         self.authorized_admin_ids = authorized_admin_ids
-        if payload.get("version", 0) < 34:
+        if payload.get("version", 0) < 36:
             self.store.save(self.payload())
 
     @contextmanager
@@ -1992,7 +2008,6 @@ class ScrimRepository:
                     "registration_role_id",
                     "registration_auto_accept",
                     "emoji_available",
-                    "emoji_reserved",
                     "emoji_pending",
                     "emoji_confirmed",
                     "slot_number_emojis",
@@ -2257,8 +2272,8 @@ class ScrimRepository:
                 scrim.timezone = DEFAULT_IDPW_TIMEZONE
                 self.idpw_configs.pop(scrim_id, None)
             if reset_emoji_settings:
-                for field_name, emoji in DEFAULT_SCRIM_EMOJIS.items():
-                    setattr(scrim, field_name, emoji)
+                for field_name in EMOJI_FIELDS:
+                    setattr(scrim, field_name, DEFAULT_SCRIM_EMOJIS[field_name])
                 scrim.slot_number_emojis = {}
                 for field_name, emoji in DEFAULT_REGISTRATION_EMOJIS.items():
                     setattr(scrim, field_name, emoji)

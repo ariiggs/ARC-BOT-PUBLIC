@@ -252,7 +252,7 @@ class SlotReviewView(DurableView):
                             requests.pop(request.request_id, None)
                             if confirm:
                                 current.assignment_id += 1
-                                current.status = _d("STATUS_RESERVED")
+                                current.status = _d("STATUS_PENDING")
                                 current.team_name = request.team_name
                                 current.tag = request.tag
                                 current.manager_id = request.manager_id
@@ -318,7 +318,7 @@ class SlotReviewView(DurableView):
             )
         text = (
             (
-                f"✅ Team **{result.team_name}** has been reserved."
+                f"✅ Team **{result.team_name}** was assigned and is Pending."
                 if self.registration_request
                 else f"🟢 Team **{result.team_name}** has been confirmed."
             )
@@ -527,7 +527,7 @@ class RegistrationQueueConfirmView(discord.ui.View):
                         if approved:
                             slot = scrim.slots[request.slot_number]
                             slot.assignment_id += 1
-                            slot.status = _d("STATUS_RESERVED")
+                            slot.status = _d("STATUS_PENDING")
                             slot.team_name, slot.tag = request.team_name, request.tag
                             slot.manager_id = slot.captain_1_id = request.manager_id
                             slot.captain_2_id = None
@@ -558,7 +558,7 @@ class RegistrationQueueConfirmView(discord.ui.View):
             await _d("send_scrim_log")(scrim,
                 "STAFF REGISTRATION APPROVAL" if approved else "STAFF REGISTRATION REJECTION",
                 f"Slot {request.slot_number:02d} · team **{request.team_name}** · "
-                f"{'Reserved' if approved else 'Declined'}")
+                f"{'Pending' if approved else 'Declined'}")
         if approved and not await _d("refresh_public_slots")(scrim):
             issues.append("Public slots board")
         if not await _d("refresh_registration_queue")(scrim):
@@ -576,7 +576,7 @@ async def apply_registration_entry(
     *,
     registration_message_id: int | None = None,
 ):
-    """Create a reserved slot or a durable unassigned registration request."""
+    """Create a Pending slot or a durable unassigned registration request."""
     snapshot = None
     auto_accept = getattr(scrim, "registration_auto_accept", False) is True
     tag_match = None
@@ -616,7 +616,7 @@ async def apply_registration_entry(
         if auto_accept:
             with _d("repository").transaction():
                 slot.assignment_id += 1
-                slot.status = _d("STATUS_RESERVED")
+                slot.status = _d("STATUS_PENDING")
                 slot.team_name = entry.team_name
                 slot.tag = entry.tag
                 slot.manager_id = entry.member.id
@@ -791,6 +791,7 @@ async def register_team(ctx, *, arguments: str) -> None:
             "Registration succeeded with follow-up warnings for scrim %s: access_ok=%s board_refreshed=%s",
             scrim.id, access_ok, board_refreshed,
         )
+    tag_match = None
     if snapshot.status == _d("STATUS_PENDING"):
         async with scrim.state_lock:
             tag_match = _d("registration_tag_conflict")(scrim, team_name, tag)
@@ -812,7 +813,12 @@ async def register_team(ctx, *, arguments: str) -> None:
         try:
             await add_reaction(
                 _d("registration_success_reaction")(
-                    scrim, accepted=snapshot.status == _d("STATUS_RESERVED")
+                    scrim,
+                    accepted=(
+                        snapshot.status == _d("STATUS_PENDING")
+                        and getattr(scrim, "registration_auto_accept", False)
+                        and not tag_match
+                    ),
                 )
             )
         except _d("discord").HTTPException:

@@ -12,7 +12,7 @@ from discord.ext import commands
 from arc_bot.storage.slot_storage import SlotStorageError
 from arc_bot.utils.discord_views import delete_message_or_clear, disable_view_items
 from arc_bot.views.base import ExpiringView
-from scrim_state import STATUS_AVAILABLE, STATUS_CONFIRMED, STATUS_PENDING, STATUS_RESERVED
+from scrim_state import STATUS_AVAILABLE, STATUS_CONFIRMED, STATUS_PENDING
 
 _owner = None
 
@@ -29,8 +29,7 @@ def _o(name):
 
 def build_slot_status_embed(scrim):
     counts = {
-        STATUS_AVAILABLE: 0, STATUS_RESERVED: 0,
-        STATUS_PENDING: 0, STATUS_CONFIRMED: 0,
+        STATUS_AVAILABLE: 0, STATUS_PENDING: 0, STATUS_CONFIRMED: 0,
     }
     for slot in scrim.slots.values():
         if slot.status in counts:
@@ -39,8 +38,7 @@ def build_slot_status_embed(scrim):
         title=f"📊 Slot Status - {discord.utils.escape_markdown(scrim.name)}",
         description=(
             f"**Total Slots:** {len(scrim.slots)}\n\n"
-            f"{scrim.emoji_available} **Free:** {counts[STATUS_AVAILABLE]}\n"
-            f"{scrim.emoji_reserved} **Reserved:** {counts[STATUS_RESERVED]}\n"
+            f"{scrim.emoji_available} **Available:** {counts[STATUS_AVAILABLE]}\n"
             f"{scrim.emoji_pending} **Pending:** {counts[STATUS_PENDING]}\n"
             f"{scrim.emoji_confirmed} **Confirmed:** {counts[STATUS_CONFIRMED]}"
         ),
@@ -56,7 +54,6 @@ def build_slot_status_embed(scrim):
         value=", ".join(available) if available else "None", inline=False,
     )
     for status, label, emoji in (
-        (STATUS_RESERVED, "Reserved Teams", scrim.emoji_reserved),
         (STATUS_PENDING, "Pending Teams", scrim.emoji_pending),
         (STATUS_CONFIRMED, "Confirmed Teams", scrim.emoji_confirmed),
     ):

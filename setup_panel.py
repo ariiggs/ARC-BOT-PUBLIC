@@ -21,7 +21,6 @@ from scrim_state import (
     DEFAULT_IDPW_TIMEZONE,
     DEFAULT_MATCH_MAPS,
     DEFAULT_EMOJI_AVAILABLE,
-    DEFAULT_EMOJI_RESERVED,
     DEFAULT_EMOJI_PENDING,
     DEFAULT_EMOJI_CONFIRMED,
     DEFAULT_EMOJI_REGISTRATION_OK,
@@ -1445,7 +1444,6 @@ def install_setup(
 
             emoji_values = (
                 ("Available", getattr(selected, "emoji_available", DEFAULT_EMOJI_AVAILABLE), DEFAULT_EMOJI_AVAILABLE),
-                ("Reserved", getattr(selected, "emoji_reserved", DEFAULT_EMOJI_RESERVED), DEFAULT_EMOJI_RESERVED),
                 ("Pending", getattr(selected, "emoji_pending", DEFAULT_EMOJI_PENDING), DEFAULT_EMOJI_PENDING),
                 ("Confirmed", getattr(selected, "emoji_confirmed", DEFAULT_EMOJI_CONFIRMED), DEFAULT_EMOJI_CONFIRMED),
                 ("Review OK", getattr(selected, "emoji_registration_ok", DEFAULT_EMOJI_REGISTRATION_OK), DEFAULT_EMOJI_REGISTRATION_OK),
@@ -1460,9 +1458,9 @@ def install_setup(
             emoji_value = (
                 f"Status: **{'Customized' if customized_emojis else 'Using defaults'}**\n"
                 "Slot statuses: "
-                + " · ".join(f"{label} {value}" for label, value, _ in emoji_values[:4])
+                + " · ".join(f"{label} {value}" for label, value, _ in emoji_values[:3])
                 + "\nRegistration: "
-                + " · ".join(f"{label} {value}" for label, value, _ in emoji_values[4:])
+                + " · ".join(f"{label} {value}" for label, value, _ in emoji_values[3:])
                 + f"\nSlot-number overrides: **{len(slot_number_emojis)}**"
             )
             if slot_number_emojis:
@@ -4672,7 +4670,7 @@ def install_setup(
                     if not await _emoji_license_check(interaction, self.guild_id):
                         return
                     await interaction.response.edit_message(
-                        content="Customize Available, Reserved, Pending, or Confirmed slot status.",
+                        content="Customize Available, Pending, or Confirmed slot status.",
                         embed=None,
                         view=SlotStatusEmojiView(
                             self.panel, self.owner_id, self.guild_id, self.scrim_id
@@ -4788,7 +4786,6 @@ def install_setup(
             self.scrim_id = scrim_id
             fields = (
                 ("Available", "emoji_available"),
-                ("Reserved", "emoji_reserved"),
                 ("Pending", "emoji_pending"),
                 ("Confirmed", "emoji_confirmed"),
             )
@@ -4831,7 +4828,6 @@ def install_setup(
                 try:
                     for field, value in (
                         ("emoji_available", DEFAULT_EMOJI_AVAILABLE),
-                        ("emoji_reserved", DEFAULT_EMOJI_RESERVED),
                         ("emoji_pending", DEFAULT_EMOJI_PENDING),
                         ("emoji_confirmed", DEFAULT_EMOJI_CONFIRMED),
                     ):

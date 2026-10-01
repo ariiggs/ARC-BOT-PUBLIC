@@ -14,7 +14,6 @@ from discord.ext import commands
 
 from scrim_state import (
     STATUS_PENDING,
-    STATUS_RESERVED,
     Slot,
     SlotSnapshot,
     Scrim,
@@ -337,11 +336,11 @@ async def remind_managers(ctx):
     scrim = await require_staff_scrim(ctx, allow_public=True)
     if scrim is None:
         return
-    reserved = [slot.snapshot() for slot in scrim.slots.values()
-                if slot.status == STATUS_RESERVED and slot.manager_id is not None]
-    if not reserved:
+    pending = [slot.snapshot() for slot in scrim.slots.values()
+               if slot.status == STATUS_PENDING and slot.manager_id is not None]
+    if not pending:
         embed = discord.Embed(title="✅ No reminder needed",
-                              description="There are no Reserved slots waiting for captain confirmation.",
+                              description="There are no Pending slots waiting for captain confirmation.",
                               color=discord.Color.blue())
         embed.set_footer(text=f"Scrim: {scrim.name}")
         await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none(), delete_after=30)
@@ -351,9 +350,9 @@ async def remind_managers(ctx):
         await send_private_command_feedback(ctx, "This scrim has no Pending Captain Role configured.", silent=False)
         return
     embed = discord.Embed(title="🔔 Slot Confirmation Reminder", color=discord.Color.blue())
-    embed.add_field(name="Slots waiting", value=", ".join(f"`{slot.number:02d}`" for slot in reserved), inline=False)
+    embed.add_field(name="Slots waiting", value=", ".join(f"`{slot.number:02d}`" for slot in pending), inline=False)
     embed.set_footer(text=f"Scrim: {scrim.name}")
-    await ctx.send(content="***Reserved teams: please Confirm or Cancel your Slot.***\n"
+    await ctx.send(content="***Pending teams: please Confirm or Cancel your Slot.***\n"
                    f"<@&{scrim.pending_role_id}>", embed=embed,
                    allowed_mentions=discord.AllowedMentions(roles=True))
     await delete_command_message(ctx)
@@ -374,8 +373,8 @@ async def confirm_slot(ctx, *, slot_numbers):
             await send_private_command_feedback(ctx, "This scrim no longer exists.")
             return
         slots = [scrim.slots.get(number) for number in numbers]
-        if any(slot is None or slot.status not in {STATUS_RESERVED, STATUS_PENDING} for slot in slots):
-            await send_private_command_feedback(ctx, "Only Reserved or Pending slots can be confirmed.")
+        if any(slot is None or slot.status != STATUS_PENDING for slot in slots):
+            await send_private_command_feedback(ctx, "Only Pending slots can be force-confirmed.")
             return
         with repository.transaction():
             confirmed = []
